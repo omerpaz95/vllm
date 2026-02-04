@@ -128,6 +128,7 @@ class OffloadingConnector(KVConnectorBase_V1):
 
         spec = OffloadingSpecFactory.create_spec(vllm_config, kv_cache_config)
 
+        self.spec = spec
         self.connector_scheduler: OffloadingConnectorScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
         if role == KVConnectorRole.SCHEDULER:
@@ -239,6 +240,9 @@ class OffloadingConnector(KVConnectorBase_V1):
         return OffloadPromMetrics(
             vllm_config, metric_types, labelnames, per_engine_labelvalues
         )
+
+    def __del__(self) -> None:
+        self.spec.cleanup()
 
 
 class OffloadingConnectorScheduler:
