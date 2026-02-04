@@ -10,6 +10,7 @@ from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.kv_offload.centralized_memory import CentralizedOffloadMemoryManager
 from vllm.v1.kv_offload.mediums import BlockIDsLoadStoreSpec
 from vllm.v1.kv_offload.worker.worker import (
     OffloadingHandler,
@@ -228,6 +229,9 @@ class CpuGpuOffloadingHandlers:
         num_cpu_blocks: int,
         gpu_caches: dict[str, torch.Tensor],
         attn_backends: dict[str, type[AttentionBackend]],
+        memory_manager: CentralizedOffloadMemoryManager | None = None,
+        tp_rank: int | None = None,
+        tp_world_size: int | None = None,
     ):
         assert gpu_caches
         assert cpu_block_size % gpu_block_size == 0
@@ -295,12 +299,44 @@ class CpuGpuOffloadingHandlers:
             cpu_shape[1 if split_k_and_v else 0] = num_cpu_kernel_blocks
 
             logger.debug("Allocating CPU tensor of shape %r", cpu_shape)
-            cpu_tensor = torch.zeros(
-                cpu_shape,
-                dtype=gpu_tensor.dtype,
-                device="cpu",
-                pin_memory=pin_memory,
-            )
+            if memory_manager is not None:
+                # Use centralized mmap memory
+                assert isinstance(tp_rank, int)
+                assert isinstance(tp_world_size, int)
+                cpu_tensor = memory_manager.get_worker_memory_view(
+                    tp_rank=tp_rank,
+                    tp_world_size=tp_world_size,
+                    shape=tuple(cpu_shape),
+                    dtype=gpu_tensor.dtype,
+                )
+                if pin_memory:
+                    try:
+                        torch.cuda.cudaHostRegister(
+                            cpu_tensor.data_ptr(),
+                            cpu_tensor.numel() * cpu_tensor.element_size(),
+                            flags=0,
+                        )
+                        logger.debug(
+                            "Pinned mmap memory for worker TP rank %d: %d MB",
+                            tp_rank,
+                            (cpu_tensor.numel() * cpu_tensor.element_size())
+                            / (1024**2),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to pin mmap memory for TP rank %d: %s. "
+                            "GPU-CPU transfers may be slower.",
+                            tp_rank,
+                            e,
+                        )
+            else:
+                # Fallback to old behavior (for backward compatibility)
+                cpu_tensor = torch.zeros(
+                    cpu_shape,
+                    dtype=gpu_tensor.dtype,
+                    device="cpu",
+                    pin_memory=pin_memory,
+                )
 
             gpu_tensors.extend(gpu_tensor.unbind(0) if split_k_and_v else [gpu_tensor])
             cpu_tensors.extend(cpu_tensor.unbind(0) if split_k_and_v else [cpu_tensor])
