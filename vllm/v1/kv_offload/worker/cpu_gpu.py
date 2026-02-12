@@ -356,7 +356,8 @@ def pin_worker_region(memory_manager, tp_rank: int, tp_world_size: int):
     offset, size = memory_manager.worker_region(tp_rank, tp_world_size)
     ptr = base + offset
 
-    # You might want cudaHostRegisterPortable | cudaHostRegisterMapped depending on usage
+    # We might want cudaHostRegisterPortable (0x01) - considered as pinned memory by all CUDA contexts
+    # | cudaHostRegisterMapped depending on usage (0x02)
     cudaHostRegisterDefault = 0
 
     result = cuda.cudaHostRegister(

@@ -55,11 +55,6 @@ def is_v1_kv_transfer_group(connector: KVConnectorBaseType | None = None) -> boo
     return isinstance(connector, KVConnectorBase_V1)
 
 
-def get_offload_memory_manager() -> "CentralizedOffloadMemoryManager | None":
-    """Get the global offload memory manager instance."""
-    return _OFFLOAD_MEMORY_MANAGER
-
-
 def ensure_offload_memory_manager_initialized(
     vllm_config: "VllmConfig",
 ) -> "CentralizedOffloadMemoryManager | None":
@@ -70,7 +65,6 @@ def ensure_offload_memory_manager_initialized(
     Returns the memory manager instance or None if not using OffloadingConnector.
     """
     global _OFFLOAD_MEMORY_MANAGER
-    
     if vllm_config.kv_transfer_config is None:
         return None
     

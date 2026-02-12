@@ -243,8 +243,6 @@ class OffloadingConnector(KVConnectorBase_V1):
             vllm_config, metric_types, labelnames, per_engine_labelvalues
         )
 
-    def __del__(self) -> None:
-        self.spec.cleanup()
 
 
 class OffloadingConnectorScheduler:

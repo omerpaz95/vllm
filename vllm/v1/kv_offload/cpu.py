@@ -39,11 +39,7 @@ class CPUOffloadingSpec(OffloadingSpec):
         tp_world_size = vllm_config.parallel_config.world_size
         total_cpu_bytes = int(cpu_bytes_to_use)  # Already accounts for all workers
 
-        # If memory_manager is provided (from Scheduler), use it as singleton
-        if memory_manager is not None:
-            self.memory_manager = memory_manager
-        else:
-            print("ERROR: Didn't get the memory_manager from factory :(")
+        self.memory_manager = memory_manager
 
         # Store TP info for workers
         self.tp_world_size = tp_world_size
