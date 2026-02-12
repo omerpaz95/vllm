@@ -313,11 +313,17 @@ class WorkerWrapperBase:
             # To make vLLM config available during worker initialization
             self.worker = worker_class(**kwargs)
 
-    def initialize_from_config(self, kv_cache_configs: list[Any]) -> None:
+    def initialize_from_config(
+        self,
+        kv_cache_configs: list[Any],
+        offload_memory_manager: Any = None,
+    ) -> None:
         kv_cache_config = kv_cache_configs[self.global_rank]
         assert self.vllm_config is not None
         with set_current_vllm_config(self.vllm_config):
-            self.worker.initialize_from_config(kv_cache_config)  # type: ignore
+            self.worker.initialize_from_config(  # type: ignore
+                kv_cache_config, offload_memory_manager
+            )
 
     def init_device(self):
         assert self.vllm_config is not None

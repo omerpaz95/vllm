@@ -58,6 +58,10 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
+from vllm.v1.kv_offload.centralized_memory import (
+    CentralizedOffloadMemoryManager,
+)
+
 logger = init_logger(__name__)
 
 
@@ -71,6 +75,7 @@ class Scheduler(SchedulerInterface):
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         include_finished_set: bool = False,
         log_stats: bool = False,
+        offload_memory_manager: "CentralizedOffloadMemoryManager | None" = None,
     ) -> None:
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
@@ -118,20 +123,11 @@ class Scheduler(SchedulerInterface):
                 "Encoder-decoder models are not currently supported with KV connectors"
             )
             
-            # Ensure global memory manager is initialized for OffloadingConnector
-            # This must happen before creating the connector
-            from vllm.distributed.kv_transfer.kv_transfer_state import (
-                ensure_offload_memory_manager_initialized,
-            )
-            memory_manager = ensure_offload_memory_manager_initialized(
-                self.vllm_config
-            )
-            
             self.connector = KVConnectorFactory.create_connector(
                 config=self.vllm_config,
                 role=KVConnectorRole.SCHEDULER,
                 kv_cache_config=self.kv_cache_config,
-                memory_manager=memory_manager,
+                memory_manager=offload_memory_manager,
             )
             if self.log_stats:
                 self.connector_prefix_cache_stats = PrefixCacheStats()

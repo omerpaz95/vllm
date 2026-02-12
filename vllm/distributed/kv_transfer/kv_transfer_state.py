@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING
 
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBaseType
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
@@ -8,20 +7,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
     KVConnectorRole,
 )
-from vllm.logger import init_logger
+from vllm.logger import init_logger 
 
-if TYPE_CHECKING:
-    from vllm.config import VllmConfig
-    from vllm.v1.kv_cache_interface import KVCacheConfig
-    from vllm.v1.kv_offload.centralized_memory import (
-        CentralizedOffloadMemoryManager,
-    )
+from vllm.config import VllmConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_offload.centralized_memory import (
+    CentralizedOffloadMemoryManager,
+)
 
 logger = init_logger(__name__)
 
 _KV_CONNECTOR_AGENT: KVConnectorBaseType | None = None
-_OFFLOAD_MEMORY_MANAGER: "CentralizedOffloadMemoryManager | None" = None
-
 
 def get_kv_transfer_group() -> KVConnectorBaseType:
     assert _KV_CONNECTOR_AGENT is not None, (
@@ -55,55 +51,8 @@ def is_v1_kv_transfer_group(connector: KVConnectorBaseType | None = None) -> boo
     return isinstance(connector, KVConnectorBase_V1)
 
 
-def ensure_offload_memory_manager_initialized(
-    vllm_config: "VllmConfig",
-) -> "CentralizedOffloadMemoryManager | None":
-    """
-    Initialize the global CentralizedOffloadMemoryManager if needed.
-    This must be called before any connectors are created.
-    
-    Returns the memory manager instance or None if not using OffloadingConnector.
-    """
-    global _OFFLOAD_MEMORY_MANAGER
-    if vllm_config.kv_transfer_config is None:
-        return None
-    
-    kv_transfer_config = vllm_config.kv_transfer_config
-    connector_name = kv_transfer_config.kv_connector
-    
-    # Only create for OffloadingConnector
-    if connector_name != "OffloadingConnector":
-        return None
-    
-    # Create singleton if not already created
-    if _OFFLOAD_MEMORY_MANAGER is None:
-        from vllm.v1.kv_offload.centralized_memory import (
-            CentralizedOffloadMemoryManager,
-        )
-        
-        extra_config = kv_transfer_config.kv_connector_extra_config
-        cpu_bytes_to_use = extra_config.get("cpu_bytes_to_use")
-        
-        if cpu_bytes_to_use:
-            import os
-            total_cpu_bytes = int(cpu_bytes_to_use)
-            mmap_path = extra_config.get("mmap_path")
-            _OFFLOAD_MEMORY_MANAGER = CentralizedOffloadMemoryManager(
-                total_size_bytes=total_cpu_bytes,
-                mmap_path=mmap_path,
-            )
-            logger.info(
-                "Created global CentralizedOffloadMemoryManager: "
-                "size=%.2f GB, path=%s",
-                total_cpu_bytes / (1e9),
-                mmap_path or f"/tmp/vllm_offload_{os.getpid()}.mmap",
-            )
-    
-    return _OFFLOAD_MEMORY_MANAGER
-
-
 def ensure_kv_transfer_initialized(
-    vllm_config: "VllmConfig", kv_cache_config: "KVCacheConfig | None" = None
+    vllm_config: "VllmConfig", kv_cache_config: "KVCacheConfig | None" = None, offload_memory_manager: "CentralizedOffloadMemoryManager | None" = None,
 ) -> None:
     """
     Initialize KV cache transfer parallel group.
@@ -118,8 +67,7 @@ def ensure_kv_transfer_initialized(
         vllm_config.kv_transfer_config.is_kv_transfer_instance
         and _KV_CONNECTOR_AGENT is None
     ):
-        # Ensure memory manager is initialized first for OffloadingConnector
-        memory_manager = ensure_offload_memory_manager_initialized(vllm_config)
+        memory_manager = offload_memory_manager 
         
         _KV_CONNECTOR_AGENT = KVConnectorFactory.create_connector(
             config=vllm_config,
@@ -136,8 +84,3 @@ def ensure_kv_transfer_shutdown() -> None:
         _KV_CONNECTOR_AGENT.shutdown()
         _KV_CONNECTOR_AGENT = None
     
-    # Cleanup memory manager
-    if _OFFLOAD_MEMORY_MANAGER is not None:
-        logger.info("Cleaning up global CentralizedOffloadMemoryManager")
-        _OFFLOAD_MEMORY_MANAGER.cleanup()
-        _OFFLOAD_MEMORY_MANAGER = None

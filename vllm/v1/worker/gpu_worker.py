@@ -62,6 +62,9 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+    from vllm.v1.kv_offload.centralized_memory import (
+        CentralizedOffloadMemoryManager,
+    )
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
@@ -395,7 +398,11 @@ class Worker(WorkerBase):
             self.model_runner.update_max_model_len(max_model_len)
         logger.debug("Updated max_model_len to %d", max_model_len)
 
-    def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+    def initialize_from_config(
+        self,
+        kv_cache_config: KVCacheConfig,
+        offload_memory_manager: "CentralizedOffloadMemoryManager | None" = None,
+    ) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
 
         # Init kv cache connector here, because it requires
@@ -403,7 +410,9 @@ class Worker(WorkerBase):
         # NOTE(Kuntai): This need to be done before `initialize_kv_cache`,
         # because `initialize_kv_cache` will inject kv cache groups not
         # related to kv cache connector (e.g. kv cache sharing layers).
-        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+        ensure_kv_transfer_initialized(
+            self.vllm_config, kv_cache_config, offload_memory_manager
+        )
 
         if self.vllm_config.model_config.enable_sleep_mode:
             from vllm.device_allocator.cumem import CuMemAllocator
