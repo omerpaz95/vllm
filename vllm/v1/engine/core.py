@@ -67,6 +67,8 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
+from vllm.v1.kv_offload.centralized_memory import CentralizedOffloadMemoryManager
+
 logger = init_logger(__name__)
 
 POLLING_TIMEOUT_S = 2.5
@@ -108,6 +110,10 @@ class EngineCore:
 
         self.available_gpu_memory_for_kv_cache = -1
 
+        # Create centralized memory manager for OffloadingConnector if needed
+        # This must be created before workers are initialized
+        self.offload_memory_manager = self._create_offload_memory_manager(vllm_config)
+
         # Setup KV Caches and update CacheConfig after profiling.
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = self._initialize_kv_caches(
             vllm_config
@@ -142,6 +148,7 @@ class EngineCore:
             include_finished_set=include_finished_set,
             log_stats=self.log_stats,
             block_size=scheduler_block_size,
+            offload_memory_manager=self.offload_memory_manager,
         )
         self.use_spec_decode = vllm_config.speculative_config is not None
         if self.scheduler.connector is not None:  # type: ignore
@@ -217,6 +224,45 @@ class EngineCore:
         # environment variable overrides after this point)
         enable_envs_cache()
 
+    def _create_offload_memory_manager(
+        self, vllm_config: VllmConfig
+    ) -> "CentralizedOffloadMemoryManager | None":
+        """Create centralized memory manager for OffloadingConnector if needed."""
+        if vllm_config.kv_transfer_config is None:
+            return None
+        
+        kv_transfer_config = vllm_config.kv_transfer_config
+        connector_name = kv_transfer_config.kv_connector
+        
+        # Only create for OffloadingConnector
+        if connector_name != "OffloadingConnector":
+            return None
+        
+        from vllm.v1.kv_offload.centralized_memory import (
+            CentralizedOffloadMemoryManager,
+        )
+        
+        extra_config = kv_transfer_config.kv_connector_extra_config
+        cpu_bytes_to_use = extra_config.get("cpu_bytes_to_use")
+        
+        if not cpu_bytes_to_use:
+            return None
+        
+        import os
+        total_cpu_bytes = int(cpu_bytes_to_use)
+        mmap_path = extra_config.get("mmap_path")
+        memory_manager = CentralizedOffloadMemoryManager(
+            total_size_bytes=total_cpu_bytes,
+            mmap_path=mmap_path,
+        )
+        logger.info(
+            "Created CentralizedOffloadMemoryManager in EngineCore: "
+            "size=%.2f GB, path=%s",
+            total_cpu_bytes / (1e9),
+            mmap_path or f"/dev/shm/vllm_offload_{os.getpid()}.mmap",
+        )
+        return memory_manager
+
     def _initialize_kv_caches(
         self, vllm_config: VllmConfig
     ) -> tuple[int, int, KVCacheConfig]:
@@ -266,7 +312,9 @@ class EngineCore:
         num_cpu_blocks = 0
 
         # Initialize kv cache and warmup the execution
-        self.model_executor.initialize_from_config(kv_cache_configs)
+        self.model_executor.initialize_from_config(
+            kv_cache_configs, self.offload_memory_manager
+        )
 
         elapsed = time.time() - start
         logger.info_once(

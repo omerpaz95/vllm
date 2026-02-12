@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING
 
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBaseType
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
@@ -8,13 +7,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
     KVConnectorRole,
 )
+from vllm.logger import init_logger 
 
-if TYPE_CHECKING:
-    from vllm.config import VllmConfig
-    from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.config import VllmConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_offload.centralized_memory import (
+    CentralizedOffloadMemoryManager,
+)
+
+logger = init_logger(__name__)
 
 _KV_CONNECTOR_AGENT: KVConnectorBaseType | None = None
-
 
 def get_kv_transfer_group() -> KVConnectorBaseType:
     assert _KV_CONNECTOR_AGENT is not None, (
@@ -49,7 +52,7 @@ def is_v1_kv_transfer_group(connector: KVConnectorBaseType | None = None) -> boo
 
 
 def ensure_kv_transfer_initialized(
-    vllm_config: "VllmConfig", kv_cache_config: "KVCacheConfig | None" = None
+    vllm_config: "VllmConfig", kv_cache_config: "KVCacheConfig | None" = None, offload_memory_manager: "CentralizedOffloadMemoryManager | None" = None,
 ) -> None:
     """
     Initialize KV cache transfer parallel group.
@@ -64,15 +67,20 @@ def ensure_kv_transfer_initialized(
         vllm_config.kv_transfer_config.is_kv_transfer_instance
         and _KV_CONNECTOR_AGENT is None
     ):
+        memory_manager = offload_memory_manager 
+        
         _KV_CONNECTOR_AGENT = KVConnectorFactory.create_connector(
             config=vllm_config,
             role=KVConnectorRole.WORKER,
             kv_cache_config=kv_cache_config,
+            memory_manager=memory_manager,
         )
 
 
 def ensure_kv_transfer_shutdown() -> None:
-    global _KV_CONNECTOR_AGENT
+    global _KV_CONNECTOR_AGENT, _OFFLOAD_MEMORY_MANAGER
+    
     if _KV_CONNECTOR_AGENT is not None:
         _KV_CONNECTOR_AGENT.shutdown()
         _KV_CONNECTOR_AGENT = None
+    

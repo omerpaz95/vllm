@@ -5,11 +5,14 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+import ctypes
+from ctypes.util import find_library
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.kv_offload.centralized_memory import CentralizedOffloadMemoryManager
 from vllm.v1.kv_offload.mediums import BlockIDsLoadStoreSpec
 from vllm.v1.kv_offload.worker.worker import (
     OffloadingHandler,
@@ -228,6 +231,9 @@ class CpuGpuOffloadingHandlers:
         num_cpu_blocks: int,
         gpu_caches: dict[str, torch.Tensor],
         attn_backends: dict[str, type[AttentionBackend]],
+        memory_manager: CentralizedOffloadMemoryManager | None = None,
+        tp_rank: int | None = None,
+        tp_world_size: int | None = None,
     ):
         assert gpu_caches
         assert cpu_block_size % gpu_block_size == 0
@@ -290,17 +296,32 @@ class CpuGpuOffloadingHandlers:
         logger.info("Allocating %d CPU tensors...", len(parsed_gpu_tensors))
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
+        if memory_manager is not None and pin_memory:
+                # Use centralized mmap memory
+                assert isinstance(tp_rank, int)
+                assert isinstance(tp_world_size, int)
+                pin_worker_region(memory_manager, tp_rank, tp_world_size)
         for gpu_tensor, split_k_and_v in parsed_gpu_tensors:
             cpu_shape = list(gpu_tensor.shape)
             cpu_shape[1 if split_k_and_v else 0] = num_cpu_kernel_blocks
 
             logger.debug("Allocating CPU tensor of shape %r", cpu_shape)
-            cpu_tensor = torch.zeros(
-                cpu_shape,
-                dtype=gpu_tensor.dtype,
-                device="cpu",
-                pin_memory=pin_memory,
-            )
+            if memory_manager is not None:
+                # Use centralized mmap memory
+                cpu_tensor = memory_manager.get_worker_memory_view(
+                    tp_rank=tp_rank,
+                    tp_world_size=tp_world_size,
+                    shape=tuple(cpu_shape),
+                    dtype=gpu_tensor.dtype,
+                )
+            else:
+                # Fallback to old behavior (for backward compatibility)
+                cpu_tensor = torch.zeros(
+                    cpu_shape,
+                    dtype=gpu_tensor.dtype,
+                    device="cpu",
+                    pin_memory=pin_memory,
+                )
 
             gpu_tensors.extend(gpu_tensor.unbind(0) if split_k_and_v else [gpu_tensor])
             cpu_tensors.extend(cpu_tensor.unbind(0) if split_k_and_v else [cpu_tensor])
@@ -317,4 +338,47 @@ class CpuGpuOffloadingHandlers:
             dst_tensors=gpu_tensors,
             src_block_size_factor=cpu_block_size_factor,
             dst_block_size_factor=gpu_block_size_factor,
+        )
+
+def pin_worker_region(memory_manager, tp_rank: int, tp_world_size: int):
+    # Resolve libcudart and set proper signature
+    libcudart_path = find_library("cudart") or "libcudart.so"
+    cuda = ctypes.CDLL(libcudart_path)
+
+    cuda.cudaHostRegister.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_uint,
+    ]
+    cuda.cudaHostRegister.restype = ctypes.c_int
+
+    base = memory_manager.base_ptr()
+    offset, size = memory_manager.worker_region(tp_rank, tp_world_size)
+    ptr = base + offset
+
+    # We might want cudaHostRegisterPortable (0x01) - considered as pinned memory by all CUDA contexts
+    # | cudaHostRegisterMapped depending on usage (0x02)
+    cudaHostRegisterDefault = 0
+
+    result = cuda.cudaHostRegister(
+        ctypes.c_void_p(ptr),
+        ctypes.c_size_t(size),
+        ctypes.c_uint(cudaHostRegisterDefault),
+    )
+    if result != 0:
+        # 1 == cudaErrorInvalidValue, but don’t claim “already pinned” unless you know
+        logger.warning(
+            "cudaHostRegister failed for worker %d (ptr=0x%x size=%d), code=%d",
+            tp_rank,
+            ptr,
+            size,
+            result,
+        )
+    else:
+        logger.info(
+            "Pinned mmap region for worker %d: %.2f GB (ptr=0x%x, size=%d)",
+            tp_rank,
+            size / (1024**3),
+            ptr,
+            size,
         )

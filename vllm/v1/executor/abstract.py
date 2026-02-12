@@ -22,8 +22,8 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
 
-if TYPE_CHECKING:
-    from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+from vllm.v1.kv_offload.centralized_memory import CentralizedOffloadMemoryManager
 
 logger = init_logger(__name__)
 
@@ -107,12 +107,19 @@ class Executor(ABC):
     def _init_executor(self) -> None:
         raise NotImplementedError
 
-    def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:
+    def initialize_from_config(
+        self,
+        kv_cache_configs: list[KVCacheConfig],
+        offload_memory_manager: "CentralizedOffloadMemoryManager | None" = None,
+    ) -> None:
         """
         Initialize the KV caches and begin the model execution loop of the
         underlying workers.
         """
-        self.collective_rpc("initialize_from_config", args=(kv_cache_configs,))
+        self.collective_rpc(
+            "initialize_from_config",
+            args=(kv_cache_configs, offload_memory_manager),
+        )
         self.collective_rpc("compile_or_warm_up_model")
 
     def register_failure_callback(self, callback: FailureCallback):  # noqa: B027

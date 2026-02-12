@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -57,6 +58,10 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
+from vllm.v1.kv_offload.centralized_memory import (
+    CentralizedOffloadMemoryManager,
+)
+
 logger = init_logger(__name__)
 
 
@@ -70,6 +75,7 @@ class Scheduler(SchedulerInterface):
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         include_finished_set: bool = False,
         log_stats: bool = False,
+        offload_memory_manager: "CentralizedOffloadMemoryManager | None" = None,
     ) -> None:
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
@@ -116,10 +122,12 @@ class Scheduler(SchedulerInterface):
             assert not self.is_encoder_decoder, (
                 "Encoder-decoder models are not currently supported with KV connectors"
             )
+            
             self.connector = KVConnectorFactory.create_connector(
                 config=self.vllm_config,
                 role=KVConnectorRole.SCHEDULER,
                 kv_cache_config=self.kv_cache_config,
+                memory_manager=offload_memory_manager,
             )
             if self.log_stats:
                 self.connector_prefix_cache_stats = PrefixCacheStats()
@@ -1835,6 +1843,13 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
             self.connector.shutdown()
+        
+        # Cleanup global memory manager (if this is the scheduler process)
+        # Note: ensure_kv_transfer_shutdown() will handle the global cleanup
+        from vllm.distributed.kv_transfer.kv_transfer_state import (
+            ensure_kv_transfer_shutdown,
+        )
+        ensure_kv_transfer_shutdown()
 
     ########################################################################
     # KV Connector Related Methods

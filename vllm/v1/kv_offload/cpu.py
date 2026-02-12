@@ -5,12 +5,14 @@ from collections.abc import Iterator
 import torch
 
 from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.abstract import LoadStoreSpec, OffloadingManager
 from vllm.v1.kv_offload.arc_manager import ARCOffloadingManager
 from vllm.v1.kv_offload.backends.cpu import CPUBackend
+from vllm.v1.kv_offload.centralized_memory import CentralizedOffloadMemoryManager
 from vllm.v1.kv_offload.lru_manager import LRUOffloadingManager
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
 from vllm.v1.kv_offload.spec import OffloadingSpec
@@ -19,7 +21,12 @@ from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
 
 class CPUOffloadingSpec(OffloadingSpec):
-    def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+        memory_manager: CentralizedOffloadMemoryManager | None = None,
+    ):
         super().__init__(vllm_config, kv_cache_config)
 
         cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
@@ -27,6 +34,17 @@ class CPUOffloadingSpec(OffloadingSpec):
             raise Exception(
                 "cpu_bytes_to_use must be specified in kv_connector_extra_config"
             )
+
+        # ==== CENTRALIZED CPU OFFLOADING MANAGER
+        tp_world_size = vllm_config.parallel_config.world_size
+        total_cpu_bytes = int(cpu_bytes_to_use)  # Already accounts for all workers
+
+        self.memory_manager = memory_manager
+
+        # Store TP info for workers
+        self.tp_world_size = tp_world_size
+
+        # ====================
 
         # calculate kv_bytes_per_offloaded_block
         assert kv_cache_config is not None
@@ -95,6 +113,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 raise Exception(
                     "CPU Offloading is currently only supported on CUDA-alike GPUs"
                 )
+            tp_rank = get_tensor_model_parallel_rank()
 
             self._handlers = CpuGpuOffloadingHandlers(
                 attn_backends=attn_backends,
@@ -102,8 +121,13 @@ class CPUOffloadingSpec(OffloadingSpec):
                 cpu_block_size=self.offloaded_block_size,
                 num_cpu_blocks=self.num_blocks,
                 gpu_caches=kv_caches,
+                memory_manager=self.memory_manager,
+                tp_rank=tp_rank,
+                tp_world_size=self.tp_world_size,
             )
 
         assert self._handlers is not None
         yield GPULoadStoreSpec, CPULoadStoreSpec, self._handlers.gpu_to_cpu_handler
         yield CPULoadStoreSpec, GPULoadStoreSpec, self._handlers.cpu_to_gpu_handler
+
+
