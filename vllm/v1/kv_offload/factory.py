@@ -34,6 +34,7 @@ class OffloadingSpecFactory:
         cls,
         config: "VllmConfig",
         kv_cache_config: "KVCacheConfig | None",
+        memory_manager: "CentralizedOffloadMemoryManager | None" = None,
     ) -> OffloadingSpec:
         kv_transfer_config = config.kv_transfer_config
         assert kv_transfer_config is not None
@@ -49,7 +50,7 @@ class OffloadingSpecFactory:
             spec_cls = getattr(spec_module, spec_name)
         assert issubclass(spec_cls, OffloadingSpec)
         logger.info("Creating offloading spec with name: %s", spec_name)
-        return spec_cls(config, kv_cache_config)
+        return spec_cls(config, kv_cache_config, memory_manager)
 
 
 # Register various specs here.

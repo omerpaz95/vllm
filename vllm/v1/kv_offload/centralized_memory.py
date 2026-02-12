@@ -12,6 +12,7 @@ import atexit
 import math
 import mmap
 import os
+import ctypes
 
 import torch
 
@@ -56,7 +57,7 @@ class CentralizedOffloadMemoryManager:
 
         # Set mmap file path
         if mmap_path is None:
-            mmap_path = f"/tmp/vllm_offload_{os.getpid()}.mmap"
+            mmap_path = f"/dev/shm/vllm_offload_{os.getpid()}.mmap"
         self.mmap_path = mmap_path
 
         # Create mmap file
@@ -75,6 +76,11 @@ class CentralizedOffloadMemoryManager:
             prot=mmap.PROT_READ | mmap.PROT_WRITE,
         )
 
+        self.mmap_obj.madvise(mmap.MADV_WILLNEED)  # Prefault pages
+        self.mmap_obj.madvise(mmap.MADV_SEQUENTIAL)  # Optimize for sequential access
+
+        self._tensor_cache: dict[tuple, torch.Tensor] = {}
+        
         # Register cleanup on exit
         atexit.register(self.cleanup)
 
@@ -83,6 +89,18 @@ class CentralizedOffloadMemoryManager:
             self.total_size_bytes / (1e9),
             self.mmap_path,
         )
+        
+    def base_ptr(self) -> int:
+        # Create a 1-byte memoryview, then get its address
+        mv = memoryview(self.mmap_obj)
+        c_char_p = ctypes.c_char.from_buffer(mv)
+        return ctypes.addressof(c_char_p)
+
+    def worker_region(self, tp_rank: int, tp_world_size: int) -> tuple[int, int]:
+        worker_size_bytes = self.total_size_bytes // tp_world_size
+        worker_size_bytes = (worker_size_bytes // self.page_size) * self.page_size
+        offset_bytes = tp_rank * worker_size_bytes
+        return offset_bytes, worker_size_bytes
 
     def get_worker_memory_view(
         self,
@@ -91,66 +109,56 @@ class CentralizedOffloadMemoryManager:
         shape: tuple,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """
-        Get a tensor view into the mmap region for a specific TP worker.
+        cache_key = (tp_rank, shape, dtype)
+        if cache_key in self._tensor_cache:
+            return self._tensor_cache[cache_key]
 
-        Args:
-            tp_rank: Tensor-parallel rank of the worker (0-indexed)
-            tp_world_size: Total number of tensor-parallel workers
-            shape: Desired tensor shape
-            dtype: PyTorch data type for the tensor
-
-        Returns:
-            A torch.Tensor backed by the mmap file at the calculated offset
-        """
-        # Calculate worker's region size (page-aligned)
         worker_size_bytes = self.total_size_bytes // tp_world_size
         worker_size_bytes = (worker_size_bytes // self.page_size) * self.page_size
-
-        # Calculate offset for this worker
         offset_bytes = tp_rank * worker_size_bytes
 
-        # Convert dtype and calculate tensor size
         element_size = torch.tensor([], dtype=dtype).element_size()
         num_elements = math.prod(shape)
         tensor_size_bytes = num_elements * element_size
 
-        logger.debug(
-            "Creating tensor view for TP rank %d/%d:",
-            tp_rank,
-            tp_world_size,
-        )
+        # You may want to assert tensor_size_bytes <= worker_size_bytes
 
-        logger.debug(
-            "shape=%s, dtype=%s, offset=%d bytes",
-            shape,
-            dtype,
-            offset_bytes,
-        )
-
-        # Create a storage view into the mmap at the correct offset
         memory_view = memoryview(self.mmap_obj)[
             offset_bytes : offset_bytes + tensor_size_bytes
         ]
 
-        # Create tensor from memory view
         tensor = torch.frombuffer(memory_view, dtype=dtype, count=num_elements).reshape(
             shape
         )
-
+        self._tensor_cache[cache_key] = tensor
         return tensor
+
 
     def cleanup(self) -> None:
         """Cleanup mmap resources and delete the backing file."""
         if hasattr(self, "mmap_obj") and self.mmap_obj is not None:
-            self.mmap_obj.close()
+            try:
+                self.mmap_obj.close()
+            except BufferError:
+                # Expected: other processes may still have memoryview references
+                # The OS will clean up the mmap when all processes exit
+                pass
+            except Exception as e:
+                logger.debug("Error closing mmap: %s", e)
 
         if hasattr(self, "file_handle") and self.file_handle is not None:
-            os.close(self.file_handle)
+            try:
+                os.close(self.file_handle)
+            except Exception as e:
+                logger.debug("Error closing file handle: %s", e)
 
         if hasattr(self, "mmap_path") and os.path.exists(self.mmap_path):
-            os.unlink(self.mmap_path)
-            logger.info("Cleaned up mmap file: %s", self.mmap_path)
+            try:
+                os.unlink(self.mmap_path)
+                logger.info("Cleaned up mmap file: %s", self.mmap_path)
+            except Exception as e:
+                # File may already be deleted by another process
+                logger.debug("Could not delete mmap file: %s", e)
 
     def __del__(self):
         """Destructor to ensure cleanup."""

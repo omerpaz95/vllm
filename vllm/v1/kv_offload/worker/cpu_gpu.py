@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+import ctypes
+from ctypes.util import find_library
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
@@ -294,6 +296,11 @@ class CpuGpuOffloadingHandlers:
         logger.info("Allocating %d CPU tensors...", len(parsed_gpu_tensors))
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
+        if memory_manager is not None and pin_memory:
+                # Use centralized mmap memory
+                assert isinstance(tp_rank, int)
+                assert isinstance(tp_world_size, int)
+                pin_worker_region(memory_manager, tp_rank, tp_world_size)
         for gpu_tensor, split_k_and_v in parsed_gpu_tensors:
             cpu_shape = list(gpu_tensor.shape)
             cpu_shape[1 if split_k_and_v else 0] = num_cpu_kernel_blocks
@@ -301,34 +308,12 @@ class CpuGpuOffloadingHandlers:
             logger.debug("Allocating CPU tensor of shape %r", cpu_shape)
             if memory_manager is not None:
                 # Use centralized mmap memory
-                assert isinstance(tp_rank, int)
-                assert isinstance(tp_world_size, int)
                 cpu_tensor = memory_manager.get_worker_memory_view(
                     tp_rank=tp_rank,
                     tp_world_size=tp_world_size,
                     shape=tuple(cpu_shape),
                     dtype=gpu_tensor.dtype,
                 )
-                if pin_memory:
-                    try:
-                        torch.cuda.cudaHostRegister(
-                            cpu_tensor.data_ptr(),
-                            cpu_tensor.numel() * cpu_tensor.element_size(),
-                            flags=0,
-                        )
-                        logger.debug(
-                            "Pinned mmap memory for worker TP rank %d: %d MB",
-                            tp_rank,
-                            (cpu_tensor.numel() * cpu_tensor.element_size())
-                            / (1024**2),
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to pin mmap memory for TP rank %d: %s. "
-                            "GPU-CPU transfers may be slower.",
-                            tp_rank,
-                            e,
-                        )
             else:
                 # Fallback to old behavior (for backward compatibility)
                 cpu_tensor = torch.zeros(
@@ -353,4 +338,46 @@ class CpuGpuOffloadingHandlers:
             dst_tensors=gpu_tensors,
             src_block_size_factor=cpu_block_size_factor,
             dst_block_size_factor=gpu_block_size_factor,
+        )
+
+def pin_worker_region(memory_manager, tp_rank: int, tp_world_size: int):
+    # Resolve libcudart and set proper signature
+    libcudart_path = find_library("cudart") or "libcudart.so"
+    cuda = ctypes.CDLL(libcudart_path)
+
+    cuda.cudaHostRegister.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_uint,
+    ]
+    cuda.cudaHostRegister.restype = ctypes.c_int
+
+    base = memory_manager.base_ptr()
+    offset, size = memory_manager.worker_region(tp_rank, tp_world_size)
+    ptr = base + offset
+
+    # You might want cudaHostRegisterPortable | cudaHostRegisterMapped depending on usage
+    cudaHostRegisterDefault = 0
+
+    result = cuda.cudaHostRegister(
+        ctypes.c_void_p(ptr),
+        ctypes.c_size_t(size),
+        ctypes.c_uint(cudaHostRegisterDefault),
+    )
+    if result != 0:
+        # 1 == cudaErrorInvalidValue, but don’t claim “already pinned” unless you know
+        logger.warning(
+            "cudaHostRegister failed for worker %d (ptr=0x%x size=%d), code=%d",
+            tp_rank,
+            ptr,
+            size,
+            result,
+        )
+    else:
+        logger.info(
+            "Pinned mmap region for worker %d: %.2f GB (ptr=0x%x, size=%d)",
+            tp_rank,
+            size / (1024**3),
+            ptr,
+            size,
         )

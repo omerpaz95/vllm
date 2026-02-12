@@ -45,6 +45,7 @@ class KVConnectorFactory:
         config: "VllmConfig",
         role: KVConnectorRole,
         kv_cache_config: "KVCacheConfig | None" = None,
+        memory_manager: "CentralizedOffloadMemoryManager | None" = None,
     ) -> KVConnectorBase:
         kv_transfer_config = config.kv_transfer_config
         if kv_transfer_config is None:
@@ -79,7 +80,11 @@ class KVConnectorFactory:
             return connector_cls(config, role)
         else:
             # New signature: __init__(self, vllm_config, role, kv_cache_config)
-            return connector_cls(config, role, kv_cache_config)
+            # Check if connector supports memory_manager parameter (OffloadingConnector)
+            if supports_kw(connector_cls.__init__, "memory_manager"):
+                return connector_cls(config, role, kv_cache_config, memory_manager)
+            else:
+                return connector_cls(config, role, kv_cache_config)
 
     @classmethod
     def get_connector_class_by_name(

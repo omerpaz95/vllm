@@ -21,7 +21,12 @@ from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
 
 class CPUOffloadingSpec(OffloadingSpec):
-    def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+        memory_manager: CentralizedOffloadMemoryManager | None = None,
+    ):
         super().__init__(vllm_config, kv_cache_config)
 
         cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
@@ -30,14 +35,15 @@ class CPUOffloadingSpec(OffloadingSpec):
                 "cpu_bytes_to_use must be specified in kv_connector_extra_config"
             )
 
-        # ==== NEW: CENTRALIZED CPU OFFLOADING MANAGER
+        # ==== CENTRALIZED CPU OFFLOADING MANAGER
         tp_world_size = vllm_config.parallel_config.world_size
         total_cpu_bytes = int(cpu_bytes_to_use)  # Already accounts for all workers
 
-        self.memory_manager = CentralizedOffloadMemoryManager(
-            total_size_bytes=total_cpu_bytes,
-            mmap_path=self.extra_config.get("mmap_path"),
-        )
+        # If memory_manager is provided (from Scheduler), use it as singleton
+        if memory_manager is not None:
+            self.memory_manager = memory_manager
+        else:
+            print("ERROR: Didn't get the memory_manager from factory :(")
 
         # Store TP info for workers
         self.tp_world_size = tp_world_size
@@ -128,7 +134,4 @@ class CPUOffloadingSpec(OffloadingSpec):
         yield GPULoadStoreSpec, CPULoadStoreSpec, self._handlers.gpu_to_cpu_handler
         yield CPULoadStoreSpec, GPULoadStoreSpec, self._handlers.cpu_to_gpu_handler
 
-    def cleanup(self):
-        """Cleanup centralized memory resources"""
-        if hasattr(self, "memory_manager"):
-            self.memory_manager.cleanup()
+

@@ -123,10 +123,12 @@ class OffloadingConnector(KVConnectorBase_V1):
         vllm_config: VllmConfig,
         role: KVConnectorRole,
         kv_cache_config: KVCacheConfig | None = None,
+        memory_manager: "CentralizedOffloadMemoryManager | None" = None,
     ):
         super().__init__(vllm_config, role, kv_cache_config)
-
-        spec = OffloadingSpecFactory.create_spec(vllm_config, kv_cache_config)
+        spec = OffloadingSpecFactory.create_spec(
+            vllm_config, kv_cache_config, memory_manager
+        )
 
         self.spec = spec
         self.connector_scheduler: OffloadingConnectorScheduler | None = None

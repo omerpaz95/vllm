@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -116,10 +117,21 @@ class Scheduler(SchedulerInterface):
             assert not self.is_encoder_decoder, (
                 "Encoder-decoder models are not currently supported with KV connectors"
             )
+            
+            # Ensure global memory manager is initialized for OffloadingConnector
+            # This must happen before creating the connector
+            from vllm.distributed.kv_transfer.kv_transfer_state import (
+                ensure_offload_memory_manager_initialized,
+            )
+            memory_manager = ensure_offload_memory_manager_initialized(
+                self.vllm_config
+            )
+            
             self.connector = KVConnectorFactory.create_connector(
                 config=self.vllm_config,
                 role=KVConnectorRole.SCHEDULER,
                 kv_cache_config=self.kv_cache_config,
+                memory_manager=memory_manager,
             )
             if self.log_stats:
                 self.connector_prefix_cache_stats = PrefixCacheStats()
@@ -1834,6 +1846,13 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
             self.connector.shutdown()
+        
+        # Cleanup global memory manager (if this is the scheduler process)
+        # Note: ensure_kv_transfer_shutdown() will handle the global cleanup
+        from vllm.distributed.kv_transfer.kv_transfer_state import (
+            ensure_kv_transfer_shutdown,
+        )
+        ensure_kv_transfer_shutdown()
 
     ########################################################################
     # KV Connector Related Methods
