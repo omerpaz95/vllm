@@ -235,6 +235,13 @@ if TYPE_CHECKING:
     VLLM_USE_V2_MODEL_RUNNER: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
+    
+    # spans vars
+    VLLM_V1_SPANS_ENABLED: bool = False
+    VLLM_V1_SPANS_DEBUG: bool = False
+    VLLM_V1_SPANS_TOKEN_PLUS: int = -1
+    VLLM_V1_SPANS_TOKEN_CROSS: int = -1
+    
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
@@ -1465,6 +1472,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS": lambda: bool(
         int(os.getenv("VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS", "0"))
     ),
+
+    # whether to enable block-attention (span detection, fan-in, repositioning)
+    "VLLM_V1_SPANS_ENABLED":
+    lambda: os.environ.get("VLLM_V1_SPANS_ENABLED", "False") == "True",
+
+    # whether to print details pertaining to the block-attention
+    # implementation
+    "VLLM_V1_SPANS_DEBUG":
+    lambda: os.environ.get("VLLM_V1_SPANS_DEBUG", "False") == "True",
+
+    # for block-attention, the token that will be used in order to
+    # indicate the beginning of a span (needed for it to work)
+    "VLLM_V1_SPANS_TOKEN_PLUS":
+    lambda: int(os.environ.get("VLLM_V1_SPANS_TOKEN_PLUS", "-1")),
+
+    # for block-attention, a token that signals the beginning of a
+    # span which needs to depend on all previous tokens
+    "VLLM_V1_SPANS_TOKEN_CROSS":
+    lambda: int(os.environ.get("VLLM_V1_SPANS_TOKEN_CROSS", "-1")),
+
     # Pin the conversation start date injected into the Harmony system
     # message. When unset the current date is used, which introduces
     # non-determinism (different tokens -> different model behaviour at
