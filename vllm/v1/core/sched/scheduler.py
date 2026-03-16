@@ -38,6 +38,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.sched.gap_policy import GapPolicy, GapPolicyFactory
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -135,6 +136,19 @@ class Scheduler(SchedulerInterface):
                 self.vllm_config.kv_transfer_config.kv_load_failure_policy
             )
             self.recompute_kv_load_failures = kv_load_failure_policy == "recompute"
+
+        # Initialize gap policy for KV cache recomputation
+        self.gap_policy: GapPolicy | None = None
+        if self.scheduler_config.gap_policy_name is not None:
+            self.gap_policy = GapPolicyFactory.create_policy(
+                policy_name=self.scheduler_config.gap_policy_name,
+                policy_config=self.scheduler_config.gap_policy_config,
+            )
+            logger.info(
+                "Initialized gap policy: %s with config: %s",
+                self.scheduler_config.gap_policy_name,
+                self.scheduler_config.gap_policy_config,
+            )
 
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
@@ -868,6 +882,93 @@ class Scheduler(SchedulerInterface):
                 for req in scheduled_new_reqs
             ]
 
+        # Track virtual gap request IDs for model runner cleanup
+        virtual_gap_req_ids: set[str] = set()
+
+        # NEW: Apply gap policy to create gaps in ANY cached tokens
+        if len(new_reqs_data) > 0:
+            for nrd in new_reqs_data:
+                request = self.requests.get(nrd.req_id)
+                if request is None:
+                    continue
+
+                # Get gaps from policy (works for all cached tokens)
+                computed_token_gaps: list[tuple[int, int]] = []
+
+                if self.gap_policy is not None:
+                    # Calculate total computed tokens
+                    num_computed_tokens = request.num_computed_tokens
+                    num_external_tokens = request.num_external_computed_tokens
+
+                    # Get policy-driven gaps
+                    policy_gaps = self.gap_policy.get_gaps(
+                        request,
+                        num_computed_tokens,
+                        num_external_tokens,
+                    )
+                    computed_token_gaps.extend(policy_gaps)
+
+                # Merge connector-reported gaps
+                if self.connector is not None:
+                    connector_gaps = self.connector.get_computed_token_gaps(request)
+                    if connector_gaps:
+                        logger.info(
+                            "Connector %s returned gaps via get_computed_token_gaps(). "
+                            "Consider migrating to use GapPolicy at scheduler level.",
+                            type(self.connector).__name__,
+                        )
+                        computed_token_gaps.extend(connector_gaps)
+
+                # Merge and deduplicate gaps if needed
+                if computed_token_gaps:
+                    computed_token_gaps = self._merge_gaps(computed_token_gaps)
+
+                if not computed_token_gaps:
+                    continue
+
+                logger.info(
+                    "Processing computed_token_gaps for request %s: %s",
+                    request.request_id,
+                    computed_token_gaps,
+                )
+                for start, end in computed_token_gaps:
+                    print(f"Gap: ({start},{end})")
+                    nrd_copy = replace(nrd)
+                    parent_req_id = nrd_copy.req_id  # Save parent before modification
+                    nrd_copy.req_id = nrd_copy.req_id + "." + str(start)
+                    # Virtual gap requests share parent's blocks and write directly
+                    # to gap positions in parent's KV cache. num_computed_tokens=start
+                    # makes positions [start, start+1, ...] which map to gap slots.
+                    nrd_copy.num_computed_tokens = start
+                    nrd_copy.is_gap_recompute = True
+                    nrd_copy.parent_req_id = parent_req_id
+                    nrd_copy.gap_start = start  # For cleanup tracking
+                    req_copy_num_sched_tokens = end - start
+                    num_scheduled_tokens[nrd_copy.req_id] = req_copy_num_sched_tokens
+                    total_num_scheduled_tokens += req_copy_num_sched_tokens
+                    # Virtual request shares ALL parent's blocks so slot mappings
+                    # point to correct positions in parent's KV cache
+                    nrd_copy.block_ids = nrd.block_ids
+                    # For virtual gap request, include prefix + gap tokens (tokens
+                    # up to end). This ensures token_indices correctly map to
+                    # position num_computed_tokens=start, since positions are
+                    # based on num_computed_tokens and prompt_token_ids must
+                    # include the prefix the model assumes is computed.
+                    nrd_copy.prompt_token_ids = (
+                        nrd.prompt_token_ids[:end]
+                        if nrd.prompt_token_ids is not None
+                        else None
+                    )
+                    # For v2 model runner, prefill_token_ids also needs to be set
+                    if self.use_v2_model_runner and nrd.prefill_token_ids is not None:
+                        nrd_copy.prefill_token_ids = nrd.prefill_token_ids[:end]
+                    block_count = (
+                        len(nrd_copy.block_ids[0]) if nrd_copy.block_ids else 0
+                    )
+                    new_reqs_data.append(nrd_copy)
+                    # Track this virtual request ID for cleanup
+                    virtual_gap_req_ids.add(nrd_copy.req_id)
+
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
                 scheduled_running_reqs,
@@ -902,6 +1003,7 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            virtual_gap_req_ids=virtual_gap_req_ids if virtual_gap_req_ids else None,
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
 
@@ -960,7 +1062,9 @@ class Scheduler(SchedulerInterface):
         #    computed tokens will be adjusted in update_from_output.
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
-            request = self.requests[req_id]
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
             request.num_computed_tokens += num_scheduled_token
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
@@ -981,6 +1085,37 @@ class Scheduler(SchedulerInterface):
         # NOTE: We shouldn't do self.finished_req_ids.clear() here because
         # it will also affect the scheduler output.
         self.finished_req_ids = set()
+
+    @staticmethod
+    def _merge_gaps(gaps: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """
+        Merge overlapping or adjacent gap intervals.
+
+        Args:
+            gaps: List of (start, end) tuples, possibly overlapping
+
+        Returns:
+            Sorted, merged list of non-overlapping gaps
+        """
+        if not gaps:
+            return []
+
+        # Sort by start position
+        sorted_gaps = sorted(gaps, key=lambda x: x[0])
+
+        merged = [sorted_gaps[0]]
+        for current_start, current_end in sorted_gaps[1:]:
+            last_start, last_end = merged[-1]
+
+            # Check if current gap overlaps or is adjacent to last gap
+            if current_start <= last_end:
+                # Merge by extending the last gap
+                merged[-1] = (last_start, max(last_end, current_end))
+            else:
+                # No overlap, add as new gap
+                merged.append((current_start, current_end))
+
+        return merged
 
     def _update_request_as_session(
         self, session: Request, update: StreamingUpdate
@@ -1458,6 +1593,7 @@ class Scheduler(SchedulerInterface):
 
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
+            print(f"Inserted {len(failed_kv_load_req_ids)} failed_kv_load_req_ids.")
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
                 outputs[request.client_index].append(
