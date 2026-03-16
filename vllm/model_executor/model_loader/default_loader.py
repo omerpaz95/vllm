@@ -23,6 +23,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     get_quant_config,
+    instanttensor_weights_iterator,
     maybe_download_from_modelscope,
     multi_thread_pt_weights_iterator,
     multi_thread_safetensors_weights_iterator,
@@ -30,6 +31,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
+from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
 logger = init_logger(__name__)
@@ -50,6 +52,9 @@ class DefaultModelLoader(BaseModelLoader):
 
         revision: str | None
         """The optional model revision."""
+
+        subfolder: str | None = None
+        """The subfolder inside the model repo."""
 
         prefix: str = ""
         """A prefix to prepend to all weights."""
@@ -80,6 +85,7 @@ class DefaultModelLoader(BaseModelLoader):
     def _prepare_weights(
         self,
         model_name_or_path: str,
+        subfolder: str | None,
         revision: str | None,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
@@ -116,7 +122,11 @@ class DefaultModelLoader(BaseModelLoader):
         # Some quantized models use .pt files for storing the weights.
         if load_format == "hf":
             allow_patterns = ["*.safetensors", "*.bin"]
-        elif load_format == "safetensors" or load_format == "fastsafetensors":
+        elif (
+            load_format == "safetensors"
+            or load_format == "fastsafetensors"
+            or load_format == "instanttensor"
+        ):
             use_safetensors = True
             allow_patterns = ["*.safetensors"]
         elif load_format == "mistral":
@@ -142,10 +152,14 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.download_dir,
                 allow_patterns,
                 revision,
+                subfolder=subfolder,
                 ignore_patterns=self.load_config.ignore_patterns,
             )
         else:
             hf_folder = model_name_or_path
+
+        if subfolder is not None:
+            hf_folder = os.path.join(hf_folder, subfolder)
 
         hf_weights_files: list[str] = []
         for pattern in allow_patterns:
@@ -165,8 +179,9 @@ class DefaultModelLoader(BaseModelLoader):
                 download_safetensors_index_file_from_hf(
                     model_name_or_path,
                     index_file,
-                    self.load_config.download_dir,
-                    revision,
+                    cache_dir=self.load_config.download_dir,
+                    subfolder=subfolder,
+                    revision=revision,
                 )
             hf_weights_files = filter_duplicate_safetensors_files(
                 hf_weights_files, hf_folder, index_file
@@ -188,6 +203,7 @@ class DefaultModelLoader(BaseModelLoader):
         extra_config = self.load_config.model_loader_extra_config
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
+            source.subfolder,
             source.revision,
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
@@ -205,6 +221,11 @@ class DefaultModelLoader(BaseModelLoader):
         elif use_safetensors:
             if self.load_config.load_format == "fastsafetensors":
                 weights_iterator = fastsafetensors_weights_iterator(
+                    hf_weights_files,
+                    self.load_config.use_tqdm_on_load,
+                )
+            elif self.load_config.load_format == "instanttensor":
+                weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
                 )
@@ -268,12 +289,14 @@ class DefaultModelLoader(BaseModelLoader):
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
-            model_config.model,
-            model_config.revision,
+            model_name_or_path=model_config.model,
+            subfolder=None,
+            revision=model_config.revision,
             fall_back_to_pt=True,
             allow_patterns_overrides=None,
         )
 
+    @instrument(span_name="Load weights")
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         if model_config.quantization == "torchao":
             quant_config = get_quant_config(model_config, self.load_config)

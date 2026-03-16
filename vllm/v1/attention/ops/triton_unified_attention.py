@@ -10,10 +10,12 @@
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
+is_batch_invariant = vllm_is_batch_invariant()
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
 
@@ -137,7 +139,7 @@ def kernel_unified_attention_2d(
     query_offset_0 = cur_batch_in_all_start_index + query_pos
     query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
     offs_d_new = tl.arange(0, HEAD_SIZE_PADDED // 2)
-    
+
     query_offset_a = (
         query_offset_0[:, None] * query_stride_0
         + query_offset_1[:, None] * query_stride_1
@@ -152,7 +154,7 @@ def kernel_unified_attention_2d(
     )
 
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
-    
+
     dim_mask_a = tl.where(offs_d_new < HEAD_SIZE, 1, 0).to(tl.int1)
     dim_mask_b = tl.where((HEAD_SIZE_PADDED // 2 + offs_d_new) < HEAD_SIZE, 1, 0).to(
         tl.int1
@@ -174,7 +176,7 @@ def kernel_unified_attention_2d(
         mask=dim_mask_b[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
-    
+
     block_table_offset = seq_idx * block_table_stride
 
     if not USE_SINKS:
@@ -341,7 +343,6 @@ def kernel_unified_attention_2d(
         else:
             K_rot_a = K_a
             K_rot_b = K_b
-
 
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
@@ -587,7 +588,6 @@ def kernel_unified_attention_3d(
         + HEAD_SIZE_PADDED // 2
     )
 
-
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
     dim_mask_a = tl.where(offs_d_new < HEAD_SIZE, 1, 0).to(tl.int1)
     dim_mask_b = tl.where((HEAD_SIZE_PADDED // 2 + offs_d_new) < HEAD_SIZE, 1, 0).to(
@@ -775,7 +775,6 @@ def kernel_unified_attention_3d(
             K_rot_a = K_a
             K_rot_b = K_b
 
-
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
             value_cache_ptr + v_offset,
@@ -787,7 +786,7 @@ def kernel_unified_attention_3d(
             if Q_a.dtype.is_fp8():
                 V = V_load
             else:
-                 V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q_a.dtype)
+                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q_a.dtype)
         else:
             V = V_load
 
@@ -1130,7 +1129,8 @@ def unified_attention(
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
     # 2. The batch includes at least one prefill request, or
-    # 3. The number of sequences exceeds the configured threshold
+    # 3. The number of sequences exceeds the configured threshold, or
+    # 4. Batch invariance is enabled
     if (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
@@ -1139,6 +1139,7 @@ def unified_attention(
         or softmax_segm_expsum is None
         or max_seqlen_q > 1
         or num_seqs > seq_threshold_3D
+        or is_batch_invariant
     ):
         kernel_unified_attention_2d[
             (
