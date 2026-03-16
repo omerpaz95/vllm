@@ -19,7 +19,9 @@ class AsyncScheduler(Scheduler):
         super()._update_after_schedule(scheduler_output)
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
         for req_id in scheduler_output.num_scheduled_tokens:
-            request = self.requests[req_id]
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
             if request.is_prefill_chunk:
                 continue
 
