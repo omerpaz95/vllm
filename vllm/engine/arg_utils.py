@@ -1221,6 +1221,12 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
+        scheduler_group.add_argument(
+            "--gap-policy-name", **scheduler_kwargs["gap_policy_name"]
+        )
+        scheduler_group.add_argument(
+            "--gap-policy-config", **scheduler_kwargs["gap_policy_config"]
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
@@ -1522,8 +1528,14 @@ class EngineArgs:
             "enable_prefix_caching must be set by this point"
         )
 
+        # Allow VLLM_V1_SPANS_BLOCK_SIZE env var to override block_size
+        # when not explicitly set via CLI
+        block_size = self.block_size
+        if block_size is None and envs.VLLM_V1_SPANS_BLOCK_SIZE > 0:
+            block_size = envs.VLLM_V1_SPANS_BLOCK_SIZE
+
         cache_config = CacheConfig(
-            block_size=self.block_size,  # type: ignore[arg-type]
+            block_size=block_size,  # type: ignore[arg-type]
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
             cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]
@@ -1763,6 +1775,22 @@ class EngineArgs:
         assert model_config.max_model_len is not None, (
             "max_model_len must be set by this point"
         )
+        # Allow gap policy configuration via env vars when not set via CLI
+        gap_policy_name = self.gap_policy_name
+        if gap_policy_name is None and envs.VLLM_V1_SPANS_GAP_POLICY_ENABLE:
+            gap_policy_name = "span_aware"
+
+        gap_policy_config = self.gap_policy_config
+        if gap_policy_config is None and gap_policy_name is not None:
+            config: dict[str, Any] = {
+                "gap_length": envs.VLLM_V1_SPANS_GAP_LENGTH,
+            }
+            if envs.VLLM_V1_SPANS_TOKEN_PLUS >= 0:
+                config["span_marker_token_id"] = envs.VLLM_V1_SPANS_TOKEN_PLUS
+            if block_size is not None:
+                config["block_size"] = block_size
+            gap_policy_config = config
+
         scheduler_config = SchedulerConfig(
             runner_type=model_config.runner_type,
             max_num_batched_tokens=self.max_num_batched_tokens,
@@ -1780,8 +1808,8 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
-            gap_policy_name=self.gap_policy_name,
-            gap_policy_config=self.gap_policy_config,
+            gap_policy_name=gap_policy_name,
+            gap_policy_config=gap_policy_config,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
