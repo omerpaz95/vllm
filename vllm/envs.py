@@ -241,6 +241,10 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_DEBUG: bool = False
     VLLM_V1_SPANS_TOKEN_PLUS: int = -1
     VLLM_V1_SPANS_TOKEN_CROSS: int = -1
+    VLLM_V1_SPANS_PAD_TOKEN: int = -1
+    VLLM_V1_SPANS_BLOCK_SIZE: int = 0
+    VLLM_V1_SPANS_GAP_POLICY_ENABLE: bool = False
+    VLLM_V1_SPANS_GAP_LENGTH: int = 32
 
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
@@ -1500,6 +1504,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # span which needs to depend on all previous tokens
     "VLLM_V1_SPANS_TOKEN_CROSS": lambda: int(
         os.environ.get("VLLM_V1_SPANS_TOKEN_CROSS", "-1")
+    ),
+    # for block-attention, the token used for padding sequences
+    # to block boundaries (client-side)
+    "VLLM_V1_SPANS_PAD_TOKEN": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_PAD_TOKEN", "-1")
+    ),
+    # override block size for spans (0 = use default/CLI value)
+    "VLLM_V1_SPANS_BLOCK_SIZE": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_BLOCK_SIZE", "0")
+    ),
+    # enable span-aware gap policy via env var
+    "VLLM_V1_SPANS_GAP_POLICY_ENABLE": lambda: os.environ.get(
+        "VLLM_V1_SPANS_GAP_POLICY_ENABLE", "False"
+    )
+    == "True",
+    # gap length for span-aware gap policy
+    "VLLM_V1_SPANS_GAP_LENGTH": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_GAP_LENGTH", "32")
     ),
     # Pin the conversation start date injected into the Harmony system
     # message. When unset the current date is used, which introduces
