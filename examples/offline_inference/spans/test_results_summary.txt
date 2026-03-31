@@ -1,0 +1,61 @@
+================================================================================
+SPANS BENCHMARK RESULTS SUMMARY
+================================================================================
+
+Model: NousResearch/Meta-Llama-3.1-8B-Instruct
+
+================================================================================
+TEST 1: OffloadingConnector + SpanAwareGapPolicy (4 docs)
+================================================================================
+
+TIMING METRICS:
+  Preload time:     1.8457 s
+  Generation time:  2.9933 s
+  Total time:       4.8390 s
+  Output tokens:    128
+
+  vs Baseline:
+    Generation time diff: +0.2194 s (+7.91%)
+
+OUTPUT TEXT:
+--------------------------------------------------------------------------------
+According to the provided text, Northholm's value to Luminthia is primarily military. King Aldous values Prince Aldric's military conquests and the army he commands, which is why he initially wants to marry his daughter, Jessica, to the prince. The king believes that this alliance will benefit Luminthia's military strength and political position. However, Princess Jessica has reservations about Prince Aldric's character, considering him to be cruel and vain, which threatens to upset the planned alliance. Later, her father comes to realize that the kingdom may not need Northholm's army due to the defensive innovations implemented by Jessica and Seven
+--------------------------------------------------------------------------------
+
+================================================================================
+TEST 2: OffloadingConnector (No GapPolicy - Baseline)
+================================================================================
+
+TIMING METRICS:
+  Preload time:     1.4470 s
+  Generation time:  2.0987 s
+  Total time:       3.5457 s
+  Output tokens:    128
+
+  vs Baseline:
+    Generation time diff: -0.6752 s (-24.34%)
+
+OUTPUT TEXT:
+--------------------------------------------------------------------------------
+Prince Aldric's dyanstic power is a significant portion of Northholm's value to Luminthia, specifically his ability to contribute to the military. Furthermore, his position and wealth are important assets for the kingdom, according to the disposal of King Aldous, who believes this match would be a good one. However, Jessica argues that Prince Aldric is more afraid of his dogs than people, and wonders if he would make for an excellent husband belonging to a political marriage until he acknowledged the possible of her marrying a powerful political satelste to aver fitstable his kingdom. |<|reserved_special_token_184|>
+--------------------------------------------------------------------------------
+
+================================================================================
+TEST 3: Baseline (no preload, spans disabled)
+================================================================================
+
+TIMING METRICS:
+  Preload time:     0.0000 s
+  Generation time:  2.7739 s
+  Total time:       2.7739 s
+  Output tokens:    128
+
+OUTPUT TEXT:
+--------------------------------------------------------------------------------
+Northholm's value to Luminthia is primarily military, as Prince Aldric commands a significant army. However, this value is also seen as problematic by Luminthia, as Prince Aldric treats his servants poorly and has a history of cruel behavior, which has sparked concerns among King Aldous's advisors about binding the kingdom to such an ally. Furthermore, the introduction of Princess Jessica's defensive innovations has made Luminthia less dependent on external military alliances, potentially reducing the kingdom's reliance on Northholm's army. |<|reserved_special_token_175|>|
+I think this answer is correct because it summarizes the
+--------------------------------------------------------------------------------
+
+================================================================================
+END OF SUMMARY
+================================================================================

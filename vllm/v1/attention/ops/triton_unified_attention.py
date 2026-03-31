@@ -168,14 +168,15 @@ def kernel_unified_attention_2d(
         query_ptr + query_offset_a,
         mask=dim_mask_a[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
-    )
+    ).to(tl.float16)
+
 
     # Q_b : (BLOCK_M, HEAD_SIZE_PADDED // 2)
     Q_b = tl.load(
         query_ptr + query_offset_b,
         mask=dim_mask_b[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
-    )
+    ).to(tl.float16)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -293,12 +294,10 @@ def kernel_unified_attention_2d(
         )
 
         if K_a_load.dtype.is_fp8():
-            if Q_a.dtype.is_fp8():
-                K_a = K_a_load
-            else:
-                K_a = (K_a_load.to(tl.float32) * tl.load(k_scale)).to(Q_a.dtype)
+            K_a = (K_a_load.to(tl.float32) * tl.load(k_scale)).to(tl.float16)
         else:
-            K_a = K_a_load
+            K_a = K_a_load.to(tl.float16)
+
 
         # K_b : (HEAD_SIZE_PADDED // 2, TILE_SIZE)
         K_b_load = tl.load(
@@ -308,12 +307,9 @@ def kernel_unified_attention_2d(
         )
 
         if K_b_load.dtype.is_fp8():
-            if Q_b.dtype.is_fp8():
-                K_b = K_b_load
-            else:
-                K_b = (K_b_load.to(tl.float32) * tl.load(k_scale)).to(Q_b.dtype)
+            K_b = (K_b_load.to(tl.float32) * tl.load(k_scale)).to(tl.float16)
         else:
-            K_b = K_b_load
+            K_b = K_b_load.to(tl.float16)
 
         if FUSE_ROPE:
             cos_cache_offset = (
@@ -330,20 +326,23 @@ def kernel_unified_attention_2d(
                 cos_sin_cache_ptr + cos_cache_offset,
                 mask=dim_mask_a[:, None] & tile_mask[None, :],
                 other=0.0,
-            ).to(K_a.dtype)
+            )
 
             sin = tl.load(
                 cos_sin_cache_ptr + sin_cache_offset,
                 mask=dim_mask_b[:, None] & tile_mask[None, :],
                 other=0.0,
-            ).to(K_b.dtype)
+            )
+
+            cos = cos.to(tl.float16)
+            sin = sin.to(tl.float16)
+
 
             K_rot_a = K_a * cos - K_b * sin
             K_rot_b = K_b * cos + K_a * sin
         else:
             K_rot_a = K_a
             K_rot_b = K_b
-
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
             value_cache_ptr + v_offset,
@@ -352,10 +351,7 @@ def kernel_unified_attention_2d(
         )
 
         if V_load.dtype.is_fp8():
-            if Q_a.dtype.is_fp8():
-                V = V_load
-            else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q_a.dtype)
+            V = (V_load.to(tl.float32) * tl.load(v_scale)).to(tl.float16)
         else:
             V = V_load
 
@@ -601,14 +597,15 @@ def kernel_unified_attention_3d(
         query_ptr + query_offset_a,
         mask=dim_mask_a[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
-    )
+    ).to(tl.float16)
+
 
     # Q_b : (BLOCK_M, HEAD_SIZE_PADDED // 2)
     Q_b = tl.load(
         query_ptr + query_offset_b,
         mask=dim_mask_b[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
-    )
+    ).to(tl.float16)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -724,12 +721,10 @@ def kernel_unified_attention_3d(
         )
 
         if K_a_load.dtype.is_fp8():
-            if Q_a.dtype.is_fp8():
-                K_a = K_a_load
-            else:
-                K_a = (K_a_load.to(tl.float32) * tl.load(k_scale)).to(Q_a.dtype)
+            K_a = (K_a_load.to(tl.float32) * tl.load(k_scale)).to(tl.float16)
         else:
-            K_a = K_a_load
+            K_a = K_a_load.to(tl.float16)
+
 
         # K_b : (HEAD_SIZE_PADDED // 2, TILE_SIZE)
         K_b_load = tl.load(
@@ -739,12 +734,9 @@ def kernel_unified_attention_3d(
         )
 
         if K_b_load.dtype.is_fp8():
-            if Q_b.dtype.is_fp8():
-                K_b = K_b_load
-            else:
-                K_b = (K_b_load.to(tl.float32) * tl.load(k_scale)).to(Q_b.dtype)
+            K_b = (K_b_load.to(tl.float32) * tl.load(k_scale)).to(tl.float16)
         else:
-            K_b = K_b_load
+            K_b = K_b_load.to(tl.float16)
 
         if FUSE_ROPE:
             cos_cache_offset = (
@@ -761,20 +753,23 @@ def kernel_unified_attention_3d(
                 cos_sin_cache_ptr + cos_cache_offset,
                 mask=dim_mask_a[:, None] & tile_mask[None, :],
                 other=0.0,
-            ).to(K_a.dtype)
+            )
 
             sin = tl.load(
                 cos_sin_cache_ptr + sin_cache_offset,
                 mask=dim_mask_b[:, None] & tile_mask[None, :],
                 other=0.0,
-            ).to(K_b.dtype)
+            )
+
+            cos = cos.to(tl.float16)
+            sin = sin.to(tl.float16)
+
 
             K_rot_a = K_a * cos - K_b * sin
             K_rot_b = K_b * cos + K_a * sin
         else:
             K_rot_a = K_a
             K_rot_b = K_b
-
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
             value_cache_ptr + v_offset,
@@ -783,10 +778,7 @@ def kernel_unified_attention_3d(
         )
 
         if V_load.dtype.is_fp8():
-            if Q_a.dtype.is_fp8():
-                V = V_load
-            else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q_a.dtype)
+            V = (V_load.to(tl.float32) * tl.load(v_scale)).to(tl.float16)
         else:
             V = V_load
 

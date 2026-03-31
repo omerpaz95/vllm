@@ -1809,32 +1809,6 @@ class GPUModelRunner(
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
-        # Debug: Print slot mapping for virtual requests created from gaps
-        for req_idx in range(num_reqs):
-            req_id = self.input_batch.req_ids[req_idx]
-            if req_id:  # and "." in req_id:  # Virtual request from gap
-                # Get the slot mapping for this request
-                req_start_idx = cu_num_tokens[req_idx - 1] if req_idx > 0 else 0
-                req_end_idx = cu_num_tokens[req_idx]
-                req_num_tokens = num_scheduled_tokens[req_idx]
-
-                # Get slot mapping from block table (it's computed but not yet in attention metadata)
-                slot_mapping_np = self.input_batch.block_table[0].slot_mapping.cpu[
-                    :total_num_scheduled_tokens
-                ]
-                req_slot_mapping = slot_mapping_np[req_start_idx:req_end_idx]
-
-                print("[DEBUG] Virtual Request Slot Mapping (Model Runner):")
-                print(f"  req_id: {req_id}")
-                print(f"  req_idx: {req_idx}")
-                print(f"  num_scheduled_tokens: {req_num_tokens}")
-                print(
-                    f"  num_computed_tokens: {self.input_batch.num_computed_tokens_cpu[req_idx]}"
-                )
-                print(f"  token_range_in_batch: [{req_start_idx}, {req_end_idx})")
-                print(f"  slot_mapping (first 20): {req_slot_mapping[:20].tolist()}")
-                print(f"  slot_mapping (last 20): {req_slot_mapping[-20:].tolist()}")
-                print(f"  slot_mapping length: {len(req_slot_mapping)}")
 
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
@@ -2010,14 +1984,34 @@ class GPUModelRunner(
         block_table_gid_0 = _get_block_table(0)
         slot_mapping_gid_0 = slot_mappings[0]
 
+        # print("==================MODULES===============")
+        
+        # # Dump full structure
+        # for name, module in self.model.named_modules():
+        #     logger.info("MODULE: %s -> %s", name, type(module).__name__)
+        #     for attr_name, attr_value in module.__dict__.items():
+        #         logger.info("  .%s: %s = %s", attr_name, type(attr_value).__name__, repr(attr_value)[:100])
+
+        # # Find rotary
+        # for name, module in self.model.named_modules():
+        #     if "rotary" in type(module).__name__.lower() or "rotary" in name.lower():
+        #         logger.info("ROTARY FOUND: %s -> %s", name, type(module).__name__)
+        
         if not hasattr(self, "rotate"):
-            if not isinstance(self.model.model.layers[0], PPMissingLayer):
-                self.rotate = self.model.model.layers[0].self_attn.rotary_emb
+            # Get the layers list, handling both standard and Llama4-style model structures
+            if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+                layers = self.model.model.layers
+            elif hasattr(self.model, "language_model") and hasattr(self.model.language_model, "model"):
+                layers = self.model.language_model.model.layers
             else:
-                for lay in self.model.model.layers:
-                    if not isinstance(lay, PPMissingLayer):
-                        self.rotate = lay.self_attn.rotary_emb
-                        break
+                raise AttributeError(f"Cannot find layers in model structure: {type(self.model).__name__}")
+
+            for lay in layers:
+                if not isinstance(lay, PPMissingLayer):
+                    self.rotate = lay.self_attn.rotary_emb
+                    break
+            else:
+                raise AttributeError("All layers are PPMissingLayer, cannot find rotary_emb")
 
         if self.routed_experts_initialized:
             attn_gid = self.routed_experts_attn_gid

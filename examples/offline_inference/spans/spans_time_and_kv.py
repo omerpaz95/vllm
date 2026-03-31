@@ -24,8 +24,13 @@ MODEL_NAMES = [
     "ldsjmdy/Tulu3-Block-FT",  # Finetuned to handle block-attention
     "ldsjmdy/Tulu3-RAG",  # Baseline
     "ibm-granite/granite-3.1-8b-instruct",  # IBMchuk
+    "/vllm-workspace/hub/models--meta-llama--Llama-4-Maverick-17B-128E-Instruct-FP8/snapshots/94125d2bd83076b21eed33119525e29eaf3894f4",
+    # "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8", # Llama-4
+    "zai-org/GLM-4.7-FP8", # GLM-4.7-FP8
+    "mistralai/Mistral-Large-3-675B-Instruct-2512", # Minimax
+    "NousResearch/Meta-Llama-3.1-8B-Instruct", # Llama-3.1
 ]
-SELECTED_MODEL_INDEX = 2
+SELECTED_MODEL_INDEX = 3
 
 # Block-attention tokens
 PAD_TOKEN = 27  # "<"
@@ -275,8 +280,8 @@ class LLMInstance:
         use_gap_policy: bool = False,
     ) -> "LLMInstance":
         """Create a new LLM instance with the given configuration."""
-        samp_preload = SamplingParams(temperature=0, max_tokens=1)
-        samp_generate = SamplingParams(temperature=0, max_tokens=max_generated)
+        samp_preload = SamplingParams(temperature=1.0, max_tokens=1)
+        samp_generate = SamplingParams(temperature=1.0, max_tokens=max_generated)
 
         # Configure gap policy if requested
         gap_policy_name = None
@@ -284,7 +289,7 @@ class LLMInstance:
         if use_gap_policy:
             gap_policy_name = "span_aware"
             gap_policy_config = {
-                "gap_length": 32,
+                "gap_length":128,
                 "span_marker_token_id": SPAN_TOKEN_PLUS,
                 "block_size": BLOCK_SIZE,
             }
@@ -293,12 +298,19 @@ class LLMInstance:
             model=model_name,
             gpu_memory_utilization=GPU_MEMORY_UTIL,
             kv_transfer_config=kv_config,
+            # trust_remote_code=True,
+            # enable_expert_parallel=True,
             gap_policy_name=gap_policy_name,
             gap_policy_config=gap_policy_config,
             enforce_eager=True,
             block_size=BLOCK_SIZE,
             attention_backend="TRITON_ATTN",
+            tensor_parallel_size=8,
             # enable_prefix_caching=False, # Use this for testing with external cache (Like offloadingConnector)
+            kv_cache_dtype="fp8",
+            async_scheduling=True,
+            enable_prefix_caching=False,
+            max_num_batched_tokens=8192,
         )
 
         tok = llm.get_tokenizer()
