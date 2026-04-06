@@ -110,18 +110,19 @@ class SharedMmapRegion:
         Args:
             tensor_page_size: Bytes per block for this  tensor.
         """
+        new_offset = self._worker_offset + tensor_page_size
+        assert new_offset <= self._worker_area_end, (
+            f"Worker offset {new_offset} exceeds worker area end "
+            f"{self._worker_area_end} (overflowed by "
+            f"{new_offset - self._worker_area_end} bytes)"
+        )
         worker_layer_view = torch.as_strided(
             self._base,
             size=(self.num_blocks, tensor_page_size),
             stride=(self._row_stride, 1),
             storage_offset=self._worker_offset,
         )
-        self._worker_offset += tensor_page_size
-        assert self._worker_offset < self._worker_area_end, (
-            f"Worker offset {self._worker_offset} exceeds worker area end "
-            f"{self._worker_area_end} (overflowed by "
-            f"{self._worker_offset - self._worker_area_end} bytes)"
-        )
+        self._worker_offset = new_offset
         return worker_layer_view
 
     def cleanup(self) -> None:
