@@ -4,7 +4,6 @@ import os
 import random
 import time
 import uuid
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -281,13 +280,12 @@ def test_mmap_round_trip(
         cpu_page_size=cpu_page_size,
     )
     try:
-        with patch("vllm.v1.kv_offload.worker.cpu_gpu.pin_mmap_region"):
-            handlers = CpuGpuOffloadingHandlers(
-                kv_caches=kv_caches,
-                block_size_factor=block_size_factor,
-                num_cpu_blocks=num_cpu_blocks,
-                mmap_region=mmap_region,
-            )
+        handlers = CpuGpuOffloadingHandlers(
+            kv_caches=kv_caches,
+            block_size_factor=block_size_factor,
+            num_cpu_blocks=num_cpu_blocks,
+            mmap_region=mmap_region,
+        )
 
         # each logical cpu_block maps to block_size_factor GPU sub-blocks,
         # so we need num_mappings * block_size_factor GPU blocks total
@@ -358,11 +356,13 @@ def test_mmap_round_trip(
 
 @pytest.mark.parametrize("num_workers", [2, 4])
 @pytest.mark.parametrize("num_tensors", [1, 2])
+@pytest.mark.parametrize("block_size_factor", [1, 2, 4])
 @torch.inference_mode()
 def test_interleaved_layout(
     default_vllm_config,
     num_workers: int,
     num_tensors: int,
+    block_size_factor: int,
 ) -> None:
     """For each block row the mmap should contain
     [worker0 | worker1 | ... | workerN] contiguously."""
@@ -370,7 +370,6 @@ def test_interleaved_layout(
     gpu_page_size_bytes = 512
     num_gpu_blocks = 32
     num_cpu_blocks = 8
-    block_size_factor = 1
     device = "cuda:0"
 
     cpu_page_size = gpu_page_size_bytes * block_size_factor * num_tensors
@@ -406,15 +405,14 @@ def test_interleaved_layout(
                 fill_value=fill_value,
             )
 
-            with patch("vllm.v1.kv_offload.worker.cpu_gpu.pin_mmap_region"):
-                handlers = CpuGpuOffloadingHandlers(
-                    kv_caches=kv_caches,
-                    block_size_factor=block_size_factor,
-                    num_cpu_blocks=num_cpu_blocks,
-                    mmap_region=regions[rank],
-                )
+            handlers = CpuGpuOffloadingHandlers(
+                kv_caches=kv_caches,
+                block_size_factor=block_size_factor,
+                num_cpu_blocks=num_cpu_blocks,
+                mmap_region=regions[rank],
+            )
 
-            gpu_blocks = list(range(len(cpu_blocks_to_use)))
+            gpu_blocks = list(range(len(cpu_blocks_to_use) * block_size_factor))
             src_spec = GPULoadStoreSpec(gpu_blocks, group_sizes=(len(gpu_blocks),))
             dst_spec = CPULoadStoreSpec(cpu_blocks_to_use)
 
@@ -491,13 +489,12 @@ def test_tp_agnostic_contiguity(
                 device,
                 fill_value=rank + 1,
             )
-            with patch("vllm.v1.kv_offload.worker.cpu_gpu.pin_mmap_region"):
-                handlers = CpuGpuOffloadingHandlers(
-                    kv_caches=kv_caches,
-                    block_size_factor=block_size_factor,
-                    num_cpu_blocks=num_cpu_blocks,
-                    mmap_region=regions[rank],
-                )
+            handlers = CpuGpuOffloadingHandlers(
+                kv_caches=kv_caches,
+                block_size_factor=block_size_factor,
+                num_cpu_blocks=num_cpu_blocks,
+                mmap_region=regions[rank],
+            )
 
             gpu_blocks = list(range(len(cpu_blocks_to_use) * block_size_factor))
             src_spec = GPULoadStoreSpec(gpu_blocks, group_sizes=(len(gpu_blocks),))

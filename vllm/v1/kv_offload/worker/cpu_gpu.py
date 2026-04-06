@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ctypes
 from collections import deque
-from ctypes.util import find_library
 from dataclasses import dataclass
 
 import numpy as np
@@ -31,39 +30,6 @@ class Transfer:
     start_event: torch.Event
     end_event: torch.Event
     num_bytes: int
-
-
-def expand_block_ids(
-    block_ids: np.ndarray,
-    block_size_factor: int,
-    output: np.ndarray,
-    skip_count: int = 0,
-):
-    """
-    Convert a list of block IDs to a list of matching block ids,
-    assuming each block is composed of actual block_size_factor blocks.
-    Outputs to output tensor.
-    The first skip_count blocks will be skipped.
-    Note that skip_count must be less than block_size_factor.
-
-    For example, if block_ids = [0, 1, 3] and block_size_factor =  4,
-    then it yields [0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15]
-    since 0 maps to [0, 1, 2, 3]
-    1 maps to [4, 5, 6, 7]
-    and 3 maps to [12, 13, 14, 15]
-    """
-    assert skip_count < block_size_factor
-
-    first_range = np.arange(skip_count, block_size_factor)
-    full_range = np.arange(0, block_size_factor)
-
-    output_idx = 0
-    for i, block_id in enumerate(block_ids):
-        base_block_id = block_id * block_size_factor
-        indices = first_range if i == 0 else full_range
-        output_end_idx = output_idx + len(indices)
-        output[output_idx:output_end_idx] = base_block_id + indices
-        output_idx = output_end_idx
 
 
 def compute_sub_block_ptrs(
@@ -119,24 +85,12 @@ def compute_sub_block_ptrs(
 def pin_mmap_region(region: SharedMmapRegion) -> None:
     """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
     tp_rank = get_tensor_model_parallel_rank()
-    libcudart = find_library("cudart") or "libcudart.so"
-    cuda = ctypes.CDLL(libcudart)
-    cuda.cudaHostRegister.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.c_uint,
-    ]
-    cuda.cudaHostRegister.restype = ctypes.c_int
 
     mv = memoryview(region.mmap_obj)
     base_ptr = ctypes.addressof(ctypes.c_char.from_buffer(mv))
 
-    result = cuda.cudaHostRegister(
-        ctypes.c_void_p(base_ptr),
-        ctypes.c_size_t(region.total_size_bytes),
-        ctypes.c_uint(0),
-    )
-    if result != 0:
+    result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
+    if result.value != 0:
         logger.warning(
             "cudaHostRegister failed for tp_rank=%d (code=%d) — "
             "falling back to standard pin_memory allocation",
@@ -267,8 +221,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         all_dst = np.empty(total, dtype=np.int64)
         all_sizes = np.empty(total, dtype=np.int64)
 
-        for t_idx in range(num_tensors):
-            bsz = self._block_size_in_bytes_arr[t_idx]
+        for t_idx, bsz in enumerate(self._block_size_in_bytes_arr):
             start = t_idx * num_pairs
             end = start + num_pairs
             compute_sub_block_ptrs(
