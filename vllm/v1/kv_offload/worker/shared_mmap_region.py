@@ -55,6 +55,7 @@ class SharedMmapRegion:
         self.mmap_path = f"/dev/shm/vllm_offload_{instance_id}.mmap"
         self._creator = False  # set True only if this worker creates the file
         self.num_blocks = num_blocks
+        self.rank = rank
         # interleaved-layout stride: one row = all workers' data for one block
         self._row_stride = cpu_page_size * num_workers
         # byte offset to this worker's first slot within each block row
@@ -66,7 +67,13 @@ class SharedMmapRegion:
             self.fd = os.open(
                 self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_TRUNC, 0o600
             )
+            t0 = time.monotonic()
             os.ftruncate(self.fd, self.total_size_bytes)
+            logger.info(
+                "ftruncate %.2f GB: %.3f s",
+                self.total_size_bytes / 1e9,
+                time.monotonic() - t0,
+            )
             self._creator = True
             logger.info(
                 "Created mmap file %s (%.2f GB)",
@@ -78,11 +85,17 @@ class SharedMmapRegion:
             _wait_for_file_size(self.fd, self.total_size_bytes)
             logger.info("Opened existing mmap file %s", self.mmap_path)
 
+        t0 = time.monotonic()
         self.mmap_obj = mmap.mmap(
             self.fd,
             self.total_size_bytes,
             flags=mmap.MAP_SHARED | mmap.MAP_POPULATE,
             prot=mmap.PROT_READ | mmap.PROT_WRITE,
+        )
+        logger.info(
+            "mmap MAP_POPULATE %.2f GB: %.3f s",
+            self.total_size_bytes / 1e9,
+            time.monotonic() - t0,
         )
         # int8 base — one element == one byte, so strides equal byte offsets
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)

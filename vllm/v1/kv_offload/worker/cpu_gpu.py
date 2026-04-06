@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ctypes
+import time
 from collections import deque
 from dataclasses import dataclass
 
@@ -8,7 +9,6 @@ import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.kv_offload.mediums import BlockIDsLoadStoreSpec
@@ -84,12 +84,14 @@ def compute_sub_block_ptrs(
 
 def pin_mmap_region(region: SharedMmapRegion) -> None:
     """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
-    tp_rank = get_tensor_model_parallel_rank()
+    tp_rank = region.rank
 
     mv = memoryview(region.mmap_obj)
     base_ptr = ctypes.addressof(ctypes.c_char.from_buffer(mv))
 
+    t0 = time.monotonic()
     result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
+    elapsed = time.monotonic() - t0
     if result.value != 0:
         logger.warning(
             "cudaHostRegister failed for tp_rank=%d (code=%d) — "
@@ -99,9 +101,10 @@ def pin_mmap_region(region: SharedMmapRegion) -> None:
         )
     else:
         logger.info(
-            "Pinned mmap region for tp_rank=%d: %.2f GB",
+            "cudaHostRegister tp_rank=%d %.2f GB: %.3f s",
             tp_rank,
             region.total_size_bytes / 1e9,
+            elapsed,
         )
 
 
@@ -338,11 +341,19 @@ class CpuGpuOffloadingHandlers:
             if mmap_region is not None:
                 cpu_tensor = mmap_region.alloc_tensor(cpu_page_size_bytes)
             else:
+                t0 = time.monotonic()
                 cpu_tensor = torch.zeros(
                     (num_cpu_blocks, cpu_page_size_bytes),
                     dtype=torch.int8,
                     device="cpu",
                     pin_memory=pin_memory,
+                )
+                logger.info(
+                    "torch.zeros pinned tensor %d×%d (%.2f GB): %.3f s",
+                    num_cpu_blocks,
+                    cpu_page_size_bytes,
+                    num_cpu_blocks * cpu_page_size_bytes / 1e9,
+                    time.monotonic() - t0,
                 )
 
             gpu_tensors.append(gpu_tensor)
