@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
-from typing import Literal
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from vllm.v1.kv_offload.abstract import (
     LoadStoreSpec,
@@ -14,6 +15,12 @@ from vllm.v1.kv_offload.cpu.policies.abstract import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
+
+
+@dataclass
+class ReqContext:
+    kv_transfer_params: dict[str, Any] | None = None
+
 
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
@@ -83,7 +90,11 @@ class CPUOffloadingManager(OffloadingManager):
 
     # --- OffloadingManager interface ---
 
-    def lookup(self, keys: Iterable[OffloadKey]) -> int | None:
+    def lookup(
+        self,
+        keys: Iterable[OffloadKey],
+        req_context: ReqContext,
+    ) -> int | None:
         hit_count = 0
         for key in keys:
             block = self._policy.get(key)
@@ -92,7 +103,11 @@ class CPUOffloadingManager(OffloadingManager):
             hit_count += 1
         return hit_count
 
-    def prepare_load(self, keys: Iterable[OffloadKey]) -> LoadStoreSpec:
+    def prepare_load(
+        self,
+        keys: Iterable[OffloadKey],
+        req_context: ReqContext,
+    ) -> LoadStoreSpec:
         blocks = []
         for key in keys:
             block = self._policy.get(key)
@@ -112,7 +127,11 @@ class CPUOffloadingManager(OffloadingManager):
             assert block.ref_cnt > 0, f"Block {key!r} ref_cnt is already 0"
             block.ref_cnt -= 1
 
-    def prepare_store(self, keys: Iterable[OffloadKey]) -> PrepareStoreOutput | None:
+    def prepare_store(
+        self,
+        keys: Iterable[OffloadKey],
+        req_context: ReqContext,
+    ) -> PrepareStoreOutput | None:
         keys_list = list(keys)
 
         # filter out blocks that are already stored

@@ -22,6 +22,7 @@ from vllm.v1.kv_offload.abstract import (
     get_offload_block_hash,
     make_offload_key,
 )
+from vllm.v1.kv_offload.cpu.manager import ReqContext
 from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
 from vllm.v1.kv_offload.spec import OffloadingSpec
 from vllm.v1.kv_offload.worker.worker import TransferSpec
@@ -181,7 +182,11 @@ class OffloadingConnectorScheduler:
             return 0, False
 
         start_block_idx = num_computed_tokens // group_config.offloaded_block_size
-        hits = self.manager.lookup(offload_keys[start_block_idx:])
+        request_context = ReqContext(request.kv_transfer_params)
+        hits = self.manager.lookup(
+            offload_keys[start_block_idx:],
+            request_context,
+        )
         if hits is None:
             # indicates a lookup that should be tried later
             return None, False
@@ -248,8 +253,8 @@ class OffloadingConnectorScheduler:
 
         assert len(request.block_hashes) // self.config.block_size_factor >= num_blocks
         offload_keys = group_state.offload_keys[start_block_idx:num_blocks]
-
-        src_spec = self.manager.prepare_load(offload_keys)
+        req_context = ReqContext(request.kv_transfer_params)
+        src_spec = self.manager.prepare_load(offload_keys, req_context)
         dst_spec = GPULoadStoreSpec(
             block_ids[num_computed_gpu_blocks:],
             group_sizes=(num_pending_gpu_blocks,),
@@ -304,7 +309,8 @@ class OffloadingConnectorScheduler:
             assert len(req.block_hashes) >= num_gpu_blocks
 
             new_offload_keys = group_state.offload_keys[start_block_idx:num_blocks]
-            store_output = self.manager.prepare_store(new_offload_keys)
+            req_context = ReqContext(req.kv_transfer_params)
+            store_output = self.manager.prepare_store(new_offload_keys, req_context)
             if store_output is None:
                 logger.warning(
                     "Request %s: cannot store %s blocks", req_id, num_new_blocks
