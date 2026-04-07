@@ -3,16 +3,15 @@
 from collections.abc import Iterator
 
 from vllm.config import VllmConfig
-from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.abstract import LoadStoreSpec, OffloadingManager
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
 from vllm.v1.kv_offload.reuse_manager import FilterReusedOffloadingManager
 from vllm.v1.kv_offload.spec import CanonicalKVCaches, OffloadingSpec
 from vllm.v1.kv_offload.worker.cpu_gpu import CpuGpuOffloadingHandlers
-from vllm.v1.kv_offload.worker.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
 
@@ -106,7 +105,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 instance_id=self.vllm_config.instance_id,
                 total_size_bytes=int(self.extra_config["cpu_bytes_to_use"]),
                 num_blocks=self.num_blocks,
-                rank=get_tensor_model_parallel_rank(),
+                rank=self.vllm_config.parallel_config.rank,
                 num_workers=num_workers,
                 cpu_page_size=self.mmap_page_size,
             )

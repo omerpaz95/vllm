@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import atexit
-import contextlib
 import mmap
 import os
 import time
@@ -28,7 +27,7 @@ def _wait_for_file_size(fd: int, expected_size: int, timeout: float = 30.0) -> N
 
 class SharedOffloadRegion:
     """
-    Single mmap-backed memory region shared across all TP workers for a
+    Single mmap-backed memory region shared across all workers for a
     vLLM instance.  Workers coordinate via the filesystem: the first worker
     to open the file with O_EXCL becomes the creator and calls ftruncate;
     the rest open the existing file and wait until it reaches the expected
@@ -42,7 +41,7 @@ class SharedOffloadRegion:
         instance_id: str,
         total_size_bytes: int,
         num_blocks: int,
-        rank: int,
+        rank: int | None,
         num_workers: int,
         cpu_page_size: int,
     ) -> None:
@@ -58,22 +57,15 @@ class SharedOffloadRegion:
         self.rank = rank
         # interleaved-layout stride: one row = all workers' data for one block
         self._row_stride = cpu_page_size * num_workers
-        # byte offset to this worker's first slot within each block row
-        self._worker_offset = rank * cpu_page_size
-        # exclusive upper bound for this worker's area within each row
-        self._worker_area_end = (rank + 1) * cpu_page_size
+        if rank is not None:
+            # byte offset to this worker's first slot within each block row
+            self._worker_offset = rank * cpu_page_size
+            # exclusive upper bound for this worker's area within each row
+            self._worker_area_end = (rank + 1) * cpu_page_size
         try:
             # Exclusive create — only one worker succeeds
-            self.fd = os.open(
-                self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_TRUNC, 0o600
-            )
-            t0 = time.monotonic()
+            self.fd = os.open(self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
             os.ftruncate(self.fd, self.total_size_bytes)
-            logger.info(
-                "ftruncate %.2f GB: %.3f s",
-                self.total_size_bytes / 1e9,
-                time.monotonic() - t0,
-            )
             self._creator = True
             logger.info(
                 "Created mmap file %s (%.2f GB)",
@@ -85,28 +77,23 @@ class SharedOffloadRegion:
             _wait_for_file_size(self.fd, self.total_size_bytes)
             logger.info("Opened existing mmap file %s", self.mmap_path)
 
-        t0 = time.monotonic()
         self.mmap_obj = mmap.mmap(
             self.fd,
             self.total_size_bytes,
             flags=mmap.MAP_SHARED,
             prot=mmap.PROT_READ | mmap.PROT_WRITE,
         )
+
         # Populate only this worker's pages (one slot per block row) instead of
         # faulting the entire shared region with MAP_POPULATE.
         # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
-        _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
-        worker_offset = rank * cpu_page_size
-        for block in range(num_blocks):
-            offset = block * self._row_stride + worker_offset
-            self.mmap_obj.madvise(_MADV_POPULATE_WRITE, offset, cpu_page_size)
-        logger.info(
-            "mmap selective MADV_POPULATE_WRITE %.2f GB (rank %d/%d): %.3f s",
-            self.total_size_bytes / 1e9,
-            rank,
-            num_workers,
-            time.monotonic() - t0,
-        )
+        if rank is not None:
+            _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+            worker_offset = rank * cpu_page_size
+            for block in range(num_blocks):
+                offset = block * self._row_stride + worker_offset
+                self.mmap_obj.madvise(_MADV_POPULATE_WRITE, offset, cpu_page_size)
+
         # int8 base — one element == one byte, so strides equal byte offsets
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
         atexit.register(self.cleanup)
@@ -133,6 +120,7 @@ class SharedOffloadRegion:
         Args:
             tensor_page_size: Bytes per block for this  tensor.
         """
+        assert self.rank is not None
         new_offset = self._worker_offset + tensor_page_size
         assert new_offset <= self._worker_area_end, (
             f"Worker offset {new_offset} exceeds worker area end "
@@ -151,16 +139,31 @@ class SharedOffloadRegion:
     def cleanup(self) -> None:
         # Release the torch tensor first; while it holds an exported buffer
         # reference to the mmap, mmap.close() raises BufferError.
+        if getattr(self, "is_pinned", False) and self._base is not None:
+            base_ptr = self._base.data_ptr()
+            result = torch.cuda.cudart().cudaHostUnregister(base_ptr)
+            if result.value != 0:
+                logger.warning(
+                    "cudaHostUnregister failed for rank=%d (code=%d)", self.rank, result
+                )
+            self.is_pinned = False
         self._base = None
         if getattr(self, "mmap_obj", None) is not None:
-            with contextlib.suppress(Exception):
+            try:
                 self.mmap_obj.close()
+            except Exception:
+                logger.warning("Failed to close mmap_obj", exc_info=True)
         if getattr(self, "fd", None) is not None:
-            with contextlib.suppress(Exception):
+            try:
                 os.close(self.fd)
+            except Exception:
+                logger.warning("Failed to close fd %s", self.fd, exc_info=True)
         if self._creator and getattr(self, "mmap_path", None):
             try:
                 os.unlink(self.mmap_path)
                 logger.info("Removed mmap file %s", self.mmap_path)
             except Exception:
-                pass
+                logger.warning(
+                    "Failed to unlink path %s", self.mmap_path, exc_info=True
+                )
+            self._creator = False

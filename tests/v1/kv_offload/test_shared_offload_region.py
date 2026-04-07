@@ -9,15 +9,10 @@ import threading
 import time
 import uuid
 
-# On WSL, NVML is not compatible with fork so vLLM auto-overrides the
-# multiprocessing start method to 'spawn' with a warning. Set it explicitly
-# here so the override is a no-op and the warning is suppressed.
-os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-
 import pytest
 
 from vllm.utils.system_utils import get_mp_context
-from vllm.v1.kv_offload.worker.shared_offload_region import (
+from vllm.v1.kv_offload.cpu.shared_offload_region import (
     SharedOffloadRegion,
     _wait_for_file_size,
 )
@@ -28,6 +23,14 @@ PAGE_SIZE = mmap.PAGESIZE
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _set_spawn_method(monkeypatch):
+    # On WSL, NVML is not compatible with fork so vLLM auto-overrides the
+    # multiprocessing start method to 'spawn' with a warning. Set it explicitly
+    # here so the override is a no-op and the warning is suppressed.
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 
 def _make_region(

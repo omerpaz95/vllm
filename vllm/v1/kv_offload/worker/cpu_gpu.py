@@ -10,9 +10,9 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.mediums import BlockIDsLoadStoreSpec
 from vllm.v1.kv_offload.spec import CanonicalKVCacheRef, CanonicalKVCaches
-from vllm.v1.kv_offload.worker.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.worker.worker import (
     OffloadingHandler,
     TransferResult,
@@ -83,26 +83,24 @@ def compute_sub_block_ptrs(
 
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
     """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
-    tp_rank = region.rank
+    rank = region.rank
 
     base_ptr = region._base.data_ptr()
-    t0 = time.monotonic()
     result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
-    elapsed = time.monotonic() - t0
     if result.value != 0:
         logger.warning(
-            "cudaHostRegister failed for tp_rank=%d (code=%d) — "
+            "cudaHostRegister failed for rank=%d (code=%d) — "
             "transfers will still work but may be slower (unpinned DMA)",
-            tp_rank,
+            rank,
             result,
         )
     else:
         logger.info(
-            "cudaHostRegister tp_rank=%d %.2f GB: %.3f s",
-            tp_rank,
+            "cudaHostRegister rank=%d %.2f GB",
+            rank,
             region.total_size_bytes / 1e9,
-            elapsed,
         )
+        region.is_pinned = True
 
 
 class SingleDirectionOffloadingHandler(OffloadingHandler):
