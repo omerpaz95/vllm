@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
-from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Literal
 
 from vllm.v1.kv_offload.abstract import (
     LoadStoreSpec,
@@ -10,17 +9,12 @@ from vllm.v1.kv_offload.abstract import (
     OffloadingManager,
     OffloadKey,
     PrepareStoreOutput,
+    ReqContext,
 )
 from vllm.v1.kv_offload.cpu.policies.abstract import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
-
-
-@dataclass
-class ReqContext:
-    kv_transfer_params: dict[str, Any] | None = None
-
 
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
