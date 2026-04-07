@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import ctypes
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -13,7 +12,7 @@ from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.kv_offload.mediums import BlockIDsLoadStoreSpec
 from vllm.v1.kv_offload.spec import CanonicalKVCacheRef, CanonicalKVCaches
-from vllm.v1.kv_offload.worker.shared_mmap_region import SharedMmapRegion
+from vllm.v1.kv_offload.worker.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.worker.worker import (
     OffloadingHandler,
     TransferResult,
@@ -82,20 +81,18 @@ def compute_sub_block_ptrs(
     output[:] = flat[skip_count : skip_count + num_sub_blocks]
 
 
-def pin_mmap_region(region: SharedMmapRegion) -> None:
+def pin_mmap_region(region: SharedOffloadRegion) -> None:
     """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
     tp_rank = region.rank
 
-    mv = memoryview(region.mmap_obj)
-    base_ptr = ctypes.addressof(ctypes.c_char.from_buffer(mv))
-
+    base_ptr = region._base.data_ptr()
     t0 = time.monotonic()
     result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
     elapsed = time.monotonic() - t0
     if result.value != 0:
         logger.warning(
             "cudaHostRegister failed for tp_rank=%d (code=%d) — "
-            "falling back to standard pin_memory allocation",
+            "transfers will still work but may be slower (unpinned DMA)",
             tp_rank,
             result,
         )
@@ -321,7 +318,7 @@ class CpuGpuOffloadingHandlers:
         kv_caches: CanonicalKVCaches,
         block_size_factor: int,
         num_cpu_blocks: int,
-        mmap_region: SharedMmapRegion | None = None,
+        mmap_region: SharedOffloadRegion | None = None,
     ):
         pin_memory = is_pin_memory_available()
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
@@ -339,7 +336,7 @@ class CpuGpuOffloadingHandlers:
             cpu_page_size_bytes = gpu_page_size_bytes * block_size_factor
 
             if mmap_region is not None:
-                cpu_tensor = mmap_region.alloc_tensor(cpu_page_size_bytes)
+                cpu_tensor = mmap_region.create_next_view(cpu_page_size_bytes)
             else:
                 t0 = time.monotonic()
                 cpu_tensor = torch.zeros(

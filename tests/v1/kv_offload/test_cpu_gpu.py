@@ -17,7 +17,7 @@ from vllm.v1.kv_offload.spec import (
     CanonicalKVCacheTensor,
 )
 from vllm.v1.kv_offload.worker.cpu_gpu import CpuGpuOffloadingHandlers
-from vllm.v1.kv_offload.worker.shared_mmap_region import SharedMmapRegion
+from vllm.v1.kv_offload.worker.shared_offload_region import SharedOffloadRegion
 
 NUM_GPU_BLOCKS = [64]
 NUM_CPU_BLOCKS = [256]
@@ -39,6 +39,7 @@ NUM_MAPPINGS = [3]
 @pytest.mark.parametrize("num_tensors", NUM_TENSORS)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("use_shared_memory", [False, True])
 @torch.inference_mode()
 def test_transfer(
     default_vllm_config,
@@ -51,6 +52,7 @@ def test_transfer(
     num_tensors: int,
     seed: int,
     device: str,
+    use_shared_memory: bool,
 ) -> None:
     set_random_seed(seed)
 
@@ -86,10 +88,24 @@ def test_transfer(
         tensors=kv_cache_tensors,
         group_data_refs=kv_cache_groups_data_refs,
     )
+
+    mmap_region: SharedOffloadRegion | None = None
+    if use_shared_memory:
+        cpu_page_size = gpu_page_size_bytes * num_tensors * block_size_factor
+        mmap_region = SharedOffloadRegion(
+            instance_id=str(uuid.uuid4()),
+            total_size_bytes=num_cpu_blocks * cpu_page_size,
+            num_blocks=num_cpu_blocks,
+            rank=0,
+            num_workers=1,
+            cpu_page_size=cpu_page_size,
+        )
+
     handlers = CpuGpuOffloadingHandlers(
         kv_caches=kv_caches,
         block_size_factor=block_size_factor,
         num_cpu_blocks=num_cpu_blocks,
+        mmap_region=mmap_region,
     )
 
     # select block mappings
@@ -173,6 +189,9 @@ def test_transfer(
                 expected = orig_dst_view[dst_sub_block]
             torch.testing.assert_close(dst_view[dst_sub_block].cpu(), expected.cpu())
 
+    if mmap_region:
+        mmap_region.cleanup()
+
 
 # ---------------------------------------------------------------------------
 # Helpers for mmap tests
@@ -233,7 +252,7 @@ def _wait_for_handler(handler, job_id, timeout=10):
 
 
 # ---------------------------------------------------------------------------
-# test_mmap_round_trip — data integrity through the SharedMmapRegion path
+# test_mmap_round_trip — data integrity through the SharedOffloadRegion path
 # ---------------------------------------------------------------------------
 
 MMAP_GPU_PAGE_SIZES = [512, 1024]
@@ -271,7 +290,7 @@ def test_mmap_round_trip(
     instance_id = str(uuid.uuid4())
     total_mmap_bytes = num_cpu_blocks * num_workers * cpu_page_size
 
-    mmap_region = SharedMmapRegion(
+    mmap_region = SharedOffloadRegion(
         instance_id=instance_id,
         total_size_bytes=total_mmap_bytes,
         num_blocks=num_cpu_blocks,
@@ -376,12 +395,12 @@ def test_interleaved_layout(
     instance_id = str(uuid.uuid4())
     total_mmap_bytes = num_cpu_blocks * num_workers * cpu_page_size
 
-    regions: list[SharedMmapRegion] = []
+    regions: list[SharedOffloadRegion] = []
     try:
         # create one region per rank (same file, MAP_SHARED)
         for rank in range(num_workers):
             regions.append(
-                SharedMmapRegion(
+                SharedOffloadRegion(
                     instance_id=instance_id,
                     total_size_bytes=total_mmap_bytes,
                     num_blocks=num_cpu_blocks,
@@ -465,11 +484,11 @@ def test_tp_agnostic_contiguity(
     instance_id = str(uuid.uuid4())
     total_mmap_bytes = num_cpu_blocks * num_workers * cpu_page_size
 
-    regions: list[SharedMmapRegion] = []
+    regions: list[SharedOffloadRegion] = []
     try:
         for rank in range(num_workers):
             regions.append(
-                SharedMmapRegion(
+                SharedOffloadRegion(
                     instance_id=instance_id,
                     total_size_bytes=total_mmap_bytes,
                     num_blocks=num_cpu_blocks,

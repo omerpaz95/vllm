@@ -12,7 +12,7 @@ from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
 from vllm.v1.kv_offload.reuse_manager import FilterReusedOffloadingManager
 from vllm.v1.kv_offload.spec import CanonicalKVCaches, OffloadingSpec
 from vllm.v1.kv_offload.worker.cpu_gpu import CpuGpuOffloadingHandlers
-from vllm.v1.kv_offload.worker.shared_mmap_region import SharedMmapRegion
+from vllm.v1.kv_offload.worker.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
 
@@ -102,7 +102,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 )
 
             num_workers = self.vllm_config.parallel_config.world_size
-            mmap_region = SharedMmapRegion(
+            mmap_region = SharedOffloadRegion(
                 instance_id=self.vllm_config.instance_id,
                 total_size_bytes=int(self.extra_config["cpu_bytes_to_use"]),
                 num_blocks=self.num_blocks,

@@ -26,7 +26,7 @@ def _wait_for_file_size(fd: int, expected_size: int, timeout: float = 30.0) -> N
         time.sleep(0.005)
 
 
-class SharedMmapRegion:
+class SharedOffloadRegion:
     """
     Single mmap-backed memory region shared across all TP workers for a
     vLLM instance.  Workers coordinate via the filesystem: the first worker
@@ -89,19 +89,29 @@ class SharedMmapRegion:
         self.mmap_obj = mmap.mmap(
             self.fd,
             self.total_size_bytes,
-            flags=mmap.MAP_SHARED | mmap.MAP_POPULATE,
+            flags=mmap.MAP_SHARED,
             prot=mmap.PROT_READ | mmap.PROT_WRITE,
         )
+        # Populate only this worker's pages (one slot per block row) instead of
+        # faulting the entire shared region with MAP_POPULATE.
+        # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
+        _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+        worker_offset = rank * cpu_page_size
+        for block in range(num_blocks):
+            offset = block * self._row_stride + worker_offset
+            self.mmap_obj.madvise(_MADV_POPULATE_WRITE, offset, cpu_page_size)
         logger.info(
-            "mmap MAP_POPULATE %.2f GB: %.3f s",
+            "mmap selective MADV_POPULATE_WRITE %.2f GB (rank %d/%d): %.3f s",
             self.total_size_bytes / 1e9,
+            rank,
+            num_workers,
             time.monotonic() - t0,
         )
         # int8 base — one element == one byte, so strides equal byte offsets
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
         atexit.register(self.cleanup)
 
-    def alloc_tensor(self, tensor_page_size: int) -> torch.Tensor:
+    def create_next_view(self, tensor_page_size: int) -> torch.Tensor:
         """Allocate a strided int8 view for this worker, one canonical tensor.
 
         Must be called once per canonical tensor. The full mmap layout is:
@@ -139,6 +149,9 @@ class SharedMmapRegion:
         return worker_layer_view
 
     def cleanup(self) -> None:
+        # Release the torch tensor first; while it holds an exported buffer
+        # reference to the mmap, mmap.close() raises BufferError.
+        self._base = None
         if getattr(self, "mmap_obj", None) is not None:
             with contextlib.suppress(Exception):
                 self.mmap_obj.close()
