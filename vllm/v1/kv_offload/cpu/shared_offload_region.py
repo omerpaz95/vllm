@@ -64,7 +64,9 @@ class SharedOffloadRegion:
             self._worker_area_end = (rank + 1) * cpu_page_size
         try:
             # Exclusive create — only one worker succeeds
-            self.fd = os.open(self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            self.fd: int | None = os.open(
+                self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
+            )
             os.ftruncate(self.fd, self.total_size_bytes)
             self._creator = True
             logger.info(
@@ -77,7 +79,7 @@ class SharedOffloadRegion:
             _wait_for_file_size(self.fd, self.total_size_bytes)
             logger.info("Opened existing mmap file %s", self.mmap_path)
 
-        self.mmap_obj = mmap.mmap(
+        self.mmap_obj: mmap.mmap | None = mmap.mmap(
             self.fd,
             self.total_size_bytes,
             flags=mmap.MAP_SHARED,
@@ -94,8 +96,8 @@ class SharedOffloadRegion:
                 offset = block * self._row_stride + worker_offset
                 self.mmap_obj.madvise(_MADV_POPULATE_WRITE, offset, cpu_page_size)
 
-        # int8 base — one element == one byte, so strides equal byte offsets
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
+        self._views: list[torch.Tensor] = []
         atexit.register(self.cleanup)
 
     def create_next_view(self, tensor_page_size: int) -> torch.Tensor:
@@ -134,11 +136,10 @@ class SharedOffloadRegion:
             storage_offset=self._worker_offset,
         )
         self._worker_offset = new_offset
+        self._views.append(worker_layer_view)
         return worker_layer_view
 
     def cleanup(self) -> None:
-        # Release the torch tensor first; while it holds an exported buffer
-        # reference to the mmap, mmap.close() raises BufferError.
         if getattr(self, "is_pinned", False) and self._base is not None:
             base_ptr = self._base.data_ptr()
             result = torch.cuda.cudart().cudaHostUnregister(base_ptr)
@@ -147,17 +148,27 @@ class SharedOffloadRegion:
                     "cudaHostUnregister failed for rank=%d (code=%d)", self.rank, result
                 )
             self.is_pinned = False
+        # Release views before _base: each view holds a _base reference and a
+        # direct StorageImpl reference.  Freeing views first lets both refcounts
+        # drop so the storage (which holds the mmap_obj buffer export) is freed
+        # before mmap_obj.close() is called below.
+        if getattr(self, "_views", None) is not None:
+            self._views.clear()
         self._base = None
         if getattr(self, "mmap_obj", None) is not None:
             try:
-                self.mmap_obj.close()
+                if self.mmap_obj:
+                    self.mmap_obj.close()
             except Exception:
                 logger.warning("Failed to close mmap_obj", exc_info=True)
+            self.mmap_obj = None
         if getattr(self, "fd", None) is not None:
             try:
-                os.close(self.fd)
+                if self.fd:
+                    os.close(self.fd)
             except Exception:
                 logger.warning("Failed to close fd %s", self.fd, exc_info=True)
+            self.fd = None
         if self._creator and getattr(self, "mmap_path", None):
             try:
                 os.unlink(self.mmap_path)

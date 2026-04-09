@@ -159,6 +159,7 @@ def _mp_race_construct_and_write(
         t[:, :] = fill_value
         done_queue.put({"rank": rank, "error": None})
         cleanup_queue.get()  # wait for parent's verification to finish
+        del t  # release view before cleanup to avoid BufferError
         region.cleanup()
     except Exception as e:
         done_queue.put({"rank": rank, "error": repr(e)})
@@ -183,6 +184,7 @@ def test_create_next_view_shape_and_stride(iid):
         assert t.shape == (4, PAGE_SIZE)
         # num_workers=1 → row_stride = cpu_page_size
         assert t.stride() == (2 * PAGE_SIZE, 1)
+        del t
 
 
 def test_create_next_view_storage_offset_rank0(iid):
@@ -190,6 +192,7 @@ def test_create_next_view_storage_offset_rank0(iid):
     with _region(iid, cpu_page_size=PAGE_SIZE, num_workers=2, rank=0) as r:
         t = r.create_next_view(PAGE_SIZE)
         assert t.data_ptr() == r._base.data_ptr()  # storage_offset == 0
+        del t
 
 
 def test_create_next_view_storage_offset_rank1(iid):
@@ -197,6 +200,7 @@ def test_create_next_view_storage_offset_rank1(iid):
     with _multi_region(iid, num_workers=2, num_blocks=4) as (r0, r1):
         t1 = r1.create_next_view(PAGE_SIZE)
         assert t1.data_ptr() == r1._base.data_ptr() + PAGE_SIZE
+        del t1
 
 
 def test_create_next_view_row_stride_with_multiple_workers(iid):
@@ -204,6 +208,7 @@ def test_create_next_view_row_stride_with_multiple_workers(iid):
     with _region(iid, num_blocks=2, num_workers=4) as r:
         t = r.create_next_view(PAGE_SIZE)
         assert t.stride(0) == 4 * PAGE_SIZE
+        del t
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +282,7 @@ def test_create_next_view_write_visible_in_raw_mmap(iid):
         # num_workers=1 → row_stride = PAGE_SIZE; block 2 starts at byte 2*PAGE_SIZE
         chunk = bytes(raw[2 * PAGE_SIZE : 3 * PAGE_SIZE])
         assert all(b == 42 for b in chunk)
+        del raw, t
 
 
 def test_create_next_view_multi_tensor_layout(iid):
@@ -295,6 +301,7 @@ def test_create_next_view_multi_tensor_layout(iid):
             assert all(
                 b == 2 for b in raw[row_offset + PAGE_SIZE : row_offset + 2 * PAGE_SIZE]
             )
+        del raw, ta, tb
 
 
 def test_create_next_view_multiprocess_slots(iid):
@@ -348,6 +355,7 @@ def test_create_next_view_multiprocess_slots(iid):
             assert all(b == 11 for b in w0), f"block {blk}: rank0 slot wrong"
             assert all(b == 22 for b in w1), f"block {blk}: rank1 slot wrong"
 
+        del raw, t0  # release before finally triggers cleanup
         cleanup_queue.put(True)
         child.join(timeout=10)
         assert child.exitcode == 0
@@ -374,6 +382,7 @@ def test_create_next_view_worker_isolation(iid):
             w1 = bytes(raw[row_start + PAGE_SIZE : row_start + 2 * PAGE_SIZE])
             assert all(b == 11 for b in w0), f"block {blk}: worker0 slot corrupted"
             assert all(b == 22 for b in w1), f"block {blk}: worker1 slot corrupted"
+        del raw, t0, t1  # release before finally triggers cleanup
 
 
 # ---------------------------------------------------------------------------
