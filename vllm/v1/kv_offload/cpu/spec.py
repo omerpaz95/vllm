@@ -7,7 +7,6 @@ from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.abstract import LoadStoreSpec, OffloadingManager
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
-from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
 from vllm.v1.kv_offload.reuse_manager import FilterReusedOffloadingManager
 from vllm.v1.kv_offload.spec import CanonicalKVCaches, OffloadingSpec
@@ -38,11 +37,7 @@ class CPUOffloadingSpec(OffloadingSpec):
             * len(kv_cache_config.kv_cache_tensors)
             * vllm_config.parallel_config.world_size
         )
-        self.mmap_page_size = (
-            page_size_bytes
-            * len(kv_cache_config.kv_cache_tensors)
-            * self.block_size_factor
-        )
+
         kv_bytes_per_offloaded_block = kv_bytes_per_block * self.block_size_factor
         self.num_blocks = (
             int(cpu_bytes_to_use) // kv_bytes_per_offloaded_block
@@ -100,21 +95,10 @@ class CPUOffloadingSpec(OffloadingSpec):
                     "CPU Offloading is currently only supported on CUDA-alike GPUs"
                 )
 
-            num_workers = self.vllm_config.parallel_config.world_size
-            mmap_region = SharedOffloadRegion(
-                instance_id=self.vllm_config.instance_id,
-                total_size_bytes=int(self.extra_config["cpu_bytes_to_use"]),
-                num_blocks=self.num_blocks,
-                rank=self.vllm_config.parallel_config.rank,
-                num_workers=num_workers,
-                cpu_page_size=self.mmap_page_size,
-            )
-
             self._handlers = CpuGpuOffloadingHandlers(
                 kv_caches=kv_caches,
                 block_size_factor=self.block_size_factor,
                 num_cpu_blocks=self.num_blocks,
-                mmap_region=mmap_region,
             )
 
         assert self._handlers is not None

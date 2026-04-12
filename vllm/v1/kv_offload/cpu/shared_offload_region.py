@@ -98,6 +98,7 @@ class SharedOffloadRegion:
 
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
         self._views: list[torch.Tensor] = []
+        self.is_pinned: bool = False
         atexit.register(self.cleanup)
 
     def create_next_view(self, tensor_page_size: int) -> torch.Tensor:
@@ -140,7 +141,7 @@ class SharedOffloadRegion:
         return worker_layer_view
 
     def cleanup(self) -> None:
-        if getattr(self, "is_pinned", False) and self._base is not None:
+        if self.is_pinned and self._base is not None:
             base_ptr = self._base.data_ptr()
             result = torch.cuda.cudart().cudaHostUnregister(base_ptr)
             if result.value != 0:
@@ -152,20 +153,18 @@ class SharedOffloadRegion:
         # direct StorageImpl reference.  Freeing views first lets both refcounts
         # drop so the storage (which holds the mmap_obj buffer export) is freed
         # before mmap_obj.close() is called below.
-        if getattr(self, "_views", None) is not None:
+        if self._views is not None:
             self._views.clear()
         self._base = None
-        if getattr(self, "mmap_obj", None) is not None:
+        if self.mmap_obj:
             try:
-                if self.mmap_obj:
-                    self.mmap_obj.close()
+                self.mmap_obj.close()
             except Exception:
                 logger.warning("Failed to close mmap_obj", exc_info=True)
             self.mmap_obj = None
-        if getattr(self, "fd", None) is not None:
+        if self.fd:
             try:
-                if self.fd:
-                    os.close(self.fd)
+                os.close(self.fd)
             except Exception:
                 logger.warning("Failed to close fd %s", self.fd, exc_info=True)
             self.fd = None
