@@ -95,7 +95,7 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
             result,
         )
     else:
-        logger.info(
+        logger.debug(
             "cudaHostRegister rank=%d %.2f GB",
             rank,
             region.total_size_bytes / 1e9,
@@ -351,7 +351,7 @@ class CpuGpuOffloadingHandlers:
                     device="cpu",
                     pin_memory=pin_memory,
                 )
-                logger.info(
+                logger.debug(
                     "torch.zeros pinned tensor %d×%d (%.2f GB): %.3f s",
                     num_cpu_blocks,
                     cpu_page_size_bytes,

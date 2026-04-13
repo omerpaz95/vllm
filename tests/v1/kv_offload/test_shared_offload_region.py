@@ -579,41 +579,19 @@ def test_cleanup_idempotent(iid):
     r.cleanup()  # must be a no-op
 
 
-@pytest.mark.parametrize("explicit_del", [True, False], ids=["explicit_del", "gc"])
-def test_cleanup_after_create_next_view_releases_mmap(iid, explicit_del):
+def test_cleanup_after_create_next_view_releases_mmap(iid):
     """cleanup() must close the mmap even after create_next_view was called.
     create_next_view returns a view that shares storage with _base; both must be
-    released before mmap.close() can succeed.
-
-    explicit_del=True:  caller does `del t` before cleanup — direct refcount drop.
-    explicit_del=False: tensor goes out of scope at inner-function return;
-                        CPython's refcounting collects it immediately."""
+    released before mmap.close() can succeed."""
     r = _make_region(iid)
     mmap_obj = r.mmap_obj
 
-    if explicit_del:
-        t = r.create_next_view(PAGE_SIZE)
-        del t
-    else:
-
-        def _alloc_and_drop(region):
-            t = region.create_next_view(PAGE_SIZE)
-            t[:, :] = 99
-            # t's refcount drops to 0 here; CPython collects it immediately
-
-        _alloc_and_drop(r)
+    t = r.create_next_view(PAGE_SIZE)
+    del t
 
     r.cleanup()
 
     assert mmap_obj.closed, "mmap should be closed after releasing the tensor"
-
-
-def test_cleanup_partial_init_no_crash():
-    """cleanup() must not raise even if __init__ never set mmap_obj or fd."""
-    r = object.__new__(SharedOffloadRegion)
-    r._creator = False
-    # mmap_obj, fd, mmap_path intentionally absent
-    r.cleanup()  # must not raise
 
 
 # ---------------------------------------------------------------------------

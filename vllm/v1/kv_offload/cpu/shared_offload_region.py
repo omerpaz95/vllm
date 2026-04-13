@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import atexit
 import mmap
 import os
 import time
@@ -50,6 +49,10 @@ class SharedOffloadRegion:
             f"total_size_bytes {total_size_bytes} is not page-aligned "
             f"(page_size={self.page_size})"
         )
+        assert cpu_page_size % self.page_size == 0, (
+            f"cpu_page_size {cpu_page_size} is not page-aligned "
+            f"(page_size={self.page_size}); madvise requires page-aligned offsets"
+        )
         self.total_size_bytes = total_size_bytes
         self.mmap_path = f"/dev/shm/vllm_offload_{instance_id}.mmap"
         self._creator = False  # set True only if this worker creates the file
@@ -86,20 +89,31 @@ class SharedOffloadRegion:
             prot=mmap.PROT_READ | mmap.PROT_WRITE,
         )
 
-        # Populate only this worker's pages (one slot per block row) instead of
-        # faulting the entire shared region with MAP_POPULATE.
         # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
+        _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
         if rank is not None:
-            _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+            # Populate only this worker's pages (one slot per block row).
             worker_offset = rank * cpu_page_size
+            _t0 = time.perf_counter()
             for block in range(num_blocks):
                 offset = block * self._row_stride + worker_offset
                 self.mmap_obj.madvise(_MADV_POPULATE_WRITE, offset, cpu_page_size)
+            logger.debug(
+                "MADV_POPULATE_WRITE loop: %d blocks in %.3f s",
+                num_blocks,
+                time.perf_counter() - _t0,
+            )
+        else:
+            # No rank — populate the entire shared region in one call.
+            _t0 = time.perf_counter()
+            self.mmap_obj.madvise(_MADV_POPULATE_WRITE, 0, self.total_size_bytes)
+            logger.debug(
+                "MADV_POPULATE_WRITE entire region: %.3f s", time.perf_counter() - _t0
+            )
 
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
         self._views: list[torch.Tensor] = []
         self.is_pinned: bool = False
-        atexit.register(self.cleanup)
 
     def create_next_view(self, tensor_page_size: int) -> torch.Tensor:
         """Allocate a strided int8 view for this worker, one canonical tensor.
@@ -162,7 +176,7 @@ class SharedOffloadRegion:
             except Exception:
                 logger.warning("Failed to close mmap_obj", exc_info=True)
             self.mmap_obj = None
-        if self.fd:
+        if self.fd is not None:
             try:
                 os.close(self.fd)
             except Exception:
