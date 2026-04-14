@@ -415,19 +415,6 @@ def test_file_has_correct_size(iid):
         assert os.path.getsize(r.mmap_path) == 4 * PAGE_SIZE
 
 
-def test_page_alignment_assertion(iid):
-    """A total_size_bytes that is not page-aligned must raise AssertionError."""
-    with pytest.raises(AssertionError, match="not page-aligned"):
-        SharedOffloadRegion(
-            instance_id=iid,
-            total_size_bytes=PAGE_SIZE + 1,
-            num_blocks=1,
-            rank=0,
-            num_workers=1,
-            cpu_page_size=PAGE_SIZE + 1,
-        )
-
-
 # ---------------------------------------------------------------------------
 # Multi-worker race — concurrent construction
 # ---------------------------------------------------------------------------

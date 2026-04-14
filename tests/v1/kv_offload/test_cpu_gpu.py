@@ -188,5 +188,11 @@ def test_transfer(
                 expected = orig_dst_view[dst_sub_block]
             torch.testing.assert_close(dst_view[dst_sub_block].cpu(), expected.cpu())
 
+    # Drop loop-variable refs so mmap_obj has no exported buffers at cleanup.
+    del orig_tensor, tensor, src_tensor, dst_tensor, orig_dst_tensor
+    del src_view, dst_view, orig_dst_view, expected
+
+    handlers.cpu_to_gpu_handler.shutdown()
+    handlers.gpu_to_cpu_handler.shutdown()
     if mmap_region:
         mmap_region.cleanup()

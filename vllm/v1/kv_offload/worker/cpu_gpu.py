@@ -316,6 +316,8 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self._transfer_events.clear()
         self._stream_pool.clear()
         self._event_pool.clear()
+        self.src_tensors.clear()
+        self.dst_tensors.clear()
 
 
 class CpuGpuOffloadingHandlers:
