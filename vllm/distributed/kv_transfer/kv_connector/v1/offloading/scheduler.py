@@ -186,7 +186,7 @@ class OffloadingConnectorScheduler:
         start_block_idx = num_computed_tokens // group_config.offloaded_block_size
         hits = self.manager.lookup(
             offload_keys[start_block_idx:],
-            self._req_status[request.request_id].req_context,
+            req_status.req_context,
         )
         if hits is None:
             # indicates a lookup that should be tried later
@@ -255,9 +255,7 @@ class OffloadingConnectorScheduler:
         assert len(request.block_hashes) // self.config.block_size_factor >= num_blocks
         offload_keys = group_state.offload_keys[start_block_idx:num_blocks]
 
-        src_spec = self.manager.prepare_load(
-            offload_keys, self._req_status[request.request_id].req_context
-        )
+        src_spec = self.manager.prepare_load(offload_keys, req_status.req_context)
         dst_spec = GPULoadStoreSpec(
             block_ids[num_computed_gpu_blocks:],
             group_sizes=(num_pending_gpu_blocks,),
