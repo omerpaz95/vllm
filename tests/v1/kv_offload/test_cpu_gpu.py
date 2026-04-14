@@ -177,9 +177,9 @@ def test_transfer(
         orig_dst_tensors,
     ):
         # view both GPU and CPU tensors as (n, gpu_page_size_bytes) for comparison.
-        src_view = src_tensor.view(-1, gpu_page_size_bytes)
-        dst_view = dst_tensor.view(-1, gpu_page_size_bytes)
-        orig_dst_view = orig_dst_tensor.view(-1, gpu_page_size_bytes)
+        src_view = src_tensor.reshape(-1, gpu_page_size_bytes)
+        dst_view = dst_tensor.reshape(-1, gpu_page_size_bytes)
+        orig_dst_view = orig_dst_tensor.reshape(-1, gpu_page_size_bytes)
         for dst_sub_block in range(num_dst_sub_blocks):
             src_sub_block = dst_to_src.get(dst_sub_block)
             if src_sub_block is not None:

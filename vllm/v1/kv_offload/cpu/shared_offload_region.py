@@ -45,14 +45,7 @@ class SharedOffloadRegion:
         cpu_page_size: int,
     ) -> None:
         self.page_size = mmap.PAGESIZE
-        assert total_size_bytes % self.page_size == 0, (
-            f"total_size_bytes {total_size_bytes} is not page-aligned "
-            f"(page_size={self.page_size})"
-        )
-        assert cpu_page_size % self.page_size == 0, (
-            f"cpu_page_size {cpu_page_size} is not page-aligned "
-            f"(page_size={self.page_size}); madvise requires page-aligned offsets"
-        )
+
         self.total_size_bytes = total_size_bytes
         self.mmap_path = f"/dev/shm/vllm_offload_{instance_id}.mmap"
         self._creator = False  # set True only if this worker creates the file
@@ -95,9 +88,15 @@ class SharedOffloadRegion:
             # Populate only this worker's pages (one slot per block row).
             worker_offset = rank * cpu_page_size
             _t0 = time.perf_counter()
+            page_size = self.page_size
             for block in range(num_blocks):
-                offset = block * self._row_stride + worker_offset
-                self.mmap_obj.madvise(_MADV_POPULATE_WRITE, offset, cpu_page_size)
+                raw_offset = block * self._row_stride + worker_offset
+                aligned_offset = (raw_offset // page_size) * page_size
+                end = raw_offset + cpu_page_size
+                aligned_length = end - aligned_offset
+                self.mmap_obj.madvise(
+                    _MADV_POPULATE_WRITE, aligned_offset, aligned_length
+                )
             logger.debug(
                 "MADV_POPULATE_WRITE loop: %d blocks in %.3f s",
                 num_blocks,
