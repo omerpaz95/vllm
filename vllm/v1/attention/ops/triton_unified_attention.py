@@ -33,6 +33,74 @@ def apply_softcap(S, x):
 
 
 @triton.jit
+def ptx_bf16_rope(K_a, K_b, cos, sin):
+    """
+    RoPE rotation on a pair of key halves using inline PTX scalar bf16
+    mul/sub/add. Each op rounds to bf16 once, matching
+    csrc/pos_encoding_kernels.cu's __hmul/__hsub/__hadd pattern bit-for-bit.
+
+    Source-level Triton arithmetic (K_a * cos - K_b * sin) promotes bf16
+    to fp32 and emits FMA, diverging from the CUDA kernel by ~1 bf16 ULP.
+    Requires SM_90+ (Hopper) for native scalar bf16 PTX ops; callers must
+    gate on device capability before invoking this helper.
+
+    Inputs: K_a, K_b, cos, sin all bf16 tiles of matching shape.
+    Returns: (K_rot_a, K_rot_b) both bf16, where
+        K_rot_a = K_a * cos - K_b * sin
+        K_rot_b = K_b * cos + K_a * sin
+    """
+    ka_cos = tl.inline_asm_elementwise(
+        asm="mul.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[K_a, cos],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    kb_sin = tl.inline_asm_elementwise(
+        asm="mul.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[K_b, sin],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    kb_cos = tl.inline_asm_elementwise(
+        asm="mul.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[K_b, cos],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    ka_sin = tl.inline_asm_elementwise(
+        asm="mul.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[K_a, sin],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    K_rot_a = tl.inline_asm_elementwise(
+        asm="sub.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[ka_cos, kb_sin],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    K_rot_b = tl.inline_asm_elementwise(
+        asm="add.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[kb_cos, ka_sin],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    return K_rot_a, K_rot_b
+
+
+@triton.jit
 def find_seq_idx(
     query_start_len_ptr,
     target_idx,
@@ -340,61 +408,7 @@ def kernel_unified_attention_2d(
             sin = sin.to(KV_COMPUTE_DTYPE)
 
             if USE_PTX_BF16_ROPE:
-                # Inline PTX scalar bf16 mul/sub/add — each rounds to bf16
-                # once, matching csrc/pos_encoding_kernels.cu's
-                # __hmul/__hsub/__hadd pattern bit-for-bit. Source-level
-                # Triton arithmetic promotes bf16 to fp32 and emits FMA,
-                # diverging from the CUDA kernel by ~1 bf16 ULP. Requires
-                # SM_90+ (Hopper) for native scalar bf16 PTX ops; older GPUs
-                # fall through to the source-level branch below.
-                ka_cos = tl.inline_asm_elementwise(
-                    asm="mul.rn.bf16 $0, $1, $2;",
-                    constraints="=h,h,h",
-                    args=[K_a, cos],
-                    dtype=tl.bfloat16,
-                    is_pure=True,
-                    pack=1,
-                )
-                kb_sin = tl.inline_asm_elementwise(
-                    asm="mul.rn.bf16 $0, $1, $2;",
-                    constraints="=h,h,h",
-                    args=[K_b, sin],
-                    dtype=tl.bfloat16,
-                    is_pure=True,
-                    pack=1,
-                )
-                kb_cos = tl.inline_asm_elementwise(
-                    asm="mul.rn.bf16 $0, $1, $2;",
-                    constraints="=h,h,h",
-                    args=[K_b, cos],
-                    dtype=tl.bfloat16,
-                    is_pure=True,
-                    pack=1,
-                )
-                ka_sin = tl.inline_asm_elementwise(
-                    asm="mul.rn.bf16 $0, $1, $2;",
-                    constraints="=h,h,h",
-                    args=[K_a, sin],
-                    dtype=tl.bfloat16,
-                    is_pure=True,
-                    pack=1,
-                )
-                K_rot_a = tl.inline_asm_elementwise(
-                    asm="sub.rn.bf16 $0, $1, $2;",
-                    constraints="=h,h,h",
-                    args=[ka_cos, kb_sin],
-                    dtype=tl.bfloat16,
-                    is_pure=True,
-                    pack=1,
-                )
-                K_rot_b = tl.inline_asm_elementwise(
-                    asm="add.rn.bf16 $0, $1, $2;",
-                    constraints="=h,h,h",
-                    args=[kb_cos, ka_sin],
-                    dtype=tl.bfloat16,
-                    is_pure=True,
-                    pack=1,
-                )
+                K_rot_a, K_rot_b = ptx_bf16_rope(K_a, K_b, cos, sin)
             else:
                 # Fallback: source-level Triton arithmetic. Produces output
                 # ~1 bf16 ULP away from the CUDA RoPE kernel due to Triton
@@ -833,61 +847,7 @@ def kernel_unified_attention_3d(
             sin = sin.to(KV_COMPUTE_DTYPE)
 
             if USE_PTX_BF16_ROPE:
-                # Inline PTX scalar bf16 mul/sub/add — each rounds to bf16
-                # once, matching csrc/pos_encoding_kernels.cu's
-                # __hmul/__hsub/__hadd pattern bit-for-bit. Source-level
-                # Triton arithmetic promotes bf16 to fp32 and emits FMA,
-                # diverging from the CUDA kernel by ~1 bf16 ULP. Requires
-                # SM_90+ (Hopper) for native scalar bf16 PTX ops; older GPUs
-                # fall through to the source-level branch below.
-                ka_cos = tl.inline_asm_elementwise(
-                    asm="mul.rn.bf16 $0, $1, $2;",
-                    constraints="=h,h,h",
-                    args=[K_a, cos],
-                    dtype=tl.bfloat16,
-                    is_pure=True,
-                    pack=1,
-                )
-                kb_sin = tl.inline_asm_elementwise(
-                    asm="mul.rn.bf16 $0, $1, $2;",
-                    constraints="=h,h,h",
-                    args=[K_b, sin],
-                    dtype=tl.bfloat16,
-                    is_pure=True,
-                    pack=1,
-                )
-                kb_cos = tl.inline_asm_elementwise(
-                    asm="mul.rn.bf16 $0, $1, $2;",
-                    constraints="=h,h,h",
-                    args=[K_b, cos],
-                    dtype=tl.bfloat16,
-                    is_pure=True,
-                    pack=1,
-                )
-                ka_sin = tl.inline_asm_elementwise(
-                    asm="mul.rn.bf16 $0, $1, $2;",
-                    constraints="=h,h,h",
-                    args=[K_a, sin],
-                    dtype=tl.bfloat16,
-                    is_pure=True,
-                    pack=1,
-                )
-                K_rot_a = tl.inline_asm_elementwise(
-                    asm="sub.rn.bf16 $0, $1, $2;",
-                    constraints="=h,h,h",
-                    args=[ka_cos, kb_sin],
-                    dtype=tl.bfloat16,
-                    is_pure=True,
-                    pack=1,
-                )
-                K_rot_b = tl.inline_asm_elementwise(
-                    asm="add.rn.bf16 $0, $1, $2;",
-                    constraints="=h,h,h",
-                    args=[kb_cos, ka_sin],
-                    dtype=tl.bfloat16,
-                    is_pure=True,
-                    pack=1,
-                )
+                K_rot_a, K_rot_b = ptx_bf16_rope(K_a, K_b, cos, sin)
             else:
                 # Fallback: source-level Triton arithmetic. Produces output
                 # ~1 bf16 ULP away from the CUDA RoPE kernel due to Triton
