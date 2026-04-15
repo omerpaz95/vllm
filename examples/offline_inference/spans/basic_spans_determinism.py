@@ -72,20 +72,40 @@ def disable_spans() -> None:
     os.environ["VLLM_V1_SPANS_ENABLED"] = "False"
 
 
-MODES: list[tuple[str, bool]] = [
-    # (label, spans_enabled)
-    ("recompute", False),
-    ("spans_no_kv", True),
-]
-MODE_NAMES = [m[0] for m in MODES]
-MODE_SPECS = {m[0]: m[1] for m in MODES}
+# Gap length so large it dwarfs the prompt, so span_aware gap policy (when it
+# fires) is forced to recompute the entire cached prefix - making the resulting
+# output equivalent to a full cold-start recompute.
+GAP_LENGTH_HUGE = 1_000_000
+
+MODES: list[str] = ["recompute", "spans_no_kv", "spans_gap_huge"]
+MODE_SPECS: dict[str, tuple[bool, dict | None]] = {
+    # name -> (spans_enabled, gap_policy_config)
+    "recompute": (False, None),
+    "spans_no_kv": (True, None),
+    "spans_gap_huge": (
+        True,
+        {
+            "gap_length": GAP_LENGTH_HUGE,
+            "span_marker_token_id": SPAN_TOKEN_PLUS,
+            "block_size": 16,
+        },
+    ),
+}
 
 
-def build_llm(model: str, spans_enabled: bool) -> LLM:
+def build_llm(
+    model: str,
+    spans_enabled: bool,
+    gap_policy_config: dict | None = None,
+) -> LLM:
     if spans_enabled:
         enable_spans()
     else:
         disable_spans()
+    extra: dict = {}
+    if gap_policy_config is not None:
+        extra["gap_policy_name"] = "span_aware"
+        extra["gap_policy_config"] = gap_policy_config
     return LLM(
         model=model,
         tensor_parallel_size=TP,
@@ -96,6 +116,7 @@ def build_llm(model: str, spans_enabled: bool) -> LLM:
         enable_prefix_caching=False,
         async_scheduling=False,
         attention_backend="TRITON_ATTN",
+        **extra,
     )
 
 
@@ -219,10 +240,14 @@ def main() -> None:
         str, dict[int, tuple[str, list[tuple[int, float]]]]
     ] = {}
 
-    for mode in MODE_NAMES:
-        spans_enabled = MODE_SPECS[mode]
+    for mode in MODES:
+        spans_enabled, gap_policy_config = MODE_SPECS[mode]
         print(f"\n{'=' * 72}\nBuilding LLM: mode={mode}\n{'=' * 72}")
-        llm = build_llm(model, spans_enabled=spans_enabled)
+        llm = build_llm(
+            model,
+            spans_enabled=spans_enabled,
+            gap_policy_config=gap_policy_config,
+        )
 
         # --- Determinism matrix ---
         for temp in TEMPS:
@@ -299,55 +324,59 @@ def main() -> None:
         ) else "[FAIL]"
         print(f"{tag} {lbl:20s}: {text_verdict}, {top_verdict}")
 
-    # 2. Cross-mode at same temp
-    print("\n=== CROSS-MODE (same temp, run#0) ===")
+    # 2. Cross-mode at same temp - compare every non-recompute mode to recompute
+    print("\n=== CROSS-MODE vs recompute (same temp, run#0) ===")
     for temp in TEMPS:
         a = results[("recompute", temp)][0]
-        b = results[("spans_no_kv", temp)][0]
         a_top = results_top10[("recompute", temp)][0]
-        b_top = results_top10[("spans_no_kv", temp)][0]
         tag = f"t{int(temp)}"
 
-        text_match = a == b
-        if text_match:
-            text_part = "text-identical"
-        else:
-            text_part = (
-                f"text-DIFFER (ratio={ratio(a, b):.3f}, "
-                f"first_differ_char={first_differ_index(a, b)})"
-            )
+        for other in MODES:
+            if other == "recompute":
+                continue
+            b = results[(other, temp)][0]
+            b_top = results_top10[(other, temp)][0]
 
-        top_match = a_top == b_top
-        if top_match:
-            top_part = f"top-{LOGPROBS_TOPK}-logprobs-identical"
-        else:
-            a_map = {tid: lp for tid, lp in a_top}
-            b_map = {tid: lp for tid, lp in b_top}
-            common = set(a_map) & set(b_map)
-            if common:
-                max_diff = max(abs(a_map[t] - b_map[t]) for t in common)
-                top_part = (
-                    f"top-{LOGPROBS_TOPK}-logprobs-DIFFER "
-                    f"(max|Δ|={max_diff:.3e})"
-                )
+            text_match = a == b
+            if text_match:
+                text_part = "text-identical"
             else:
-                top_part = (
-                    f"top-{LOGPROBS_TOPK}-logprobs-DIFFER "
-                    f"(no overlap in top-{LOGPROBS_TOPK} ids)"
+                text_part = (
+                    f"text-DIFFER (ratio={ratio(a, b):.3f}, "
+                    f"first_differ_char={first_differ_index(a, b)})"
                 )
 
-        verdict = "[PASS]" if (text_match and top_match) else "[WARN]"
-        print(
-            f"{verdict} {tag:6s} recompute vs spans_no_kv: "
-            f"{text_part}, {top_part}"
-        )
-        if not text_match:
-            print(f"         recompute   : {truncate(a)}")
-            print(f"         spans_no_kv : {truncate(b)}")
+            top_match = a_top == b_top
+            if top_match:
+                top_part = f"top-{LOGPROBS_TOPK}-logprobs-identical"
+            else:
+                a_map = {tid: lp for tid, lp in a_top}
+                b_map = {tid: lp for tid, lp in b_top}
+                common = set(a_map) & set(b_map)
+                if common:
+                    max_diff = max(abs(a_map[t] - b_map[t]) for t in common)
+                    top_part = (
+                        f"top-{LOGPROBS_TOPK}-logprobs-DIFFER "
+                        f"(max|Δ|={max_diff:.3e})"
+                    )
+                else:
+                    top_part = (
+                        f"top-{LOGPROBS_TOPK}-logprobs-DIFFER "
+                        f"(no overlap in top-{LOGPROBS_TOPK} ids)"
+                    )
+
+            verdict = "[PASS]" if (text_match and top_match) else "[WARN]"
+            print(
+                f"{verdict} {tag:6s} recompute vs {other:14s}: "
+                f"{text_part}, {top_part}"
+            )
+            if not text_match:
+                print(f"         recompute       : {truncate(a)}")
+                print(f"         {other:14s}  : {truncate(b)}")
 
     # 3. Cross-temp within same mode
     print("\n=== CROSS-TEMP (same mode, run#0) ===")
-    for mode in MODE_NAMES:
+    for mode in MODES:
         a = results[(mode, 0.0)][0]
         b = results[(mode, 1.0)][0]
         r = ratio(a, b)
@@ -363,51 +392,42 @@ def main() -> None:
         f"\n=== LOGPROB EQUIVALENCE TEST: TOP-{LOGPROBS_TOPK} LOGPROBS AT "
         f"STEP 0 (t=0, max_tokens=1) ==="
     )
-    print("\nrecompute:")
-    for i, (tid, tok, lp) in enumerate(logprobs_by_mode["recompute"]):
-        print(f"  #{i + 1:2d}  id={tid:6d}  logprob={lp:.10f}  {tok!r}")
-    print("\nspans_no_kv:")
-    for i, (tid, tok, lp) in enumerate(logprobs_by_mode["spans_no_kv"]):
-        print(f"  #{i + 1:2d}  id={tid:6d}  logprob={lp:.10f}  {tok!r}")
+    for mode in MODES:
+        print(f"\n{mode}:")
+        for i, (tid, tok, lp) in enumerate(logprobs_by_mode[mode]):
+            print(f"  #{i + 1:2d}  id={tid:6d}  logprob={lp:.10f}  {tok!r}")
 
     rc = logprobs_by_mode["recompute"]
-    sp = logprobs_by_mode["spans_no_kv"]
     rc_ids = [t[0] for t in rc]
-    sp_ids = [t[0] for t in sp]
     rc_lps = [t[2] for t in rc]
-    sp_lps = [t[2] for t in sp]
+    rc_map = {tid: lp for tid, _, lp in rc}
 
-    same_ids = rc_ids == sp_ids
-    same_lps_bit = rc_lps == sp_lps
-    max_abs_lp_diff = 0.0
-    if len(rc_lps) == len(sp_lps):
-        # Compare by token_id so mismatched top-K orders don't confuse the diff.
-        rc_map = {tid: lp for tid, _, lp in rc}
-        sp_map = {tid: lp for tid, _, lp in sp}
-        common_ids = set(rc_map.keys()) & set(sp_map.keys())
+    print("\n--- Logprob equivalence verdict (vs recompute) ---")
+    for other in MODES:
+        if other == "recompute":
+            continue
+        ot = logprobs_by_mode[other]
+        ot_ids = [t[0] for t in ot]
+        ot_lps = [t[2] for t in ot]
+        ot_map = {tid: lp for tid, _, lp in ot}
+
+        same_ids = rc_ids == ot_ids
+        same_lps_bit = rc_lps == ot_lps
+        max_abs_lp_diff = 0.0
+        common_ids = set(rc_map) & set(ot_map)
         if common_ids:
             max_abs_lp_diff = max(
-                abs(rc_map[tid] - sp_map[tid]) for tid in common_ids
+                abs(rc_map[tid] - ot_map[tid]) for tid in common_ids
             )
 
-    print("\n--- Logprob equivalence verdict ---")
-    print(f"top-{LOGPROBS_TOPK} token ids match (same order): {same_ids}")
-    print(f"top-{LOGPROBS_TOPK} logprobs bit-identical:       {same_lps_bit}")
-    print(f"max |logprob(recompute) - logprob(spans)| on common ids: "
-          f"{max_abs_lp_diff:.3e}")
-
-    if same_lps_bit and same_ids:
-        print(
-            "\n[A REFUTED] Forward pass is bit-identical. "
-            "Remaining drift must come from RNG consumption ordering "
-            "(Hypothesis B). Next step: audit VLLM_V1_SPANS_ENABLED call "
-            "sites for RNG-touching ops."
+        verdict = (
+            "[A REFUTED] bit-identical"
+            if same_lps_bit and same_ids
+            else f"[A CONFIRMED] max|Δlogprob|={max_abs_lp_diff:.3e}"
         )
-    elif max_abs_lp_diff > 0:
         print(
-            "\n[A CONFIRMED] Forward pass produces numerically different "
-            "logits between modes. Layer-RoPE vs kernel-RoPE path mismatch "
-            "is the likely root cause (Hypothesis A)."
+            f"  recompute vs {other:14s}: ids_in_order={same_ids}  "
+            f"lps_bit_identical={same_lps_bit}  {verdict}"
         )
 
     # =========================================================================
@@ -420,66 +440,71 @@ def main() -> None:
     matches = 0
     differs = 0
     first_diff_positions: list[int] = []
-    for s in MULTI_SEEDS:
-        a_text, a_top = multi_seed_by_mode["recompute"][s]
-        b_text, b_top = multi_seed_by_mode["spans_no_kv"][s]
-        text_same = a_text == b_text
-        top_same = a_top == b_top
-        fd = first_differ_index(a_text, b_text)
-        r = ratio(a_text, b_text)
+    for other in MODES:
+        if other == "recompute":
+            continue
+        print(f"\n-- recompute vs {other} --")
+        for s in MULTI_SEEDS:
+            a_text, a_top = multi_seed_by_mode["recompute"][s]
+            b_text, b_top = multi_seed_by_mode[other][s]
+            text_same = a_text == b_text
+            top_same = a_top == b_top
+            fd = first_differ_index(a_text, b_text)
+            r = ratio(a_text, b_text)
 
-        if top_same:
-            top_part = f"top-{LOGPROBS_TOPK}-logprobs-identical"
-        else:
-            a_map = {tid: lp for tid, lp in a_top}
-            b_map = {tid: lp for tid, lp in b_top}
-            common = set(a_map) & set(b_map)
-            if common:
-                max_diff = max(abs(a_map[t] - b_map[t]) for t in common)
-                top_part = (
-                    f"top-{LOGPROBS_TOPK}-logprobs-DIFFER "
-                    f"(max|Δ|={max_diff:.3e})"
+            if top_same:
+                top_part = f"top-{LOGPROBS_TOPK}-logprobs-identical"
+            else:
+                a_map = {tid: lp for tid, lp in a_top}
+                b_map = {tid: lp for tid, lp in b_top}
+                common = set(a_map) & set(b_map)
+                if common:
+                    max_diff = max(abs(a_map[t] - b_map[t]) for t in common)
+                    top_part = (
+                        f"top-{LOGPROBS_TOPK}-logprobs-DIFFER "
+                        f"(max|Δ|={max_diff:.3e})"
+                    )
+                else:
+                    top_part = (
+                        f"top-{LOGPROBS_TOPK}-logprobs-DIFFER "
+                        f"(no overlap in top-{LOGPROBS_TOPK} ids)"
+                    )
+
+            if text_same and top_same:
+                matches += 1
+                print(
+                    f"  seed={s:4d}  [MATCH]   ratio=1.000  {top_part}  "
+                    f"{truncate(a_text, 60)!r}"
                 )
             else:
-                top_part = (
-                    f"top-{LOGPROBS_TOPK}-logprobs-DIFFER "
-                    f"(no overlap in top-{LOGPROBS_TOPK} ids)"
+                differs += 1
+                if not text_same:
+                    first_diff_positions.append(fd)
+                text_part = (
+                    "text-identical"
+                    if text_same
+                    else f"text-DIFFER ratio={r:.3f} first_differ_char={fd}"
                 )
+                print(
+                    f"  seed={s:4d}  [DIFFER]  {text_part}, {top_part}"
+                )
+                if not text_same:
+                    print(f"    recompute      : {truncate(a_text, 60)}")
+                    print(f"    {other:14s} : {truncate(b_text, 60)}")
 
-        if text_same and top_same:
-            matches += 1
-            print(
-                f"  seed={s:4d}  [MATCH]   ratio=1.000  {top_part}  "
-                f"{truncate(a_text, 60)!r}"
-            )
-        else:
-            differs += 1
-            if not text_same:
-                first_diff_positions.append(fd)
-            text_part = (
-                "text-identical"
-                if text_same
-                else f"text-DIFFER ratio={r:.3f} first_differ_char={fd}"
-            )
-            print(
-                f"  seed={s:4d}  [DIFFER]  {text_part}, {top_part}"
-            )
-            if not text_same:
-                print(f"    recompute   : {truncate(a_text, 60)}")
-                print(f"    spans_no_kv : {truncate(b_text, 60)}")
-
+    total_comparisons = len(MULTI_SEEDS) * (len(MODES) - 1)
     print("\n--- Multi-seed drift verdict ---")
-    print(f"seeds that MATCH across modes : {matches}/{len(MULTI_SEEDS)}")
-    print(f"seeds that DIFFER across modes: {differs}/{len(MULTI_SEEDS)}")
+    print(f"seeds that MATCH across modes : {matches}/{total_comparisons}")
+    print(f"seeds that DIFFER across modes: {differs}/{total_comparisons}")
     if first_diff_positions:
         print(f"first-differ character positions: {first_diff_positions}")
-    if matches == len(MULTI_SEEDS):
+    if matches == total_comparisons:
         print(
             "\nAll seeds match across modes at t=1. Combined with the "
             "cross-mode t1 drift you saw with seed=42 earlier, this would "
             "be surprising - double-check the test harness."
         )
-    elif differs == len(MULTI_SEEDS):
+    elif differs == total_comparisons:
         print(
             "\nAll seeds drift across modes. Consistent with either A or B. "
             "Use the LOGPROB EQUIVALENCE TEST to disambiguate - "

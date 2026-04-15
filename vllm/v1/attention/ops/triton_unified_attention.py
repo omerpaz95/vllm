@@ -170,7 +170,7 @@ def kernel_unified_attention_2d(
         query_ptr + query_offset_a,
         mask=dim_mask_a[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
-    ).to(tl.float16)
+    ).to(KV_COMPUTE_DTYPE)
 
 
     # Q_b : (BLOCK_M, HEAD_SIZE_PADDED // 2)
@@ -178,7 +178,7 @@ def kernel_unified_attention_2d(
         query_ptr + query_offset_b,
         mask=dim_mask_b[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
-    ).to(tl.float16)
+    ).to(KV_COMPUTE_DTYPE)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -395,18 +395,16 @@ def kernel_unified_attention_2d(
                     is_pure=True,
                     pack=1,
                 )
-                K_rot_a = K_rot_a.to(tl.float16)
-                K_rot_b = K_rot_b.to(tl.float16)
             else:
                 # Fallback: source-level Triton arithmetic. Produces output
                 # ~1 bf16 ULP away from the CUDA RoPE kernel due to Triton
                 # promoting bf16 to fp32 with FMA. Correct but not
                 # bit-identical to the non-spans baseline.
-                K_rot_a = (K_a * cos - K_b * sin).to(tl.float16)
-                K_rot_b = (K_b * cos + K_a * sin).to(tl.float16)
+                K_rot_a = K_a * cos - K_b * sin
+                K_rot_b = K_b * cos + K_a * sin
         else:
-            K_rot_a = K_a.to(tl.float16)
-            K_rot_b = K_b.to(tl.float16)
+            K_rot_a = K_a
+            K_rot_b = K_b
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
             value_cache_ptr + v_offset,
@@ -663,7 +661,7 @@ def kernel_unified_attention_3d(
         query_ptr + query_offset_a,
         mask=dim_mask_a[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
-    ).to(tl.float16)
+    ).to(KV_COMPUTE_DTYPE)
 
 
     # Q_b : (BLOCK_M, HEAD_SIZE_PADDED // 2)
@@ -671,7 +669,7 @@ def kernel_unified_attention_3d(
         query_ptr + query_offset_b,
         mask=dim_mask_b[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
-    ).to(tl.float16)
+    ).to(KV_COMPUTE_DTYPE)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -890,18 +888,16 @@ def kernel_unified_attention_3d(
                     is_pure=True,
                     pack=1,
                 )
-                K_rot_a = K_rot_a.to(tl.float16)
-                K_rot_b = K_rot_b.to(tl.float16)
             else:
                 # Fallback: source-level Triton arithmetic. Produces output
                 # ~1 bf16 ULP away from the CUDA RoPE kernel due to Triton
                 # promoting bf16 to fp32 with FMA. Correct but not
                 # bit-identical to the non-spans baseline.
-                K_rot_a = (K_a * cos - K_b * sin).to(tl.float16)
-                K_rot_b = (K_b * cos + K_a * sin).to(tl.float16)
+                K_rot_a = K_a * cos - K_b * sin
+                K_rot_b = K_b * cos + K_a * sin
         else:
-            K_rot_a = K_a.to(tl.float16)
-            K_rot_b = K_b.to(tl.float16)
+            K_rot_a = K_a
+            K_rot_b = K_b
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
             value_cache_ptr + v_offset,
