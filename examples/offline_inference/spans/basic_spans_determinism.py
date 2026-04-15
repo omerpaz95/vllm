@@ -43,6 +43,7 @@ MODEL_NAMES = [
     "zai-org/GLM-4.7-FP8",
     "mistralai/Mistral-Large-3-675B-Instruct-2512",
     "NousResearch/Meta-Llama-3.1-8B-Instruct",
+    "Qwen/Qwen3-8B",
 ]
 MODEL_INDEX = int(os.environ.get("VLLM_SPANS_MODEL_INDEX", "6"))
 TP = int(os.environ.get("VLLM_SPANS_TP", "1"))
@@ -225,6 +226,116 @@ def first_differ_index(a: str, b: str) -> int:
 
 def label(mode: str, temp: float) -> str:
     return f"{mode}_t{int(temp)}"
+
+
+def run_gap_policy_replay_test(
+    model: str,
+    reference_text: str,
+    reference_top10: list[tuple[int, float]],
+) -> None:
+    """
+    Force gap policy's recomputation path to fire and verify it matches
+    clean recompute.
+
+    Gap policy only triggers on prefix-cache HITS. The rest of this test
+    runs with enable_prefix_caching=False so gap policy is inert. Here we:
+
+      1. Build an LLM with spans=True, gap_policy=span_aware,
+         gap_length=GAP_LENGTH_HUGE, and enable_prefix_caching=True.
+      2. Run PROMPT once cold (populates the cache).
+      3. Run PROMPT a second time. Every block is now a cache hit, which
+         hands the request to gap policy. With gap_length >> prompt length,
+         gap policy should recompute the entire cached prefix.
+      4. Compare the second run's output to the clean recompute-mode
+         reference from the main 3-mode loop.
+
+    Expected: second-run output is bit-identical to recompute. That is the
+    "huge gap ≡ full recompute" equivalence claim.
+    """
+    print(
+        f"\n{'=' * 72}\n"
+        "GAP-POLICY REPLAY TEST (prefix_cache=ON, gap_length=huge)\n"
+        f"{'=' * 72}"
+    )
+
+    enable_spans()
+    llm = LLM(
+        model=model,
+        tensor_parallel_size=TP,
+        kv_transfer_config=None,
+        gpu_memory_utilization=0.9,
+        enforce_eager=True,
+        block_size=16,
+        enable_prefix_caching=True,
+        async_scheduling=False,
+        attention_backend="TRITON_ATTN",
+        gap_policy_name="span_aware",
+        gap_policy_config={
+            "gap_length": GAP_LENGTH_HUGE,
+            "span_marker_token_id": SPAN_TOKEN_PLUS,
+            "block_size": 16,
+        },
+    )
+
+    sp = _make_sp(SEED, 0.0, MAX_TOKENS, logprobs=LOGPROBS_TOPK)
+
+    print("  run #1 (cold prefill, populates cache)...")
+    res1 = llm.generate(PROMPT, sampling_params=sp, use_tqdm=False)
+    text1 = res1[0].outputs[0].text
+    top10_1 = _extract_step0_topk(res1[0].outputs[0])
+    print(f"    output: {truncate(text1)}")
+
+    print("  run #2 (all blocks cached → gap policy fires → recompute)...")
+    res2 = llm.generate(PROMPT, sampling_params=sp, use_tqdm=False)
+    text2 = res2[0].outputs[0].text
+    top10_2 = _extract_step0_topk(res2[0].outputs[0])
+    print(f"    output: {truncate(text2)}")
+
+    del llm
+    gc.collect()
+    try:
+        import torch  # type: ignore[import-not-found]
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    print("\n--- Verdict ---")
+
+    # First: did the replay itself change anything? If run#2 differs from
+    # run#1, gap policy did some recomputation that perturbed the output.
+    # With deterministic sampling (t=0, same seed) and a correct
+    # implementation, run#1 and run#2 should be bit-identical regardless
+    # of whether gap policy fired.
+    replay_stable = text1 == text2 and top10_1 == top10_2
+    if replay_stable:
+        print("  [OK]   run #1 == run #2 (replay is deterministic)")
+    else:
+        print("  [WARN] run #1 != run #2 (prefix cache / gap policy leaks "
+              "nondeterminism)")
+
+    # Second: does gap-policy-replay match clean recompute?
+    text_match = text2 == reference_text
+    top_match = top10_2 == reference_top10
+
+    if text_match and top_match:
+        print("  [PASS] replay run #2 == clean recompute (text + "
+              f"top-{LOGPROBS_TOPK}-logprobs bit-identical)")
+        print("  -> gap_length >= prompt_length ≡ full recompute ✓")
+    else:
+        print("  [FAIL] replay run #2 != clean recompute")
+        if not text_match:
+            print(f"    reference (recompute): {truncate(reference_text)}")
+            print(f"    replay run #2        : {truncate(text2)}")
+        if not top_match:
+            ref_map = {tid: lp for tid, lp in reference_top10}
+            rep_map = {tid: lp for tid, lp in top10_2}
+            common = set(ref_map) & set(rep_map)
+            if common:
+                max_diff = max(abs(ref_map[t] - rep_map[t]) for t in common)
+                print(f"    top-{LOGPROBS_TOPK} logprobs max|Δ| = "
+                      f"{max_diff:.3e}")
+            else:
+                print(f"    top-{LOGPROBS_TOPK} token sets disjoint")
 
 
 def main() -> None:
@@ -421,9 +532,9 @@ def main() -> None:
             )
 
         verdict = (
-            "[A REFUTED] bit-identical"
+            "bit-identical"
             if same_lps_bit and same_ids
-            else f"[A CONFIRMED] max|Δlogprob|={max_abs_lp_diff:.3e}"
+            else f"max|Δlogprob|={max_abs_lp_diff:.3e}"
         )
         print(
             f"  recompute vs {other:14s}: ids_in_order={same_ids}  "
@@ -516,6 +627,12 @@ def main() -> None:
             "logits differ slightly, and only seeds whose RNG draw lands "
             "near a probability boundary end up flipping a token."
         )
+
+    # Pick up the clean recompute baseline at t=0 run#0 for the replay test
+    # to compare against.
+    reference_text = results[("recompute", 0.0)][0]
+    reference_top10 = results_top10[("recompute", 0.0)][0]
+    run_gap_policy_replay_test(model, reference_text, reference_top10)
 
     print(f"\n{'#' * 72}")
 
