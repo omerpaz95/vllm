@@ -656,6 +656,9 @@ class Scheduler(SchedulerInterface):
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
+                # Pre-reserved token budget for virtual gap requests created
+                # for this request (set in else branch below; zero for async KV).
+                gap_overhead = 0
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
@@ -671,17 +674,40 @@ class Scheduler(SchedulerInterface):
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
+                    # Pre-compute virtual gap overhead for this request.
+                    # Virtual gap requests are injected *after* the budget
+                    # assertion at line 844, so without this reservation the
+                    # combined total can exceed max_num_batched_tokens — which
+                    # overflows the model runner's pre-allocated buffers.
+                    # num_computed_tokens here equals request.num_computed_tokens
+                    # after scheduling, so get_gaps() returns the same gaps as
+                    # the post-scheduling gap loop.
+                    if self.gap_policy is not None:
+                        gap_overhead = sum(
+                            end - start
+                            for start, end in self.gap_policy.get_gaps(
+                                request,
+                                num_computed_tokens,
+                                num_external_computed_tokens,
+                            )
+                        )
+
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
+                    effective_budget = token_budget - gap_overhead
                     if (
                         not self.scheduler_config.enable_chunked_prefill
-                        and num_new_tokens > token_budget
+                        and num_new_tokens > effective_budget
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
                         break
 
-                    num_new_tokens = min(num_new_tokens, token_budget)
+                    num_new_tokens = min(num_new_tokens, effective_budget)
+                    if num_new_tokens <= 0:
+                        # Gap overhead alone consumes the remaining budget;
+                        # this request will be scheduled in the next step.
+                        break
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -814,6 +840,9 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                # Consume the pre-reserved gap budget so future requests
+                # cannot use it for real tokens.
+                token_budget -= gap_overhead
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
@@ -962,9 +991,6 @@ class Scheduler(SchedulerInterface):
                     # For v2 model runner, prefill_token_ids also needs to be set
                     if self.use_v2_model_runner and nrd.prefill_token_ids is not None:
                         nrd_copy.prefill_token_ids = nrd.prefill_token_ids[:end]
-                    block_count = (
-                        len(nrd_copy.block_ids[0]) if nrd_copy.block_ids else 0
-                    )
                     new_reqs_data.append(nrd_copy)
                     # Track this virtual request ID for cleanup
                     virtual_gap_req_ids.add(nrd_copy.req_id)

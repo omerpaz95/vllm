@@ -240,7 +240,6 @@ def kernel_unified_attention_2d(
         other=0.0,
     ).to(KV_COMPUTE_DTYPE)
 
-
     # Q_b : (BLOCK_M, HEAD_SIZE_PADDED // 2)
     Q_b = tl.load(
         query_ptr + query_offset_b,
@@ -368,7 +367,6 @@ def kernel_unified_attention_2d(
         else:
             K_a = K_a_load.to(KV_COMPUTE_DTYPE)
 
-
         # K_b : (HEAD_SIZE_PADDED // 2, TILE_SIZE)
         K_b_load = tl.load(
             key_cache_ptr + k_offset_b,
@@ -396,7 +394,7 @@ def kernel_unified_attention_2d(
                 cos_sin_cache_ptr + cos_cache_offset,
                 mask=dim_mask_a[:, None] & tile_mask[None, :],
                 other=0.0,
-            )
+            ).to(K_a.dtype)
 
             sin = tl.load(
                 cos_sin_cache_ptr + sin_cache_offset,
@@ -419,6 +417,7 @@ def kernel_unified_attention_2d(
         else:
             K_rot_a = K_a
             K_rot_b = K_b
+
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
             value_cache_ptr + v_offset,
@@ -427,7 +426,10 @@ def kernel_unified_attention_2d(
         )
 
         if V_load.dtype.is_fp8():
-            V = (V_load.to(tl.float32) * tl.load(v_scale)).to(tl.float16)
+            if Q_a.dtype.is_fp8():
+                V = V_load
+            else:
+                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q_a.dtype)
         else:
             V = V_load
 
@@ -677,7 +679,6 @@ def kernel_unified_attention_3d(
         other=0.0,
     ).to(KV_COMPUTE_DTYPE)
 
-
     # Q_b : (BLOCK_M, HEAD_SIZE_PADDED // 2)
     Q_b = tl.load(
         query_ptr + query_offset_b,
@@ -807,7 +808,6 @@ def kernel_unified_attention_3d(
         else:
             K_a = K_a_load.to(KV_COMPUTE_DTYPE)
 
-
         # K_b : (HEAD_SIZE_PADDED // 2, TILE_SIZE)
         K_b_load = tl.load(
             key_cache_ptr + k_offset_b,
@@ -835,7 +835,7 @@ def kernel_unified_attention_3d(
                 cos_sin_cache_ptr + cos_cache_offset,
                 mask=dim_mask_a[:, None] & tile_mask[None, :],
                 other=0.0,
-            )
+            ).to(K_a.dtype)
 
             sin = tl.load(
                 cos_sin_cache_ptr + sin_cache_offset,
@@ -858,6 +858,7 @@ def kernel_unified_attention_3d(
         else:
             K_rot_a = K_a
             K_rot_b = K_b
+
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
             value_cache_ptr + v_offset,
@@ -866,7 +867,10 @@ def kernel_unified_attention_3d(
         )
 
         if V_load.dtype.is_fp8():
-            V = (V_load.to(tl.float32) * tl.load(v_scale)).to(tl.float16)
+            if Q_a.dtype.is_fp8():
+                V = V_load
+            else:
+                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q_a.dtype)
         else:
             V = V_load
 
