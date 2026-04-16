@@ -1809,7 +1809,6 @@ class GPUModelRunner(
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
-
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
@@ -1985,7 +1984,7 @@ class GPUModelRunner(
         slot_mapping_gid_0 = slot_mappings[0]
 
         # print("==================MODULES===============")
-        
+
         # # Dump full structure
         # for name, module in self.model.named_modules():
         #     logger.info("MODULE: %s -> %s", name, type(module).__name__)
@@ -1996,22 +1995,31 @@ class GPUModelRunner(
         # for name, module in self.model.named_modules():
         #     if "rotary" in type(module).__name__.lower() or "rotary" in name.lower():
         #         logger.info("ROTARY FOUND: %s -> %s", name, type(module).__name__)
-        
+
         if not hasattr(self, "rotate"):
             # Get the layers list, handling both standard and Llama4-style model structures
             if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
                 layers = self.model.model.layers
-            elif hasattr(self.model, "language_model") and hasattr(self.model.language_model, "model"):
+            elif hasattr(self.model, "language_model") and hasattr(
+                self.model.language_model, "model"
+            ):
                 layers = self.model.language_model.model.layers
             else:
-                raise AttributeError(f"Cannot find layers in model structure: {type(self.model).__name__}")
+                raise AttributeError(
+                    f"Cannot find layers in model structure: {type(self.model).__name__}"
+                )
 
             for lay in layers:
                 if not isinstance(lay, PPMissingLayer):
                     self.rotate = lay.self_attn.rotary_emb
                     break
             else:
-                raise AttributeError("All layers are PPMissingLayer, cannot find rotary_emb")
+                raise AttributeError(
+                    "All layers are PPMissingLayer, cannot find rotary_emb"
+                )
+
+            self._cos_sin_cache = self.rotate.cos_sin_cache
+            self._rotary_dim = self.rotate.rotary_dim
 
         if self.routed_experts_initialized:
             attn_gid = self.routed_experts_attn_gid
@@ -2032,7 +2040,8 @@ class GPUModelRunner(
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
             causal=True,
-            cos_sin_cache=self.rotate.cos_sin_cache,
+            cos_sin_cache=self._cos_sin_cache,
+            rotary_dim=self._rotary_dim,
         )
 
         if self.dcp_world_size > 1:

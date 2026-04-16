@@ -345,6 +345,7 @@ class CommonAttentionMetadata:
     slot_mapping: torch.Tensor
 
     cos_sin_cache: torch.Tensor | None = None
+    rotary_dim: int = 0
 
     causal: bool = True
 

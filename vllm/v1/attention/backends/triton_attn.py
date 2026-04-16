@@ -76,6 +76,7 @@ class TritonAttentionMetadata:
     suffix_kv_lens: torch.Tensor | None
 
     cos_sin_cache: torch.Tensor | None = None
+    rotary_dim: int = 0
 
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
@@ -236,8 +237,10 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
 
         if envs.VLLM_V1_SPANS_ENABLED:
             cos_sin_cache = common_attn_metadata.cos_sin_cache
+            rotary_dim = common_attn_metadata.rotary_dim
         else:
             cos_sin_cache = None
+            rotary_dim = 0
 
         attn_metadata = TritonAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -259,6 +262,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
             cos_sin_cache=cos_sin_cache,
+            rotary_dim=rotary_dim,
         )
         return attn_metadata
 
@@ -503,6 +507,7 @@ class TritonAttentionImpl(AttentionImpl):
         descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
 
         cos_sin_cache = attn_metadata.cos_sin_cache
+        rotary_dim = attn_metadata.rotary_dim
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
@@ -534,6 +539,7 @@ class TritonAttentionImpl(AttentionImpl):
             output_scale=output_scale,
             cos_sin_cache=cos_sin_cache,
             mm_prefix_range=mm_prefix_range_tensor,
+            rotary_dim=rotary_dim,
         )
 
         return output

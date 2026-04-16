@@ -178,6 +178,7 @@ def kernel_unified_attention_2d(
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     USE_FP8: tl.constexpr,  # bool
+    ROTARY_DIM: tl.constexpr = 0,  # int, 0 means rotary_dim == head_size
     KV_COMPUTE_DTYPE: tl.constexpr = tl.float16,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
@@ -380,40 +381,102 @@ def kernel_unified_attention_2d(
             K_b = K_b_load.to(KV_COMPUTE_DTYPE)
 
         if FUSE_ROPE:
-            cos_cache_offset = (
-                seq_offset[None, :] * stride_cs_cache_0
-                + offs_d_new[:, None] * stride_cs_cache_1
-            )
+            if ROTARY_DIM > 0 and ROTARY_DIM < HEAD_SIZE:
+                HALF_ROT: tl.constexpr = ROTARY_DIM // 2
+                partner_dim = tl.where(
+                    offs_d_new < HALF_ROT,
+                    offs_d_new + HALF_ROT,
+                    tl.where(
+                        offs_d_new < ROTARY_DIM,
+                        offs_d_new - HALF_ROT,
+                        offs_d_new,
+                    ),
+                )
+                rot_mask = (offs_d_new[:, None] < ROTARY_DIM) & tile_mask[None, :]
 
-            sin_cache_offset = (
-                seq_offset[None, :] * stride_cs_cache_0
-                + (HEAD_SIZE_PADDED // 2 + offs_d_new[:, None]) * stride_cs_cache_1
-            )
+                k_partner_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + partner_dim[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                K_partner_load = tl.load(
+                    key_cache_ptr + k_partner_offset,
+                    mask=rot_mask,
+                    other=0.0,
+                )
+                if K_partner_load.dtype.is_fp8():
+                    K_partner = (K_partner_load.to(tl.float32) * tl.load(k_scale)).to(
+                        KV_COMPUTE_DTYPE
+                    )
+                else:
+                    K_partner = K_partner_load.to(KV_COMPUTE_DTYPE)
 
-            cos = tl.load(
-                cos_sin_cache_ptr + cos_cache_offset,
-                mask=dim_mask_a[:, None] & tile_mask[None, :],
-                other=0.0,
-            ).to(K_a.dtype)
+                cos_idx = tl.where(
+                    offs_d_new < HALF_ROT,
+                    offs_d_new,
+                    tl.where(
+                        offs_d_new < ROTARY_DIM,
+                        offs_d_new - HALF_ROT,
+                        0,
+                    ),
+                )
+                cos_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + cos_idx[:, None] * stride_cs_cache_1
+                )
+                sin_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + (HALF_ROT + cos_idx[:, None]) * stride_cs_cache_1
+                )
+                cos = tl.load(
+                    cos_sin_cache_ptr + cos_offset,
+                    mask=rot_mask,
+                    other=1.0,
+                ).to(KV_COMPUTE_DTYPE)
+                sin = tl.load(
+                    cos_sin_cache_ptr + sin_offset,
+                    mask=rot_mask,
+                    other=0.0,
+                ).to(KV_COMPUTE_DTYPE)
 
-            sin = tl.load(
-                cos_sin_cache_ptr + sin_cache_offset,
-                mask=dim_mask_b[:, None] & tile_mask[None, :],
-                other=0.0,
-            )
-
-            cos = cos.to(KV_COMPUTE_DTYPE)
-            sin = sin.to(KV_COMPUTE_DTYPE)
-
-            if USE_PTX_BF16_ROPE:
-                K_rot_a, K_rot_b = ptx_bf16_rope(K_a, K_b, cos, sin)
+                K_rot_a = tl.where(
+                    offs_d_new[:, None] < HALF_ROT,
+                    K_a * cos - K_partner * sin,
+                    tl.where(
+                        offs_d_new[:, None] < ROTARY_DIM,
+                        K_a * cos + K_partner * sin,
+                        K_a,
+                    ),
+                )
+                K_rot_b = K_b
             else:
-                # Fallback: source-level Triton arithmetic. Produces output
-                # ~1 bf16 ULP away from the CUDA RoPE kernel due to Triton
-                # promoting bf16 to fp32 with FMA. Correct but not
-                # bit-identical to the non-spans baseline.
-                K_rot_a = K_a * cos - K_b * sin
-                K_rot_b = K_b * cos + K_a * sin
+                cos_cache_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + offs_d_new[:, None] * stride_cs_cache_1
+                )
+                sin_cache_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + (HEAD_SIZE_PADDED // 2 + offs_d_new[:, None]) * stride_cs_cache_1
+                )
+                cos = tl.load(
+                    cos_sin_cache_ptr + cos_cache_offset,
+                    mask=dim_mask_a[:, None] & tile_mask[None, :],
+                    other=0.0,
+                ).to(K_a.dtype)
+                sin = tl.load(
+                    cos_sin_cache_ptr + sin_cache_offset,
+                    mask=dim_mask_b[:, None] & tile_mask[None, :],
+                    other=0.0,
+                )
+                cos = cos.to(KV_COMPUTE_DTYPE)
+                sin = sin.to(KV_COMPUTE_DTYPE)
+
+                if USE_PTX_BF16_ROPE:
+                    K_rot_a, K_rot_b = ptx_bf16_rope(K_a, K_b, cos, sin)
+                else:
+                    K_rot_a = K_a * cos - K_b * sin
+                    K_rot_b = K_b * cos + K_a * sin
         else:
             K_rot_a = K_a
             K_rot_b = K_b
@@ -610,6 +673,7 @@ def kernel_unified_attention_3d(
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
+    ROTARY_DIM: tl.constexpr = 0,  # int, 0 means rotary_dim == head_size
     KV_COMPUTE_DTYPE: tl.constexpr = tl.float16,
 ):
     q_block_global_idx = tl.program_id(0)
@@ -821,40 +885,102 @@ def kernel_unified_attention_3d(
             K_b = K_b_load.to(KV_COMPUTE_DTYPE)
 
         if FUSE_ROPE:
-            cos_cache_offset = (
-                seq_offset[None, :] * stride_cs_cache_0
-                + offs_d_new[:, None] * stride_cs_cache_1
-            )
+            if ROTARY_DIM > 0 and ROTARY_DIM < HEAD_SIZE:
+                HALF_ROT: tl.constexpr = ROTARY_DIM // 2
+                partner_dim = tl.where(
+                    offs_d_new < HALF_ROT,
+                    offs_d_new + HALF_ROT,
+                    tl.where(
+                        offs_d_new < ROTARY_DIM,
+                        offs_d_new - HALF_ROT,
+                        offs_d_new,
+                    ),
+                )
+                rot_mask = (offs_d_new[:, None] < ROTARY_DIM) & tile_mask[None, :]
 
-            sin_cache_offset = (
-                seq_offset[None, :] * stride_cs_cache_0
-                + (HEAD_SIZE_PADDED // 2 + offs_d_new[:, None]) * stride_cs_cache_1
-            )
+                k_partner_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + partner_dim[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                K_partner_load = tl.load(
+                    key_cache_ptr + k_partner_offset,
+                    mask=rot_mask,
+                    other=0.0,
+                )
+                if K_partner_load.dtype.is_fp8():
+                    K_partner = (K_partner_load.to(tl.float32) * tl.load(k_scale)).to(
+                        KV_COMPUTE_DTYPE
+                    )
+                else:
+                    K_partner = K_partner_load.to(KV_COMPUTE_DTYPE)
 
-            cos = tl.load(
-                cos_sin_cache_ptr + cos_cache_offset,
-                mask=dim_mask_a[:, None] & tile_mask[None, :],
-                other=0.0,
-            ).to(K_a.dtype)
+                cos_idx = tl.where(
+                    offs_d_new < HALF_ROT,
+                    offs_d_new,
+                    tl.where(
+                        offs_d_new < ROTARY_DIM,
+                        offs_d_new - HALF_ROT,
+                        0,
+                    ),
+                )
+                cos_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + cos_idx[:, None] * stride_cs_cache_1
+                )
+                sin_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + (HALF_ROT + cos_idx[:, None]) * stride_cs_cache_1
+                )
+                cos = tl.load(
+                    cos_sin_cache_ptr + cos_offset,
+                    mask=rot_mask,
+                    other=1.0,
+                ).to(KV_COMPUTE_DTYPE)
+                sin = tl.load(
+                    cos_sin_cache_ptr + sin_offset,
+                    mask=rot_mask,
+                    other=0.0,
+                ).to(KV_COMPUTE_DTYPE)
 
-            sin = tl.load(
-                cos_sin_cache_ptr + sin_cache_offset,
-                mask=dim_mask_b[:, None] & tile_mask[None, :],
-                other=0.0,
-            )
-
-            cos = cos.to(KV_COMPUTE_DTYPE)
-            sin = sin.to(KV_COMPUTE_DTYPE)
-
-            if USE_PTX_BF16_ROPE:
-                K_rot_a, K_rot_b = ptx_bf16_rope(K_a, K_b, cos, sin)
+                K_rot_a = tl.where(
+                    offs_d_new[:, None] < HALF_ROT,
+                    K_a * cos - K_partner * sin,
+                    tl.where(
+                        offs_d_new[:, None] < ROTARY_DIM,
+                        K_a * cos + K_partner * sin,
+                        K_a,
+                    ),
+                )
+                K_rot_b = K_b
             else:
-                # Fallback: source-level Triton arithmetic. Produces output
-                # ~1 bf16 ULP away from the CUDA RoPE kernel due to Triton
-                # promoting bf16 to fp32 with FMA. Correct but not
-                # bit-identical to the non-spans baseline.
-                K_rot_a = K_a * cos - K_b * sin
-                K_rot_b = K_b * cos + K_a * sin
+                cos_cache_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + offs_d_new[:, None] * stride_cs_cache_1
+                )
+                sin_cache_offset = (
+                    seq_offset[None, :] * stride_cs_cache_0
+                    + (HEAD_SIZE_PADDED // 2 + offs_d_new[:, None]) * stride_cs_cache_1
+                )
+                cos = tl.load(
+                    cos_sin_cache_ptr + cos_cache_offset,
+                    mask=dim_mask_a[:, None] & tile_mask[None, :],
+                    other=0.0,
+                ).to(K_a.dtype)
+                sin = tl.load(
+                    cos_sin_cache_ptr + sin_cache_offset,
+                    mask=dim_mask_b[:, None] & tile_mask[None, :],
+                    other=0.0,
+                )
+                cos = cos.to(KV_COMPUTE_DTYPE)
+                sin = sin.to(KV_COMPUTE_DTYPE)
+
+                if USE_PTX_BF16_ROPE:
+                    K_rot_a, K_rot_b = ptx_bf16_rope(K_a, K_b, cos, sin)
+                else:
+                    K_rot_a = K_a * cos - K_b * sin
+                    K_rot_b = K_b * cos + K_a * sin
         else:
             K_rot_a = K_a
             K_rot_b = K_b
@@ -1150,6 +1276,7 @@ def unified_attention(
     mm_prefix_range=None,
     use_alibi_sqrt=False,
     cos_sin_cache=None,
+    rotary_dim=0,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -1308,6 +1435,7 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
+            ROTARY_DIM=rotary_dim,
             KV_COMPUTE_DTYPE=kv_compute_dtype,
         )
     else:
@@ -1366,6 +1494,7 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+            ROTARY_DIM=rotary_dim,
             KV_COMPUTE_DTYPE=kv_compute_dtype,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
