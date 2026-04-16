@@ -50,7 +50,11 @@ TP = int(os.environ.get("VLLM_SPANS_TP", "1"))
 
 SEED = 42
 MAX_TOKENS = 64
-PROMPT = "Hello world! Please write a short greeting in one sentence."
+_PROMPT_FILE = os.environ.get("VLLM_SPANS_PROMPT_FILE")
+PROMPT = (
+    open(_PROMPT_FILE).read().strip() if _PROMPT_FILE
+    else "Hello world! Please write a short greeting in one sentence."
+)
 NUM_REPS = 3
 TEMPS = [0.0, 1.0]
 LOGPROBS_TOPK = 10
@@ -232,7 +236,7 @@ def run_gap_policy_replay_test(
     model: str,
     reference_text: str,
     reference_top10: list[tuple[int, float]],
-) -> None:
+) -> dict:
     """
     Force gap policy's recomputation path to fire and verify it matches
     clean recompute.
@@ -249,8 +253,7 @@ def run_gap_policy_replay_test(
       4. Compare the second run's output to the clean recompute-mode
          reference from the main 3-mode loop.
 
-    Expected: second-run output is bit-identical to recompute. That is the
-    "huge gap ≡ full recompute" equivalence claim.
+    Returns a dict with all data needed to print the verdict later.
     """
     print(
         f"\n{'=' * 72}\n"
@@ -285,7 +288,7 @@ def run_gap_policy_replay_test(
     top10_1 = _extract_step0_topk(res1[0].outputs[0])
     print(f"    output: {truncate(text1)}")
 
-    print("  run #2 (all blocks cached → gap policy fires → recompute)...")
+    print("  run #2 (all blocks cached -> gap policy fires -> recompute)...")
     res2 = llm.generate(PROMPT, sampling_params=sp, use_tqdm=False)
     text2 = res2[0].outputs[0].text
     top10_2 = _extract_step0_topk(res2[0].outputs[0])
@@ -299,43 +302,14 @@ def run_gap_policy_replay_test(
     except Exception:
         pass
 
-    print("\n--- Verdict ---")
-
-    # First: did the replay itself change anything? If run#2 differs from
-    # run#1, gap policy did some recomputation that perturbed the output.
-    # With deterministic sampling (t=0, same seed) and a correct
-    # implementation, run#1 and run#2 should be bit-identical regardless
-    # of whether gap policy fired.
-    replay_stable = text1 == text2 and top10_1 == top10_2
-    if replay_stable:
-        print("  [OK]   run #1 == run #2 (replay is deterministic)")
-    else:
-        print("  [WARN] run #1 != run #2 (prefix cache / gap policy leaks "
-              "nondeterminism)")
-
-    # Second: does gap-policy-replay match clean recompute?
-    text_match = text2 == reference_text
-    top_match = top10_2 == reference_top10
-
-    if text_match and top_match:
-        print("  [PASS] replay run #2 == clean recompute (text + "
-              f"top-{LOGPROBS_TOPK}-logprobs bit-identical)")
-        print("  -> gap_length >= prompt_length ≡ full recompute ✓")
-    else:
-        print("  [FAIL] replay run #2 != clean recompute")
-        if not text_match:
-            print(f"    reference (recompute): {truncate(reference_text)}")
-            print(f"    replay run #2        : {truncate(text2)}")
-        if not top_match:
-            ref_map = {tid: lp for tid, lp in reference_top10}
-            rep_map = {tid: lp for tid, lp in top10_2}
-            common = set(ref_map) & set(rep_map)
-            if common:
-                max_diff = max(abs(ref_map[t] - rep_map[t]) for t in common)
-                print(f"    top-{LOGPROBS_TOPK} logprobs max|Δ| = "
-                      f"{max_diff:.3e}")
-            else:
-                print(f"    top-{LOGPROBS_TOPK} token sets disjoint")
+    return {
+        "text1": text1,
+        "text2": text2,
+        "top10_1": top10_1,
+        "top10_2": top10_2,
+        "reference_text": reference_text,
+        "reference_top10": reference_top10,
+    }
 
 
 def main() -> None:
@@ -389,6 +363,14 @@ def main() -> None:
             torch.cuda.empty_cache()
         except Exception:
             pass
+
+    # Run gap policy replay test BEFORE the report so its engine logs
+    # don't appear in the middle of the summary.
+    reference_text = results[("recompute", 0.0)][0]
+    reference_top10 = results_top10[("recompute", 0.0)][0]
+    gap_policy_results = run_gap_policy_replay_test(
+        model, reference_text, reference_top10
+    )
 
     print(f"\n\n{'#' * 72}\n# REPORT\n{'#' * 72}")
 
@@ -628,11 +610,43 @@ def main() -> None:
             "near a probability boundary end up flipping a token."
         )
 
-    # Pick up the clean recompute baseline at t=0 run#0 for the replay test
-    # to compare against.
-    reference_text = results[("recompute", 0.0)][0]
-    reference_top10 = results_top10[("recompute", 0.0)][0]
-    run_gap_policy_replay_test(model, reference_text, reference_top10)
+    # --- Gap-policy replay verdict ---
+    print(
+        "\n=== GAP-POLICY REPLAY TEST "
+        "(prefix_cache=ON, gap_length=huge) ==="
+    )
+    gp = gap_policy_results
+    replay_stable = (
+        gp["text1"] == gp["text2"] and gp["top10_1"] == gp["top10_2"]
+    )
+    if replay_stable:
+        print("  [OK]   run #1 == run #2 (replay is deterministic)")
+    else:
+        print("  [WARN] run #1 != run #2 (prefix cache / gap policy leaks "
+              "nondeterminism)")
+
+    text_match = gp["text2"] == gp["reference_text"]
+    top_match = gp["top10_2"] == gp["reference_top10"]
+
+    if text_match and top_match:
+        print("  [PASS] replay run #2 == clean recompute (text + "
+              f"top-{LOGPROBS_TOPK}-logprobs bit-identical)")
+        print("  -> gap_length >= prompt_length = full recompute")
+    else:
+        print("  [FAIL] replay run #2 != clean recompute")
+        if not text_match:
+            print(f"    reference (recompute): {truncate(gp['reference_text'])}")
+            print(f"    replay run #2        : {truncate(gp['text2'])}")
+        if not top_match:
+            ref_map = {tid: lp for tid, lp in gp["reference_top10"]}
+            rep_map = {tid: lp for tid, lp in gp["top10_2"]}
+            common = set(ref_map) & set(rep_map)
+            if common:
+                max_diff = max(abs(ref_map[t] - rep_map[t]) for t in common)
+                print(f"    top-{LOGPROBS_TOPK} logprobs max|delta| = "
+                      f"{max_diff:.3e}")
+            else:
+                print(f"    top-{LOGPROBS_TOPK} token sets disjoint")
 
     print(f"\n{'#' * 72}")
 
