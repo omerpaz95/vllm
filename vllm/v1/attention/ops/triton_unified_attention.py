@@ -33,6 +33,74 @@ def apply_softcap(S, x):
 
 
 @triton.jit
+def ptx_bf16_rope(K_a, K_b, cos, sin):
+    """
+    RoPE rotation on a pair of key halves using inline PTX scalar bf16
+    mul/sub/add. Each op rounds to bf16 once, matching
+    csrc/pos_encoding_kernels.cu's __hmul/__hsub/__hadd pattern bit-for-bit.
+
+    Source-level Triton arithmetic (K_a * cos - K_b * sin) promotes bf16
+    to fp32 and emits FMA, diverging from the CUDA kernel by ~1 bf16 ULP.
+    Requires SM_90+ (Hopper) for native scalar bf16 PTX ops; callers must
+    gate on device capability before invoking this helper.
+
+    Inputs: K_a, K_b, cos, sin all bf16 tiles of matching shape.
+    Returns: (K_rot_a, K_rot_b) both bf16, where
+        K_rot_a = K_a * cos - K_b * sin
+        K_rot_b = K_b * cos + K_a * sin
+    """
+    ka_cos = tl.inline_asm_elementwise(
+        asm="mul.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[K_a, cos],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    kb_sin = tl.inline_asm_elementwise(
+        asm="mul.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[K_b, sin],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    kb_cos = tl.inline_asm_elementwise(
+        asm="mul.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[K_b, cos],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    ka_sin = tl.inline_asm_elementwise(
+        asm="mul.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[K_a, sin],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    K_rot_a = tl.inline_asm_elementwise(
+        asm="sub.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[ka_cos, kb_sin],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    K_rot_b = tl.inline_asm_elementwise(
+        asm="add.rn.bf16 $0, $1, $2;",
+        constraints="=h,h,h",
+        args=[kb_cos, ka_sin],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+    return K_rot_a, K_rot_b
+
+
+@triton.jit
 def find_seq_idx(
     query_start_len_ptr,
     target_idx,
@@ -91,6 +159,7 @@ def kernel_unified_attention_2d(
     USE_SINKS: tl.constexpr,  # bool
     SLIDING_WINDOW: tl.constexpr,  # int
     FUSE_ROPE: tl.constexpr,  # bool
+    USE_PTX_BF16_ROPE: tl.constexpr,  # bool
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
@@ -109,6 +178,7 @@ def kernel_unified_attention_2d(
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     USE_FP8: tl.constexpr,  # bool
+    KV_COMPUTE_DTYPE: tl.constexpr = tl.float16,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -168,14 +238,14 @@ def kernel_unified_attention_2d(
         query_ptr + query_offset_a,
         mask=dim_mask_a[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
-    )
+    ).to(KV_COMPUTE_DTYPE)
 
     # Q_b : (BLOCK_M, HEAD_SIZE_PADDED // 2)
     Q_b = tl.load(
         query_ptr + query_offset_b,
         mask=dim_mask_b[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
-    )
+    ).to(KV_COMPUTE_DTYPE)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -293,12 +363,9 @@ def kernel_unified_attention_2d(
         )
 
         if K_a_load.dtype.is_fp8():
-            if Q_a.dtype.is_fp8():
-                K_a = K_a_load
-            else:
-                K_a = (K_a_load.to(tl.float32) * tl.load(k_scale)).to(Q_a.dtype)
+            K_a = (K_a_load.to(tl.float32) * tl.load(k_scale)).to(KV_COMPUTE_DTYPE)
         else:
-            K_a = K_a_load
+            K_a = K_a_load.to(KV_COMPUTE_DTYPE)
 
         # K_b : (HEAD_SIZE_PADDED // 2, TILE_SIZE)
         K_b_load = tl.load(
@@ -308,12 +375,9 @@ def kernel_unified_attention_2d(
         )
 
         if K_b_load.dtype.is_fp8():
-            if Q_b.dtype.is_fp8():
-                K_b = K_b_load
-            else:
-                K_b = (K_b_load.to(tl.float32) * tl.load(k_scale)).to(Q_b.dtype)
+            K_b = (K_b_load.to(tl.float32) * tl.load(k_scale)).to(KV_COMPUTE_DTYPE)
         else:
-            K_b = K_b_load
+            K_b = K_b_load.to(KV_COMPUTE_DTYPE)
 
         if FUSE_ROPE:
             cos_cache_offset = (
@@ -336,10 +400,20 @@ def kernel_unified_attention_2d(
                 cos_sin_cache_ptr + sin_cache_offset,
                 mask=dim_mask_b[:, None] & tile_mask[None, :],
                 other=0.0,
-            ).to(K_b.dtype)
+            )
 
-            K_rot_a = K_a * cos - K_b * sin
-            K_rot_b = K_b * cos + K_a * sin
+            cos = cos.to(KV_COMPUTE_DTYPE)
+            sin = sin.to(KV_COMPUTE_DTYPE)
+
+            if USE_PTX_BF16_ROPE:
+                K_rot_a, K_rot_b = ptx_bf16_rope(K_a, K_b, cos, sin)
+            else:
+                # Fallback: source-level Triton arithmetic. Produces output
+                # ~1 bf16 ULP away from the CUDA RoPE kernel due to Triton
+                # promoting bf16 to fp32 with FMA. Correct but not
+                # bit-identical to the non-spans baseline.
+                K_rot_a = K_a * cos - K_b * sin
+                K_rot_b = K_b * cos + K_a * sin
         else:
             K_rot_a = K_a
             K_rot_b = K_b
@@ -517,6 +591,7 @@ def kernel_unified_attention_3d(
     USE_SINKS: tl.constexpr,  # bool
     SLIDING_WINDOW: tl.constexpr,  # int
     FUSE_ROPE: tl.constexpr,  # bool
+    USE_PTX_BF16_ROPE: tl.constexpr,  # bool
     stride_k_cache_0: tl.int64,  # int
     stride_k_cache_1: tl.int64,  # int
     stride_k_cache_2: tl.int64,  # int
@@ -535,6 +610,7 @@ def kernel_unified_attention_3d(
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
+    KV_COMPUTE_DTYPE: tl.constexpr = tl.float16,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -601,14 +677,14 @@ def kernel_unified_attention_3d(
         query_ptr + query_offset_a,
         mask=dim_mask_a[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
-    )
+    ).to(KV_COMPUTE_DTYPE)
 
     # Q_b : (BLOCK_M, HEAD_SIZE_PADDED // 2)
     Q_b = tl.load(
         query_ptr + query_offset_b,
         mask=dim_mask_b[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
-    )
+    ).to(KV_COMPUTE_DTYPE)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -717,6 +793,10 @@ def kernel_unified_attention_3d(
         )
 
         # K_a : (HEAD_SIZE_PADDED // 2, TILE_SIZE)
+        # Cast to KV_COMPUTE_DTYPE (model compute dtype, e.g. bfloat16) so the
+        # in-kernel RoPE multiply below uses the same dtype as the layer-side
+        # RoPE in rotary_embedding/common.py. With this, the fused-RoPE path
+        # is bit-equivalent to the layer-rotated-then-cached path.
         K_a_load = tl.load(
             key_cache_ptr + k_offset_a,
             mask=dim_mask_a[:, None] & tile_mask[None, :],
@@ -724,12 +804,9 @@ def kernel_unified_attention_3d(
         )
 
         if K_a_load.dtype.is_fp8():
-            if Q_a.dtype.is_fp8():
-                K_a = K_a_load
-            else:
-                K_a = (K_a_load.to(tl.float32) * tl.load(k_scale)).to(Q_a.dtype)
+            K_a = (K_a_load.to(tl.float32) * tl.load(k_scale)).to(KV_COMPUTE_DTYPE)
         else:
-            K_a = K_a_load
+            K_a = K_a_load.to(KV_COMPUTE_DTYPE)
 
         # K_b : (HEAD_SIZE_PADDED // 2, TILE_SIZE)
         K_b_load = tl.load(
@@ -739,12 +816,9 @@ def kernel_unified_attention_3d(
         )
 
         if K_b_load.dtype.is_fp8():
-            if Q_b.dtype.is_fp8():
-                K_b = K_b_load
-            else:
-                K_b = (K_b_load.to(tl.float32) * tl.load(k_scale)).to(Q_b.dtype)
+            K_b = (K_b_load.to(tl.float32) * tl.load(k_scale)).to(KV_COMPUTE_DTYPE)
         else:
-            K_b = K_b_load
+            K_b = K_b_load.to(KV_COMPUTE_DTYPE)
 
         if FUSE_ROPE:
             cos_cache_offset = (
@@ -767,10 +841,20 @@ def kernel_unified_attention_3d(
                 cos_sin_cache_ptr + sin_cache_offset,
                 mask=dim_mask_b[:, None] & tile_mask[None, :],
                 other=0.0,
-            ).to(K_b.dtype)
+            )
 
-            K_rot_a = K_a * cos - K_b * sin
-            K_rot_b = K_b * cos + K_a * sin
+            cos = cos.to(KV_COMPUTE_DTYPE)
+            sin = sin.to(KV_COMPUTE_DTYPE)
+
+            if USE_PTX_BF16_ROPE:
+                K_rot_a, K_rot_b = ptx_bf16_rope(K_a, K_b, cos, sin)
+            else:
+                # Fallback: source-level Triton arithmetic. Produces output
+                # ~1 bf16 ULP away from the CUDA RoPE kernel due to Triton
+                # promoting bf16 to fp32 with FMA. Correct but not
+                # bit-identical to the non-spans baseline.
+                K_rot_a = K_a * cos - K_b * sin
+                K_rot_b = K_b * cos + K_a * sin
         else:
             K_rot_a = K_a
             K_rot_b = K_b
@@ -1087,6 +1171,30 @@ def unified_attention(
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     fuse_rope = cos_sin_cache is not None
+    # The in-kernel RoPE matches the CUDA RoPE kernel bit-for-bit only when
+    # it uses inline PTX scalar bf16 mul/sub/add, which requires SM_90+
+    # (Hopper) and bf16 operands. Otherwise we fall back to source-level
+    # Triton arithmetic, which is correct but ~1 bf16 ULP off the CUDA path.
+    _device_cap = (
+        current_platform.get_device_capability() if current_platform.is_cuda() else None
+    )
+    use_ptx_bf16_rope = (
+        fuse_rope
+        and k.dtype == torch.bfloat16
+        and _device_cap is not None
+        and _device_cap >= (9, 0)
+    )
+    # Select the compute dtype for in-kernel RoPE + key cast so it matches
+    # the layer-side RoPE dtype (x.dtype inside rotary_embedding/common.py).
+    # For fp8 caches we keep fp16 (the existing dequant path lands there).
+    if k.dtype == torch.bfloat16:
+        kv_compute_dtype = tl.bfloat16
+    elif k.dtype == torch.float16:
+        kv_compute_dtype = tl.float16
+    elif k.dtype == torch.float32:
+        kv_compute_dtype = tl.float32
+    else:
+        kv_compute_dtype = tl.float16
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
@@ -1184,6 +1292,7 @@ def unified_attention(
             mm_prefix_range_ptr=mm_prefix_range,
             SLIDING_WINDOW=(1 + window_size[0]),
             FUSE_ROPE=fuse_rope,
+            USE_PTX_BF16_ROPE=use_ptx_bf16_rope,
             stride_k_cache_0=k.stride(0),
             stride_k_cache_1=k.stride(1),
             stride_k_cache_2=k.stride(2),
@@ -1199,6 +1308,7 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
+            KV_COMPUTE_DTYPE=kv_compute_dtype,
         )
     else:
         kernel_unified_attention_3d[
@@ -1240,6 +1350,7 @@ def unified_attention(
             mm_prefix_range_ptr=mm_prefix_range,
             SLIDING_WINDOW=(1 + window_size[0]),
             FUSE_ROPE=fuse_rope,
+            USE_PTX_BF16_ROPE=use_ptx_bf16_rope,
             stride_k_cache_0=k.stride(0),
             stride_k_cache_1=k.stride(1),
             stride_k_cache_2=k.stride(2),
@@ -1255,6 +1366,7 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+            KV_COMPUTE_DTYPE=kv_compute_dtype,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
