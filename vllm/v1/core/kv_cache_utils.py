@@ -534,6 +534,7 @@ def hash_block_tokens(
     parent_block_hash: BlockHash | None,
     curr_block_token_ids: Sequence[int],
     extra_keys: tuple[Any, ...] | None = None,
+    is_span_start: bool = False,
 ) -> BlockHash:
     """Computes a hash value corresponding to the contents of a block and
     the contents of the preceding block(s). The hash value is used for
@@ -546,28 +547,13 @@ def hash_block_tokens(
         curr_block_token_ids: A list of token ids in the current
             block. The current block is assumed to be full.
         extra_keys: Extra keys for the block.
+        is_span_start: If True, reset parent hash to NONE_HASH (fan-in).
     Returns:
         The hash value of the block and the token ids in the block.
         The entire tuple is used as the hash key of the block.
     """
-    if not parent_block_hash:
+    if not parent_block_hash or is_span_start:
         parent_block_hash = NONE_HASH
-
-    if envs.VLLM_V1_SPANS_ENABLED:
-        if envs.VLLM_V1_SPANS_TOKEN_PLUS == -1:
-            raise Exception(
-                "[SPANS -> kv_cache_utils]: span separator token undefined!"
-            )
-        # if a block starts with the span separator token, then its hash
-        # should be independent of previous tokens
-        firstok = curr_block_token_ids[0]
-        if firstok == envs.VLLM_V1_SPANS_TOKEN_PLUS:
-            if envs.VLLM_V1_SPANS_DEBUG:
-                print(
-                    f'[SPANS -> kv_cache_utils] detected span separator " \
-                        "token {envs.VLLM_V1_SPANS_TOKEN_PLUS} -> enable fan-in'
-                )
-            parent_block_hash = NONE_HASH
 
     curr_block_token_ids_tuple = tuple(curr_block_token_ids)
     return BlockHash(
@@ -576,14 +562,11 @@ def hash_block_tokens(
 
 
 def recompute_token_handler(
-    block_first_token: int,
     tokens_up_to_block: list[int],
     extra_keys: tuple[Any, ...] | None,
+    is_cross_span: bool = False,
 ) -> tuple[Any, ...] | None:
-    if (
-        envs.VLLM_V1_SPANS_ENABLED
-        and block_first_token == envs.VLLM_V1_SPANS_TOKEN_CROSS
-    ):
+    if is_cross_span:
         tok_tuple = tuple(tokens_up_to_block)
         extra_keys = (*extra_keys, tok_tuple) if extra_keys else tok_tuple
     return extra_keys
@@ -604,6 +587,26 @@ def get_request_block_hasher(
         if start_token_idx + block_size > num_tokens:
             # Early stop when there no new full blocks created.
             return []
+
+        # Build O(1) lookup sets from span metadata
+        span_starts_set: set[int] = set()
+        cross_starts_set: set[int] = set()
+        if request.span_starts:
+            for pos in request.span_starts:
+                if pos % block_size != 0:
+                    raise ValueError(
+                        f"span_starts position {pos} is not aligned to "
+                        f"block_size {block_size}"
+                    )
+            span_starts_set = set(request.span_starts)
+        if request.cross_span_starts:
+            for pos in request.cross_span_starts:
+                if pos % block_size != 0:
+                    raise ValueError(
+                        f"cross_span_starts position {pos} is not aligned to "
+                        f"block_size {block_size}"
+                    )
+            cross_starts_set = set(request.cross_span_starts)
 
         curr_mm_idx = 0
         if start_token_idx > 0:
@@ -631,12 +634,20 @@ def get_request_block_hasher(
             # Compute the hash of the current block
             block_tokens = request.all_token_ids[start_token_idx:end_token_idx]
 
+            is_cross_span = start_token_idx in cross_starts_set
             extra_keys = recompute_token_handler(
-                block_tokens[0], block_tokens[:start_token_idx], extra_keys
+                request.all_token_ids[:start_token_idx],
+                extra_keys,
+                is_cross_span=is_cross_span,
             )
 
+            is_span_start = start_token_idx in span_starts_set
             block_hash = hash_block_tokens(
-                caching_hash_fn, prev_block_hash_value, block_tokens, extra_keys
+                caching_hash_fn,
+                prev_block_hash_value,
+                block_tokens,
+                extra_keys,
+                is_span_start=is_span_start,
             )
 
             new_block_hashes.append(block_hash)
