@@ -309,7 +309,11 @@ class OffloadingConnectorScheduler:
         self._reqs_to_load[request.request_id] = (src_spec, dst_spec)
         req_blocks_being_loaded = self._reqs_being_loaded[request.request_id]
         req_blocks_being_loaded.update(offload_keys)
-        group_state.next_stored_block_idx = num_blocks
+        params = req_status.req_context.kv_transfer_params
+        if params is None or not params.get("do_remote_decode"):
+            # For P/D prefill requests (do_remote_decode=True), we do NOT advance
+            # next_stored_block_idx past GPU-cached prefix blocks.
+            group_state.next_stored_block_idx = num_blocks
 
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.update(req_blocks_being_loaded)
@@ -344,12 +348,7 @@ class OffloadingConnectorScheduler:
             # with async scheduling, some tokens may be missing
             total_tokens = min(expected_tokens, req.num_tokens)
             num_blocks = total_tokens // group_config.offloaded_block_size
-            params = req.kv_transfer_params
-            if params is not None and params.get("do_remote_decode"):
-                # For P/D disaggregation: Offload all blocks (not just new ones).
-                start_block_idx = 0
-            else:
-                start_block_idx = group_state.next_stored_block_idx
+            start_block_idx = group_state.next_stored_block_idx
             num_new_blocks = num_blocks - start_block_idx
 
             if num_new_blocks <= 0:
