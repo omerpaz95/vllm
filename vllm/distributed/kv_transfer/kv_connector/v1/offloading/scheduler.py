@@ -300,7 +300,12 @@ class OffloadingConnectorScheduler:
             # with async scheduling, some tokens may be missing
             total_tokens = min(expected_tokens, req.num_tokens)
             num_blocks = total_tokens // group_config.offloaded_block_size
-            start_block_idx = group_state.next_stored_block_idx
+            params = req.kv_transfer_params
+            if params is not None and params.get("do_remote_decode"):
+                # For P/D disaggregation: Offload all blocks (not just new ones).
+                start_block_idx = 0
+            else:
+                start_block_idx = group_state.next_stored_block_idx
             num_new_blocks = num_blocks - start_block_idx
 
             if num_new_blocks <= 0:
