@@ -311,8 +311,8 @@ class OffloadingConnectorScheduler:
         req_blocks_being_loaded.update(offload_keys)
         params = req_status.req_context.kv_transfer_params
         if params is None or not params.get("do_remote_decode"):
-            # For P/D prefill requests (do_remote_decode=True), we do NOT advance
-            # next_stored_block_idx past GPU-cached prefix blocks.
+            # For P/D prefill requests (do_remote_decode=True), we do NOT skip
+            # saving the hit prefix, as we stream the entire request.
             group_state.next_stored_block_idx = num_blocks
 
         if self._blocks_being_loaded is not None:
