@@ -603,6 +603,82 @@ def test_hash_block_tokens(hash_fn):
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
+def test_hash_block_tokens_span_start_resets_parent(hash_fn):
+    """When is_span_start=True, parent_block_hash is reset to NONE_HASH."""
+    parent_block_hash = BlockHash(b"some_parent")
+    curr_block_token_ids = (100, 200, 300)
+    extra_keys = None
+
+    hash_with_span = hash_block_tokens(
+        hash_fn,
+        parent_block_hash,
+        curr_block_token_ids,
+        extra_keys,
+        is_span_start=True,
+    )
+    hash_with_none_parent = hash_block_tokens(
+        hash_fn,
+        None,
+        curr_block_token_ids,
+        extra_keys,
+    )
+    assert hash_with_span == hash_with_none_parent
+
+
+@pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
+def test_hash_block_tokens_no_span_start_keeps_parent(hash_fn):
+    """When is_span_start=False (default), parent_block_hash is preserved."""
+    parent_block_hash = BlockHash(b"some_parent")
+    curr_block_token_ids = (100, 200, 300)
+
+    hash_default = hash_block_tokens(
+        hash_fn,
+        parent_block_hash,
+        curr_block_token_ids,
+        None,
+    )
+    hash_explicit_false = hash_block_tokens(
+        hash_fn,
+        parent_block_hash,
+        curr_block_token_ids,
+        None,
+        is_span_start=False,
+    )
+    assert hash_default == hash_explicit_false
+
+
+def test_recompute_token_handler_cross_span():
+    """When is_cross_span=True, preceding tokens are folded into extra_keys."""
+    from vllm.v1.core.kv_cache_utils import recompute_token_handler
+
+    tokens = [1, 2, 3, 4, 5]
+    extra_keys = ("existing",)
+
+    result = recompute_token_handler(tokens, extra_keys, is_cross_span=True)
+    assert result == ("existing", (1, 2, 3, 4, 5))
+
+
+def test_recompute_token_handler_no_cross_span():
+    """When is_cross_span=False, extra_keys unchanged."""
+    from vllm.v1.core.kv_cache_utils import recompute_token_handler
+
+    tokens = [1, 2, 3, 4, 5]
+    extra_keys = ("existing",)
+
+    result = recompute_token_handler(tokens, extra_keys, is_cross_span=False)
+    assert result == ("existing",)
+
+
+def test_recompute_token_handler_cross_span_none_extra_keys():
+    """When is_cross_span=True and extra_keys is None, tokens become extra_keys."""
+    from vllm.v1.core.kv_cache_utils import recompute_token_handler
+
+    tokens = [10, 20, 30]
+    result = recompute_token_handler(tokens, None, is_cross_span=True)
+    assert result == (10, 20, 30)
+
+
+@pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
 def test_request_block_hasher(hash_fn):
     request = make_request(
         request_id="0",
@@ -2094,3 +2170,180 @@ def test_unify_hybrid_kv_cache_specs():
 
     with pytest.raises(ValueError):
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+
+def test_request_span_metadata_extracted():
+    """span_starts/cross_span_starts extracted from extra_args when SPANS_ENABLED."""
+    import vllm.envs as envs
+
+    original = envs.VLLM_V1_SPANS_ENABLED
+    try:
+        envs.VLLM_V1_SPANS_ENABLED = True
+        sampling_params = SamplingParams(
+            max_tokens=17,
+            extra_args={
+                "span_starts": [0, 64],
+                "cross_span_starts": [128],
+            },
+        )
+        sampling_params.update_from_generation_config({}, eos_token_id=100)
+        req = Request(
+            request_id="span_test",
+            prompt_token_ids=list(range(192)),
+            sampling_params=sampling_params,
+            pooling_params=None,
+        )
+        assert req.span_starts == [0, 64]
+        assert req.cross_span_starts == [128]
+    finally:
+        envs.VLLM_V1_SPANS_ENABLED = original
+
+
+def test_request_span_metadata_ignored_when_disabled():
+    """span_starts/cross_span_starts are None when SPANS_ENABLED is False."""
+    import vllm.envs as envs
+
+    original = envs.VLLM_V1_SPANS_ENABLED
+    try:
+        envs.VLLM_V1_SPANS_ENABLED = False
+        sampling_params = SamplingParams(
+            max_tokens=17,
+            extra_args={
+                "span_starts": [0, 64],
+                "cross_span_starts": [128],
+            },
+        )
+        sampling_params.update_from_generation_config({}, eos_token_id=100)
+        req = Request(
+            request_id="span_test_disabled",
+            prompt_token_ids=list(range(192)),
+            sampling_params=sampling_params,
+            pooling_params=None,
+        )
+        assert req.span_starts is None
+        assert req.cross_span_starts is None
+    finally:
+        envs.VLLM_V1_SPANS_ENABLED = original
+
+
+def test_request_span_metadata_none_when_no_extra_args():
+    """span_starts/cross_span_starts are None when extra_args is absent."""
+    import vllm.envs as envs
+
+    original = envs.VLLM_V1_SPANS_ENABLED
+    try:
+        envs.VLLM_V1_SPANS_ENABLED = True
+        sampling_params = SamplingParams(max_tokens=17)
+        sampling_params.update_from_generation_config({}, eos_token_id=100)
+        req = Request(
+            request_id="span_test_none",
+            prompt_token_ids=list(range(192)),
+            sampling_params=sampling_params,
+            pooling_params=None,
+        )
+        assert req.span_starts is None
+        assert req.cross_span_starts is None
+    finally:
+        envs.VLLM_V1_SPANS_ENABLED = original
+
+
+def test_request_block_hasher_span_start_resets_hash():
+    """Block at a span_start position gets NONE_HASH as parent."""
+    import vllm.envs as envs
+    from vllm.utils.hashing import sha256_cbor
+
+    original = envs.VLLM_V1_SPANS_ENABLED
+    try:
+        envs.VLLM_V1_SPANS_ENABLED = True
+        block_size = 3
+        # Tokens: [0,1,2] [3,4,5] [6,7,8]
+        # span_starts=[3] means block 1 is a span start
+        sampling_params = SamplingParams(
+            max_tokens=17,
+            extra_args={"span_starts": [3]},
+        )
+        sampling_params.update_from_generation_config({}, eos_token_id=100)
+        req = Request(
+            request_id="span_hash_test",
+            prompt_token_ids=list(range(9)),
+            sampling_params=sampling_params,
+            pooling_params=None,
+            block_hasher=get_request_block_hasher(block_size, sha256_cbor),
+        )
+        hashes = req.block_hashes
+        assert len(hashes) == 3
+        # Block 1 (span start) should have same hash as if it were the first block
+        standalone_hash = hash_block_tokens(
+            sha256_cbor,
+            None,
+            (3, 4, 5),
+            None,
+            is_span_start=True,
+        )
+        assert hashes[1] == standalone_hash
+    finally:
+        envs.VLLM_V1_SPANS_ENABLED = original
+
+
+def test_request_block_hasher_validates_alignment():
+    """span_starts not aligned to block_size raises ValueError."""
+    import vllm.envs as envs
+    from vllm.utils.hashing import sha256_cbor
+
+    original = envs.VLLM_V1_SPANS_ENABLED
+    try:
+        envs.VLLM_V1_SPANS_ENABLED = True
+        block_size = 4
+        sampling_params = SamplingParams(
+            max_tokens=17,
+            extra_args={"span_starts": [5]},  # not divisible by 4
+        )
+        sampling_params.update_from_generation_config({}, eos_token_id=100)
+        with pytest.raises(ValueError, match="not aligned to block_size"):
+            Request(
+                request_id="bad_align",
+                prompt_token_ids=list(range(16)),
+                sampling_params=sampling_params,
+                pooling_params=None,
+                block_hasher=get_request_block_hasher(block_size, sha256_cbor),
+            )
+    finally:
+        envs.VLLM_V1_SPANS_ENABLED = original
+
+
+def test_request_block_hasher_cross_span_folds_tokens():
+    """Block at a cross_span_starts position folds preceding tokens into extra_keys."""
+    import vllm.envs as envs
+    from vllm.utils.hashing import sha256_cbor
+
+    original = envs.VLLM_V1_SPANS_ENABLED
+    try:
+        envs.VLLM_V1_SPANS_ENABLED = True
+        block_size = 3
+        # Tokens: [0,1,2] [3,4,5]
+        # cross_span_starts=[3] means block 1 is a cross span
+        sampling_params = SamplingParams(
+            max_tokens=17,
+            extra_args={"cross_span_starts": [3]},
+        )
+        sampling_params.update_from_generation_config({}, eos_token_id=100)
+        req = Request(
+            request_id="cross_hash_test",
+            prompt_token_ids=list(range(6)),
+            sampling_params=sampling_params,
+            pooling_params=None,
+            block_hasher=get_request_block_hasher(block_size, sha256_cbor),
+        )
+        hashes = req.block_hashes
+        assert len(hashes) == 2
+        # Block 1 should have extra_keys containing tokens up to block start
+        expected_extra = tuple(range(3))  # tokens [0,1,2] folded in
+        expected_hash = hash_block_tokens(
+            sha256_cbor,
+            hashes[0],
+            (3, 4, 5),
+            expected_extra,
+        )
+        assert hashes[1] == expected_hash
+    finally:
+        envs.VLLM_V1_SPANS_ENABLED = original

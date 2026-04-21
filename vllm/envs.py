@@ -239,8 +239,6 @@ if TYPE_CHECKING:
     # spans vars
     VLLM_V1_SPANS_ENABLED: bool = False
     VLLM_V1_SPANS_DEBUG: bool = False
-    VLLM_V1_SPANS_TOKEN_PLUS: int = -1
-    VLLM_V1_SPANS_TOKEN_CROSS: int = -1
     VLLM_V1_SPANS_PAD_TOKEN: int = -1
     VLLM_V1_SPANS_BLOCK_SIZE: int = 0
     VLLM_V1_SPANS_GAP_POLICY_ENABLE: bool = False
@@ -1495,16 +1493,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # implementation
     "VLLM_V1_SPANS_DEBUG": lambda: os.environ.get("VLLM_V1_SPANS_DEBUG", "False")
     == "True",
-    # for block-attention, the token that will be used in order to
-    # indicate the beginning of a span (needed for it to work)
-    "VLLM_V1_SPANS_TOKEN_PLUS": lambda: int(
-        os.environ.get("VLLM_V1_SPANS_TOKEN_PLUS", "-1")
-    ),
-    # for block-attention, a token that signals the beginning of a
-    # span which needs to depend on all previous tokens
-    "VLLM_V1_SPANS_TOKEN_CROSS": lambda: int(
-        os.environ.get("VLLM_V1_SPANS_TOKEN_CROSS", "-1")
-    ),
     # for block-attention, the token used for padding sequences
     # to block boundaries (client-side)
     "VLLM_V1_SPANS_PAD_TOKEN": lambda: int(

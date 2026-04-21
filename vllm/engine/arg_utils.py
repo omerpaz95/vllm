@@ -1785,8 +1785,6 @@ class EngineArgs:
             config: dict[str, Any] = {
                 "gap_length": envs.VLLM_V1_SPANS_GAP_LENGTH,
             }
-            if envs.VLLM_V1_SPANS_TOKEN_PLUS >= 0:
-                config["span_marker_token_id"] = envs.VLLM_V1_SPANS_TOKEN_PLUS
             if block_size is not None:
                 config["block_size"] = block_size
             gap_policy_config = config

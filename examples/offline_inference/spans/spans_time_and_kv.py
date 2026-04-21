@@ -26,16 +26,14 @@ MODEL_NAMES = [
     "ibm-granite/granite-3.1-8b-instruct",  # IBMchuk
     "/vllm-workspace/hub/models--meta-llama--Llama-4-Maverick-17B-128E-Instruct-FP8/snapshots/94125d2bd83076b21eed33119525e29eaf3894f4",
     # "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8", # Llama-4
-    "zai-org/GLM-4.7-FP8", # GLM-4.7-FP8
-    "mistralai/Mistral-Large-3-675B-Instruct-2512", # Minimax
-    "NousResearch/Meta-Llama-3.1-8B-Instruct", # Llama-3.1
+    "zai-org/GLM-4.7-FP8",  # GLM-4.7-FP8
+    "mistralai/Mistral-Large-3-675B-Instruct-2512",  # Minimax
+    "NousResearch/Meta-Llama-3.1-8B-Instruct",  # Llama-3.1
 ]
 SELECTED_MODEL_INDEX = 3
 
-# Block-attention tokens
+# Token used for padding to block boundaries
 PAD_TOKEN = 27  # "<"
-SPAN_TOKEN_PLUS = 10  # "+"
-SPAN_TOKEN_CROSS = 31  # "@"
 
 # Paths
 TEXT_FILE_1 = "example_text.txt"
@@ -58,8 +56,6 @@ def setup_environment():
 
     # Enable block attention
     os.environ["VLLM_V1_SPANS_ENABLED"] = "True"
-    os.environ["VLLM_V1_SPANS_TOKEN_PLUS"] = str(SPAN_TOKEN_PLUS)
-    os.environ["VLLM_V1_SPANS_TOKEN_CROSS"] = str(SPAN_TOKEN_CROSS)
 
     # Debug and configuration
     os.environ["VLLM_V1_SPANS_DEBUG"] = "True"
@@ -289,8 +285,7 @@ class LLMInstance:
         if use_gap_policy:
             gap_policy_name = "span_aware"
             gap_policy_config = {
-                "gap_length":128,
-                "span_marker_token_id": SPAN_TOKEN_PLUS,
+                "gap_length": 128,
                 "block_size": BLOCK_SIZE,
             }
 
@@ -331,12 +326,23 @@ class LLMInstance:
             )
         return time.time() - start
 
-    def generate(self, prompt: list[int]) -> tuple:
+    def generate(
+        self,
+        prompt: list[int],
+        extra_args: dict | None = None,
+    ) -> tuple:
         """Generate response returning output and elapsed time."""
+        params = self.sampling_params_generate
+        if extra_args:
+            params = SamplingParams(
+                temperature=params.temperature,
+                max_tokens=params.max_tokens,
+                extra_args=extra_args,
+            )
         start = time.time()
         response = self.llm.generate(
             wrap_prompt(prompt),
-            sampling_params=self.sampling_params_generate, # self.sampling_params_preload for checking timing performance
+            sampling_params=params,
             use_tqdm=False,
         )
         elapsed = time.time() - start
@@ -371,8 +377,8 @@ class DocumentSet:
 
     @staticmethod
     def _format_doc(tokens: list[int]) -> list[int]:
-        """Format a document with span token and padding."""
-        return pad_tokens([SPAN_TOKEN_PLUS] + tokens, PAD_TOKEN)
+        """Format a document with padding."""
+        return pad_tokens(tokens, PAD_TOKEN)
 
     def __len__(self) -> int:
         return len(self.segments)
@@ -424,7 +430,7 @@ class TestRunner:
         baseline_result = None
         segmented_result = None
         offloading_result = None
-        
+
         for r in self.results:
             name_lower = r.name.lower()
             if "baseline" in name_lower:
@@ -440,7 +446,7 @@ class TestRunner:
             print(f"  - Preload time: {result.preload_time:.4f} s")
             print(f"  - Generation time: {result.generation_time:.4f} s")
             print(f"  - Total time: {total:.4f} s")
-            
+
             if result.ttft > 0:
                 print(f"  - TTFT: {result.ttft:.4f} s ({result.ttft * 1000:.2f} ms)")
             if result.tpot > 0:
@@ -452,12 +458,16 @@ class TestRunner:
                     result.generation_time / baseline_result.generation_time - 1
                 ) * 100
                 print(f"  - vs Baseline: {diff:+.4f} s ({pct:+.2f}%)")
-            
+
             # Add comparison between OffloadingConnector and SegmentedPrefillOffloadConnector
             if result == offloading_result and segmented_result:
                 diff = result.generation_time - segmented_result.generation_time
-                pct = (result.generation_time / segmented_result.generation_time - 1) * 100
-                print(f"  - vs SegmentedPrefillOffloadConnector: {diff:+.4f} s ({pct:+.2f}%)")
+                pct = (
+                    result.generation_time / segmented_result.generation_time - 1
+                ) * 100
+                print(
+                    f"  - vs SegmentedPrefillOffloadConnector: {diff:+.4f} s ({pct:+.2f}%)"
+                )
 
         print("=" * 80)
 
@@ -473,14 +483,17 @@ class TestRunner:
             baseline_result = None
             segmented_result = None
             offloading_result = None
-            
+
             for r in self.results:
                 name_lower = r.name.lower()
                 if "baseline" in name_lower:
                     baseline_result = r
                 elif "segmentedprefilloffload" in name_lower:
                     segmented_result = r
-                elif "offloadingconnector" in name_lower and "segmented" not in name_lower:
+                elif (
+                    "offloadingconnector" in name_lower
+                    and "segmented" not in name_lower
+                ):
                     offloading_result = r
 
             for i, result in enumerate(self.results, 1):
@@ -492,51 +505,69 @@ class TestRunner:
                 f.write("TIMING METRICS:\n")
                 f.write(f"  Preload time:     {result.preload_time:.4f} s\n")
                 f.write(f"  Generation time:  {result.generation_time:.4f} s\n")
-                f.write(f"  Total time:       {result.preload_time + result.generation_time:.4f} s\n")
-                
+                f.write(
+                    f"  Total time:       {result.preload_time + result.generation_time:.4f} s\n"
+                )
+
                 if result.ttft > 0:
-                    f.write(f"  TTFT:             {result.ttft:.4f} s ({result.ttft * 1000:.2f} ms)\n")
+                    f.write(
+                        f"  TTFT:             {result.ttft:.4f} s ({result.ttft * 1000:.2f} ms)\n"
+                    )
                 if result.tpot > 0:
-                    f.write(f"  TPOT:             {result.tpot:.4f} s ({result.tpot * 1000:.2f} ms)\n")
+                    f.write(
+                        f"  TPOT:             {result.tpot:.4f} s ({result.tpot * 1000:.2f} ms)\n"
+                    )
                 if result.num_output_tokens > 0:
                     f.write(f"  Output tokens:    {result.num_output_tokens}\n")
 
                 # Comparison with baseline
                 if baseline_result and result != baseline_result:
                     diff = result.generation_time - baseline_result.generation_time
-                    pct = (result.generation_time / baseline_result.generation_time - 1) * 100
-                    f.write(f"\n  vs Baseline:\n")
+                    pct = (
+                        result.generation_time / baseline_result.generation_time - 1
+                    ) * 100
+                    f.write("\n  vs Baseline:\n")
                     f.write(f"    Generation time diff: {diff:+.4f} s ({pct:+.2f}%)\n")
-                    
+
                     if result.ttft > 0 and baseline_result.ttft > 0:
                         ttft_diff = result.ttft - baseline_result.ttft
                         ttft_pct = (result.ttft / baseline_result.ttft - 1) * 100
-                        f.write(f"    TTFT diff:            {ttft_diff:+.4f} s ({ttft_pct:+.2f}%)\n")
-                    
+                        f.write(
+                            f"    TTFT diff:            {ttft_diff:+.4f} s ({ttft_pct:+.2f}%)\n"
+                        )
+
                     if result.tpot > 0 and baseline_result.tpot > 0:
                         tpot_diff = result.tpot - baseline_result.tpot
                         tpot_pct = (result.tpot / baseline_result.tpot - 1) * 100
-                        f.write(f"    TPOT diff:            {tpot_diff:+.4f} s ({tpot_pct:+.2f}%)\n")
+                        f.write(
+                            f"    TPOT diff:            {tpot_diff:+.4f} s ({tpot_pct:+.2f}%)\n"
+                        )
 
                 # Comparison between SegmentedPrefillOffloadConnector and OffloadingConnector
                 if result == offloading_result and segmented_result:
                     diff = result.generation_time - segmented_result.generation_time
-                    pct = (result.generation_time / segmented_result.generation_time - 1) * 100
-                    f.write(f"\n  vs SegmentedPrefillOffloadConnector:\n")
+                    pct = (
+                        result.generation_time / segmented_result.generation_time - 1
+                    ) * 100
+                    f.write("\n  vs SegmentedPrefillOffloadConnector:\n")
                     f.write(f"    Generation time diff: {diff:+.4f} s ({pct:+.2f}%)\n")
-                    
+
                     if result.ttft > 0 and segmented_result.ttft > 0:
                         ttft_diff = result.ttft - segmented_result.ttft
                         ttft_pct = (result.ttft / segmented_result.ttft - 1) * 100
-                        f.write(f"    TTFT diff:            {ttft_diff:+.4f} s ({ttft_pct:+.2f}%)\n")
-                    
+                        f.write(
+                            f"    TTFT diff:            {ttft_diff:+.4f} s ({ttft_pct:+.2f}%)\n"
+                        )
+
                     if result.tpot > 0 and segmented_result.tpot > 0:
                         tpot_diff = result.tpot - segmented_result.tpot
                         tpot_pct = (result.tpot / segmented_result.tpot - 1) * 100
-                        f.write(f"    TPOT diff:            {tpot_diff:+.4f} s ({tpot_pct:+.2f}%)\n")
+                        f.write(
+                            f"    TPOT diff:            {tpot_diff:+.4f} s ({tpot_pct:+.2f}%)\n"
+                        )
 
                 # Output text
-                f.write(f"\nOUTPUT TEXT:\n")
+                f.write("\nOUTPUT TEXT:\n")
                 f.write("-" * 80 + "\n")
                 f.write(f"{result.output_text}\n")
                 f.write("-" * 80 + "\n\n")
@@ -579,7 +610,7 @@ def main():
         ),
         PAD_TOKEN,
     )
-    query_prefix = [SPAN_TOKEN_CROSS] + tokenizer(
+    query_prefix = tokenizer(
         "<|user|>\nPlease write a high-quality answer for the "
         "given question using only the provided search documents "
         "(some of which might be irrelevant).\nQuestion: "
@@ -613,10 +644,24 @@ def main():
 
     # Build the full query
     question = "What is Northholm's value to Luminthia?"
+    all_docs_flat = sum(all_docs, [])
     full_prompt = (
-        prefix + sum(all_docs, []) + query_prefix + tokenizer(question) + query_suffix
+        prefix + all_docs_flat + query_prefix + tokenizer(question) + query_suffix
     )
     print(f"\nFull prompt length: {len(full_prompt)} tokens")
+
+    # Compute span boundaries for extra_args
+    span_starts = []
+    offset = len(prefix)
+    for doc in all_docs:
+        span_starts.append(offset)
+        offset += len(doc)
+    cross_span_starts = [offset]
+
+    span_extra_args = {
+        "span_starts": span_starts,
+        "cross_span_starts": cross_span_starts,
+    }
 
     # =============================================================================
     # TEST 1: OffloadingConnector + SpanAwareGapPolicy
@@ -625,14 +670,14 @@ def main():
     test_name = f"OffloadingConnector + SpanAwareGapPolicy ({len(all_docs)} docs)"
     runner.print_header(f"TEST 1: {test_name}")
 
-    response, gen_time = instance1.generate(full_prompt)
+    response, gen_time = instance1.generate(full_prompt, extra_args=span_extra_args)
     output_text = response[0].outputs[0].text
-    
+
     # Extract metrics
     ttft = 0.0
     tpot = 0.0
     num_output_tokens = len(response[0].outputs[0].token_ids)
-    
+
     metrics = response[0].metrics
     num_output_tokens = len(response[0].outputs[0].token_ids)
     # TTFT: time from arrival to first token
@@ -642,8 +687,15 @@ def main():
         ttft = 0.0
 
     # TPOT: time between tokens after the first
-    if metrics and metrics.finished_time and metrics.first_token_time and num_output_tokens > 1:
-        tpot = (metrics.finished_time - metrics.first_token_time) / (num_output_tokens - 1)
+    if (
+        metrics
+        and metrics.finished_time
+        and metrics.first_token_time
+        and num_output_tokens > 1
+    ):
+        tpot = (metrics.finished_time - metrics.first_token_time) / (
+            num_output_tokens - 1
+        )
     else:
         tpot = 0.0
     print(f"Preload time: {preload_time:.4f} s")
@@ -654,9 +706,20 @@ def main():
     print(f"Output tokens: {num_output_tokens}")
     print(f"Output: {output_text[:200]}...")
 
-    dump_kv_cache_to_file(instance1.llm, "kv_cache_test1_with_gap_policy.txt", test_name)
+    dump_kv_cache_to_file(
+        instance1.llm, "kv_cache_test1_with_gap_policy.txt", test_name
+    )
     runner.results.append(
-        TestResult(test_name, preload_time, gen_time, output_text, model_name, ttft, tpot, num_output_tokens)
+        TestResult(
+            test_name,
+            preload_time,
+            gen_time,
+            output_text,
+            model_name,
+            ttft,
+            tpot,
+            num_output_tokens,
+        )
     )
 
     # Cleanup instance 1
@@ -672,7 +735,7 @@ def main():
     instance2 = LLMInstance.create(
         model_name,
         kv_config=KVConfigBuilder.offloading(),
-        use_gap_policy=False  # Disable gap policy for baseline comparison
+        use_gap_policy=False,  # Disable gap policy for baseline comparison
     )
 
     runner.print_header("TEST 2: OffloadingConnector (No GapPolicy - Baseline)")
@@ -682,17 +745,17 @@ def main():
     print(f"Preload completed in {preload_time2:.4f} s")
     time.sleep(2)
 
-    response2, gen_time2 = instance2.generate(full_prompt)
+    response2, gen_time2 = instance2.generate(full_prompt, extra_args=span_extra_args)
     output_text2 = response2[0].outputs[0].text
-    
+
     # Extract metrics
     ttft2 = 0.0
     tpot2 = 0.0
     num_output_tokens2 = len(response2[0].outputs[0].token_ids)
-    
-    if response2[0].metrics and hasattr(response2[0].metrics, 'first_token_latency'):
+
+    if response2[0].metrics and hasattr(response2[0].metrics, "first_token_latency"):
         ttft2 = response2[0].metrics.first_token_latency
-    
+
     if num_output_tokens2 > 1 and ttft2 > 0:
         tpot2 = (gen_time2 - ttft2) / (num_output_tokens2 - 1)
 
@@ -707,7 +770,16 @@ def main():
     test_name2 = "OffloadingConnector (No GapPolicy - Baseline)"
     dump_kv_cache_to_file(instance2.llm, "kv_cache_test2_no_gap_policy.txt", test_name2)
     runner.results.append(
-        TestResult(test_name2, preload_time2, gen_time2, output_text2, model_name, ttft2, tpot2, num_output_tokens2)
+        TestResult(
+            test_name2,
+            preload_time2,
+            gen_time2,
+            output_text2,
+            model_name,
+            ttft2,
+            tpot2,
+            num_output_tokens2,
+        )
     )
 
     # Cleanup instance 2
@@ -729,15 +801,15 @@ def main():
     print("Running generation without preload...")
     response3, gen_time3 = instance3.generate(full_prompt)
     output_text3 = response3[0].outputs[0].text
-    
+
     # Extract metrics
     ttft3 = 0.0
     tpot3 = 0.0
     num_output_tokens3 = len(response3[0].outputs[0].token_ids)
-    
-    if response3[0].metrics and hasattr(response3[0].metrics, 'first_token_latency'):
+
+    if response3[0].metrics and hasattr(response3[0].metrics, "first_token_latency"):
         ttft3 = response3[0].metrics.first_token_latency
-    
+
     if num_output_tokens3 > 1 and ttft3 > 0:
         tpot3 = (gen_time3 - ttft3) / (num_output_tokens3 - 1)
 
@@ -751,7 +823,16 @@ def main():
     test_name3 = "Baseline (no preload, spans disabled)"
     dump_kv_cache_to_file(instance3.llm, "kv_cache_test3_baseline.txt", test_name3)
     runner.results.append(
-        TestResult(test_name3, 0.0, gen_time3, output_text3, model_name, ttft3, tpot3, num_output_tokens3)
+        TestResult(
+            test_name3,
+            0.0,
+            gen_time3,
+            output_text3,
+            model_name,
+            ttft3,
+            tpot3,
+            num_output_tokens3,
+        )
     )
 
     instance3.cleanup()
