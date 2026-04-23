@@ -32,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -684,7 +685,7 @@ class Scheduler(SchedulerInterface):
                     # the post-scheduling gap loop.
                     if self.gap_policy is not None:
                         gap_overhead = sum(
-                            end - start
+                            cdiv(end, self.block_size) * self.block_size - start
                             for start, end in self.gap_policy.get_gaps(
                                 request,
                                 num_computed_tokens,
@@ -914,8 +915,9 @@ class Scheduler(SchedulerInterface):
         # Track virtual gap request IDs for model runner cleanup
         virtual_gap_req_ids: set[str] = set()
 
-        # NEW: Apply gap policy to create gaps in ANY cached tokens
+        # Apply gap policy to create gaps in ANY cached tokens
         if len(new_reqs_data) > 0:
+            block_size = self.block_size
             for nrd in new_reqs_data:
                 request = self.requests.get(nrd.req_id)
                 if request is None:
@@ -925,11 +927,9 @@ class Scheduler(SchedulerInterface):
                 computed_token_gaps: list[tuple[int, int]] = []
 
                 if self.gap_policy is not None:
-                    # Calculate total computed tokens
                     num_computed_tokens = request.num_computed_tokens
                     num_external_tokens = request.num_external_computed_tokens
 
-                    # Get policy-driven gaps
                     policy_gaps = self.gap_policy.get_gaps(
                         request,
                         num_computed_tokens,
@@ -942,13 +942,13 @@ class Scheduler(SchedulerInterface):
                     connector_gaps = self.connector.get_computed_token_gaps(request)
                     if connector_gaps:
                         logger.info(
-                            "Connector %s returned gaps via get_computed_token_gaps(). "
-                            "Consider migrating to use GapPolicy at scheduler level.",
+                            "Connector %s returned gaps via "
+                            "get_computed_token_gaps(). Consider migrating "
+                            "to use GapPolicy at scheduler level.",
                             type(self.connector).__name__,
                         )
                         computed_token_gaps.extend(connector_gaps)
 
-                # Merge and deduplicate gaps if needed
                 if computed_token_gaps:
                     computed_token_gaps = self._merge_gaps(computed_token_gaps)
 
@@ -960,39 +960,55 @@ class Scheduler(SchedulerInterface):
                     request.request_id,
                     computed_token_gaps,
                 )
+
+                parent_req_id = nrd.req_id
+
                 for start, end in computed_token_gaps:
-                    print(f"Gap: ({start},{end})")
+                    start_block = start // block_size
+                    end_block = cdiv(end, block_size)
+                    num_gap_blocks = end_block - start_block
+                    aligned_end = end_block * block_size
+
+                    # Allocate fresh blocks so span blocks stay immutable
+                    gap_blocks = self.kv_cache_manager.allocate_gap_blocks(
+                        num_gap_blocks
+                    )
+                    gap_block_ids = tuple(
+                        [b.block_id for b in group] for group in gap_blocks
+                    )
+
+                    # Register gap blocks with parent for cleanup on free()
+                    self.kv_cache_manager.register_gap_blocks(parent_req_id, gap_blocks)
+
+                    # Patch the parent's block_ids in-place so that both
+                    # the parent and the gap request point to the same
+                    # fresh blocks. Within a single forward pass, the gap
+                    # request writes K,V to these blocks and the parent's
+                    # attention reads from them — same physical memory.
+                    for gid, gap_group in enumerate(gap_block_ids):
+                        nrd.block_ids[gid][start_block:end_block] = list(gap_group)
+
+                    # The gap request gets a snapshot of the (now-patched)
+                    # parent block_ids — both share the fresh gap blocks.
                     nrd_copy = replace(nrd)
-                    parent_req_id = nrd_copy.req_id  # Save parent before modification
-                    nrd_copy.req_id = nrd_copy.req_id + "." + str(start)
-                    # Virtual gap requests share parent's blocks and write directly
-                    # to gap positions in parent's KV cache. num_computed_tokens=start
-                    # makes positions [start, start+1, ...] which map to gap slots.
+                    nrd_copy.req_id = parent_req_id + "." + str(start)
                     nrd_copy.num_computed_tokens = start
                     nrd_copy.is_gap_recompute = True
                     nrd_copy.parent_req_id = parent_req_id
-                    nrd_copy.gap_start = start  # For cleanup tracking
-                    req_copy_num_sched_tokens = end - start
+                    nrd_copy.gap_start = start
+
+                    req_copy_num_sched_tokens = aligned_end - start
                     num_scheduled_tokens[nrd_copy.req_id] = req_copy_num_sched_tokens
                     total_num_scheduled_tokens += req_copy_num_sched_tokens
-                    # Virtual request shares ALL parent's blocks so slot mappings
-                    # point to correct positions in parent's KV cache
-                    nrd_copy.block_ids = nrd.block_ids
-                    # For virtual gap request, include prefix + gap tokens (tokens
-                    # up to end). This ensures token_indices correctly map to
-                    # position num_computed_tokens=start, since positions are
-                    # based on num_computed_tokens and prompt_token_ids must
-                    # include the prefix the model assumes is computed.
+
                     nrd_copy.prompt_token_ids = (
-                        nrd.prompt_token_ids[:end]
+                        nrd.prompt_token_ids[:aligned_end]
                         if nrd.prompt_token_ids is not None
                         else None
                     )
-                    # For v2 model runner, prefill_token_ids also needs to be set
                     if self.use_v2_model_runner and nrd.prefill_token_ids is not None:
-                        nrd_copy.prefill_token_ids = nrd.prefill_token_ids[:end]
+                        nrd_copy.prefill_token_ids = nrd.prefill_token_ids[:aligned_end]
                     new_reqs_data.append(nrd_copy)
-                    # Track this virtual request ID for cleanup
                     virtual_gap_req_ids.add(nrd_copy.req_id)
 
         with record_function_or_nullcontext("schedule: make_cached_request_data"):

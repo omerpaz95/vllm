@@ -501,6 +501,33 @@ class KVCacheManager:
         # Only create new KVCacheBlocks for non-empty blocks
         return KVCacheBlocks(blocks) if any(blocks) else self.empty_kv_cache_blocks
 
+    def allocate_gap_blocks(self, num_blocks: int) -> tuple[list[KVCacheBlock], ...]:
+        """Allocate fresh blocks for gap recomputation.
+
+        These blocks are not tied to any request in req_to_blocks. The caller
+        must later register them with a parent request via
+        register_gap_blocks() so they are freed when the parent finishes.
+
+        Returns:
+            KVCacheBlock objects per KV cache group.
+        """
+        return tuple(
+            mgr.block_pool.get_new_blocks(num_blocks)
+            for mgr in self.coordinator.single_type_managers
+        )
+
+    def register_gap_blocks(
+        self,
+        parent_request_id: str,
+        gap_blocks: tuple[list[KVCacheBlock], ...],
+    ) -> None:
+        """Register gap blocks with a parent request for lifecycle tracking.
+
+        The gap blocks will be freed when the parent request is freed.
+        """
+        for mgr, blocks in zip(self.coordinator.single_type_managers, gap_blocks):
+            mgr.req_to_blocks[parent_request_id].extend(blocks)
+
     def take_new_block_ids(self) -> list[int]:
         """Drain and return new attention block IDs for zeroing."""
         ids: list[int] = []

@@ -4332,9 +4332,10 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
             )
 
-        # Handle virtual gap requests: cleanup only (KV written directly to parent)
-        # Virtual gap requests share parent's blocks and write directly to parent's
-        # KV cache during model execution. Only need cleanup.
+        # Clean up virtual gap requests. The parent's block_ids were already
+        # patched by the scheduler to point to the fresh gap blocks, so both
+        # parent and gap request shared the same physical blocks during
+        # execution. No post-execution patching needed.
         if scheduler_output.virtual_gap_req_ids is not None:
             for req_id in scheduler_output.virtual_gap_req_ids:
                 self.requests.pop(req_id, None)
