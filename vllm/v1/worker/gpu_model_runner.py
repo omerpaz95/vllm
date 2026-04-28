@@ -219,6 +219,24 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+_ATTN_ATTR_CANDIDATES = ("self_attn", "attn")
+
+
+def _get_attn_module(layer):
+    """Return the attention submodule of ``layer`` regardless of naming.
+
+    Most decoder blocks expose attention as ``self_attn`` (Llama-style),
+    but some (e.g. gpt-oss's ``TransformerBlock``) name it ``attn``.
+    """
+    for attr in _ATTN_ATTR_CANDIDATES:
+        if hasattr(layer, attr):
+            return getattr(layer, attr)
+    raise AttributeError(
+        f"{type(layer).__name__} has no recognized attention attribute "
+        f"(tried {', '.join(repr(a) for a in _ATTN_ATTR_CANDIDATES)})"
+    )
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -2011,7 +2029,7 @@ class GPUModelRunner(
 
             for lay in layers:
                 if not isinstance(lay, PPMissingLayer):
-                    self.rotate = lay.self_attn.rotary_emb
+                    self.rotate = _get_attn_module(lay).rotary_emb
                     break
             else:
                 raise AttributeError(
