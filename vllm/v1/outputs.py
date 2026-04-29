@@ -250,6 +250,9 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
+    # req_id -> per-context-token ProphetKV alpha_bar scores.
+    prophet_kv_scores: dict[str, list[float]] | None = None
+
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 

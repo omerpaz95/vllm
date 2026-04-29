@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import torch
+from dataclasses import dataclass
 
-from tests.v1.kv_connector.unit.utils import MockKVConfig
+import torch
 from vllm.config import (
     CacheConfig,
     ECTransferConfig,
@@ -33,6 +33,12 @@ from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
 EOS_TOKEN_ID = 50256
+
+
+@dataclass(frozen=True)
+class MockKVConfig:
+    matched_tokens: int = 0
+    is_async: bool = False
 
 
 def mock_kv(matched_tokens: int, is_async: bool):

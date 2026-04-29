@@ -51,6 +51,16 @@ if TYPE_CHECKING:
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
     VLLM_CPU_SGL_KERNEL: bool = False
+    VLLM_CPU_ATTN_SPLIT_KV: bool = True
+    VLLM_ZENTORCH_WEIGHT_PREPACK: bool = True
+    VLLM_CPU_INT4_W4A8: bool = True
+    VLLM_V1_SPANS_PROPHET_KV_ENABLED: bool = False
+    VLLM_V1_SPANS_PROPHET_KV_RATIO: float = 0.2
+    VLLM_V1_SPANS_PROPHET_KV_MIN_TOKENS: int = 0
+    VLLM_V1_SPANS_PROPHET_KV_GAP_THRESHOLD: int = 0
+    VLLM_V1_SPANS_PROPHET_KV_MAX_NUM_SPANS: int = 0
+    VLLM_V1_SPANS_PROPHET_KV_BLOCK_SIZE: int = 0
+    VLLM_V1_SPANS_PROPHET_KV_SCORE_KEY: str = "prophet_kv_scores"
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
@@ -718,6 +728,47 @@ environment_variables: dict[str, Callable[[], Any]] = {
     else None,
     # (CPU backend only) whether to use SGL kernels, optimized for small batch.
     "VLLM_CPU_SGL_KERNEL": lambda: bool(int(os.getenv("VLLM_CPU_SGL_KERNEL", "0"))),
+    # (CPU backend only) whether to enable attention spilt KV.
+    "VLLM_CPU_ATTN_SPLIT_KV": lambda: bool(
+        int(os.getenv("VLLM_CPU_ATTN_SPLIT_KV", "1"))
+    ),
+    # (Zen CPU backend) eagerly prepack weights into ZenDNN blocked layout
+    # at model load time. Eliminates per-inference layout conversion overhead.
+    "VLLM_ZENTORCH_WEIGHT_PREPACK": lambda: bool(
+        int(os.getenv("VLLM_ZENTORCH_WEIGHT_PREPACK", "1"))
+    ),
+    # (CPU backend only) whether to use SGLang INT4 W4A8 kernels for AWQ.
+    "VLLM_CPU_INT4_W4A8": lambda: bool(int(os.getenv("VLLM_CPU_INT4_W4A8", "1"))),
+    # Enable ProphetKV (query-driven selective KV cache recomputation) as the
+    # active gap policy for spans mode. See vllm/v1/core/sched/prophet_kv.py.
+    "VLLM_V1_SPANS_PROPHET_KV_ENABLED": lambda: os.environ.get(
+        "VLLM_V1_SPANS_PROPHET_KV_ENABLED", "False"
+    ).lower() in ("true", "1"),
+    # Fraction of cached tokens to recompute (p in the paper; default 20%).
+    "VLLM_V1_SPANS_PROPHET_KV_RATIO": lambda: float(
+        os.environ.get("VLLM_V1_SPANS_PROPHET_KV_RATIO", "0.2")
+    ),
+    # Lower bound on |T_p| regardless of ratio*C rounding.
+    "VLLM_V1_SPANS_PROPHET_KV_MIN_TOKENS": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_PROPHET_KV_MIN_TOKENS", "0")
+    ),
+    # Merge small holes between nearby selected spans to reduce fragmentation.
+    "VLLM_V1_SPANS_PROPHET_KV_GAP_THRESHOLD": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_PROPHET_KV_GAP_THRESHOLD", "0")
+    ),
+    # Hard cap on the number of emitted spans; 0 disables the cap.
+    "VLLM_V1_SPANS_PROPHET_KV_MAX_NUM_SPANS": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_PROPHET_KV_MAX_NUM_SPANS", "0")
+    ),
+    # Legacy knob kept for compatibility; values >1 are only relevant if a
+    # future fallback needs block-granular selection.
+    "VLLM_V1_SPANS_PROPHET_KV_BLOCK_SIZE": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_PROPHET_KV_BLOCK_SIZE", "0")
+    ),
+    # kv_transfer_params key holding the fused per-token score tensor.
+    "VLLM_V1_SPANS_PROPHET_KV_SCORE_KEY": lambda: os.environ.get(
+        "VLLM_V1_SPANS_PROPHET_KV_SCORE_KEY", "prophet_kv_scores"
+    ),
     # If the env var is set, Ray Compiled Graph uses the specified
     # channel type to communicate between workers belonging to
     # different pipeline-parallel stages.
