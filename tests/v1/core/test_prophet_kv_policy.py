@@ -37,6 +37,7 @@ from vllm.v1.core.sched.prophet_kv import (
     fuse_and_select,
     indices_to_gap_intervals,
     prophet_kv_policy_from_env,
+    scores_to_gap_intervals,
 )
 
 
@@ -149,15 +150,13 @@ class TestSelector:
             sel.select(q, k, head_dim=8), sel.select(q, k, head_dim=8)
         )
 
-    def test_gaps_block_aligned(self):
+    def test_gaps_are_contiguous_spans(self):
         torch.manual_seed(3)
         q = [torch.randn(1, 2, 4)]
         k = [torch.randn(1, 64, 4)]
         sel = ProphetKVSelector(ProphetKVConfig(recomp_ratio=0.25, block_size=16))
         for s, e in sel.gaps(q, k, head_dim=4, total_len=64):
             assert 0 <= s < e <= 64
-            assert s % 16 == 0
-            assert e % 16 == 0 or e == 64
 
     def test_varying_C_raises(self):
         sel = ProphetKVSelector()
@@ -181,16 +180,15 @@ class TestIntervals:
             (0, 3), (5, 7), (9, 10),
         ]
 
-    def test_block_alignment_merges(self):
-        # block_size=4; {1, 3, 5} -> [0,4) + [4,8) -> merged [0,8)
-        assert indices_to_gap_intervals([1, 3, 5], total_len=8, block_size=4) == [
-            (0, 8)
-        ]
+    def test_gap_threshold_merges_nearby_spans(self):
+        assert indices_to_gap_intervals(
+            [1, 2, 5, 6, 10], total_len=16, gap_threshold=2
+        ) == [(1, 11)]
 
-    def test_block_clamps_tail(self):
-        assert indices_to_gap_intervals([9], total_len=10, block_size=4) == [
-            (8, 10)
-        ]
+    def test_max_num_spans_merges_closest_gaps(self):
+        assert indices_to_gap_intervals(
+            [1, 4, 8, 20], total_len=32, max_num_spans=2
+        ) == [(1, 9), (20, 21)]
 
     def test_oor_raises(self):
         with pytest.raises(ValueError, match="out of range"):
@@ -201,6 +199,32 @@ class TestIntervals:
         assert indices_to_gap_intervals(t, total_len=8) == [
             (2, 3), (4, 5), (6, 7)
         ]
+
+    def test_negative_gap_threshold_raises(self):
+        with pytest.raises(ValueError, match="gap_threshold"):
+            indices_to_gap_intervals([1], total_len=8, gap_threshold=-1)
+
+    def test_negative_max_num_spans_raises(self):
+        with pytest.raises(ValueError, match="max_num_spans"):
+            indices_to_gap_intervals([1], total_len=8, max_num_spans=-1)
+
+
+class TestScoresToGapIntervals:
+    def test_token_topk_then_contiguous_spans(self):
+        scores = torch.tensor([0.0, 0.9, 0.8, 0.0, 0.7, 0.0])
+        assert scores_to_gap_intervals(scores, 6, recomp_ratio=0.5) == [
+            (1, 3), (4, 5)
+        ]
+
+    def test_span_controls_reduce_fragmentation(self):
+        scores = torch.tensor([0.9, 0.0, 0.8, 0.0, 0.7, 0.0, 0.6])
+        assert scores_to_gap_intervals(
+            scores,
+            7,
+            recomp_ratio=4 / 7,
+            gap_threshold=0,
+            max_num_spans=2,
+        ) == [(0, 5), (6, 7)]
 
 
 # ---- ProphetKVGapPolicy -------------------------------------------------
@@ -241,14 +265,24 @@ class TestProphetKVGapPolicy:
         # Top 3 over all 10 computed tokens -> indices 7,8,9 -> one run.
         assert p.get_gaps(req, 4, 6) == [(7, 10)]
 
-    def test_block_alignment(self):
-        scores = torch.zeros(32)
-        scores[5] = 1.0
+    def test_gap_threshold(self):
+        scores = torch.zeros(10)
+        scores[1] = 1.0
+        scores[4] = 0.9
+        scores[7] = 0.8
         req = SimpleNamespace(
             kv_transfer_params={"prophet_kv_scores": scores}
         )
-        p = ProphetKVGapPolicy(recomp_ratio=0.05, block_size=8)
-        assert p.get_gaps(req, 32, 0) == [(0, 8)]
+        p = ProphetKVGapPolicy(recomp_ratio=0.3, gap_threshold=2)
+        assert p.get_gaps(req, 10, 0) == [(1, 8)]
+
+    def test_max_num_spans(self):
+        scores = torch.tensor([1.0, 0.0, 0.9, 0.0, 0.8, 0.0, 0.7])
+        req = SimpleNamespace(
+            kv_transfer_params={"prophet_kv_scores": scores}
+        )
+        p = ProphetKVGapPolicy(recomp_ratio=4 / 7, max_num_spans=2)
+        assert p.get_gaps(req, 7, 0) == [(0, 3), (4, 7)]
 
     def test_custom_score_key(self):
         scores = torch.tensor([1.0, 0.0, 1.0])
@@ -301,6 +335,8 @@ class TestFactoryEnv:
             "VLLM_V1_SPANS_PROPHET_KV_ENABLED": "True",
             "VLLM_V1_SPANS_PROPHET_KV_RATIO": "0.35",
             "VLLM_V1_SPANS_PROPHET_KV_MIN_TOKENS": "2",
+            "VLLM_V1_SPANS_PROPHET_KV_GAP_THRESHOLD": "3",
+            "VLLM_V1_SPANS_PROPHET_KV_MAX_NUM_SPANS": "12",
             "VLLM_V1_SPANS_PROPHET_KV_BLOCK_SIZE": "8",
             "VLLM_V1_SPANS_PROPHET_KV_SCORE_KEY": "alpha_bar",
         }
@@ -308,11 +344,13 @@ class TestFactoryEnv:
             p = prophet_kv_policy_from_env()
         assert isinstance(p, ProphetKVGapPolicy)
         assert p.recomp_ratio == pytest.approx(0.35)
+        assert p.gap_threshold == 3
+        assert p.max_num_spans == 12
         assert p.block_size == 8
         assert p.min_tokens == 2
         assert p.score_key == "alpha_bar"
 
-    def test_env_var_inherits_default_block_size_when_zero(self):
+    def test_env_var_zero_block_size_disables_block_fallback(self):
         env = {
             "VLLM_V1_SPANS_PROPHET_KV_ENABLED": "True",
             "VLLM_V1_SPANS_PROPHET_KV_BLOCK_SIZE": "0",
@@ -320,7 +358,7 @@ class TestFactoryEnv:
         with patch.dict(os.environ, env, clear=False):
             p = prophet_kv_policy_from_env(default_block_size=16)
         assert isinstance(p, ProphetKVGapPolicy)
-        assert p.block_size == 16
+        assert p.block_size == 1
 
     def test_explicit_policy_name_wins_over_env(self):
         env = {"VLLM_V1_SPANS_PROPHET_KV_ENABLED": "True"}

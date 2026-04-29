@@ -57,6 +57,8 @@ if TYPE_CHECKING:
     VLLM_V1_SPANS_PROPHET_KV_ENABLED: bool = False
     VLLM_V1_SPANS_PROPHET_KV_RATIO: float = 0.2
     VLLM_V1_SPANS_PROPHET_KV_MIN_TOKENS: int = 0
+    VLLM_V1_SPANS_PROPHET_KV_GAP_THRESHOLD: int = 0
+    VLLM_V1_SPANS_PROPHET_KV_MAX_NUM_SPANS: int = 0
     VLLM_V1_SPANS_PROPHET_KV_BLOCK_SIZE: int = 0
     VLLM_V1_SPANS_PROPHET_KV_SCORE_KEY: str = "prophet_kv_scores"
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
@@ -750,7 +752,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_V1_SPANS_PROPHET_KV_MIN_TOKENS": lambda: int(
         os.environ.get("VLLM_V1_SPANS_PROPHET_KV_MIN_TOKENS", "0")
     ),
-    # Block alignment for emitted gap intervals (0 = inherit scheduler block).
+    # Merge small holes between nearby selected spans to reduce fragmentation.
+    "VLLM_V1_SPANS_PROPHET_KV_GAP_THRESHOLD": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_PROPHET_KV_GAP_THRESHOLD", "0")
+    ),
+    # Hard cap on the number of emitted spans; 0 disables the cap.
+    "VLLM_V1_SPANS_PROPHET_KV_MAX_NUM_SPANS": lambda: int(
+        os.environ.get("VLLM_V1_SPANS_PROPHET_KV_MAX_NUM_SPANS", "0")
+    ),
+    # Legacy knob kept for compatibility; values >1 are only relevant if a
+    # future fallback needs block-granular selection.
     "VLLM_V1_SPANS_PROPHET_KV_BLOCK_SIZE": lambda: int(
         os.environ.get("VLLM_V1_SPANS_PROPHET_KV_BLOCK_SIZE", "0")
     ),

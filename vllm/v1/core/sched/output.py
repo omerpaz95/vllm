@@ -37,6 +37,7 @@ class NewRequestData:
     block_ids: tuple[list[int], ...]
     num_computed_tokens: int
     lora_request: LoRARequest | None
+    num_cached_tokens: int = -1
     prompt_embeds: "torch.Tensor | None" = None
 
     # Only used for v2 model runner.
@@ -64,6 +65,7 @@ class NewRequestData:
             pooling_params=request.pooling_params,
             block_ids=block_ids,
             num_computed_tokens=request.num_computed_tokens,
+            num_cached_tokens=request.num_cached_tokens,
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,

@@ -395,6 +395,13 @@ class Attention(nn.Module, AttentionLayerBase):
         """
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(query, key, value, self.layer_name)
+        forward_context = get_forward_context()
+        collector = forward_context.additional_kwargs.get("prophet_kv_query_collector")
+        if collector is not None and not torch.compiler.is_compiling():
+            collector.capture(
+                self.layer_name,
+                query.reshape(-1, self.num_heads, self.head_size),
+            )
         output_dtype = query.dtype
         if self.query_quant is not None:
             # quantizing with a simple torch operation enables

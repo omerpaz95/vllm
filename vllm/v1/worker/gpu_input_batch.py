@@ -36,6 +36,7 @@ class CachedRequestState:
 
     block_ids: tuple[list[int], ...]
     num_computed_tokens: int
+    num_cached_tokens: int
     output_token_ids: list[int]
 
     mrope_positions: torch.Tensor | None = None
@@ -48,6 +49,10 @@ class CachedRequestState:
 
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0
+
+    # Virtual gap recompute requests share a parent's KV cache blocks.
+    is_gap_recompute: bool = False
+    parent_req_id: str | None = None
 
     # for pooling models
     pooling_params: PoolingParams | None = None

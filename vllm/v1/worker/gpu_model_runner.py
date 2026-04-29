@@ -12,7 +12,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import reduce
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
@@ -58,10 +58,6 @@ from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
-)
-from vllm.model_executor.layers.rotary_embedding import (
-    MRotaryEmbedding,
-    XDRotaryEmbedding,
 )
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.reload import (
@@ -131,6 +127,7 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
 )
 from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.prophet_kv import compute_layer_alpha
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -217,6 +214,30 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+@dataclass
+class ProphetKVQueryAccumulator:
+    query_start: int
+    query_end: int
+    query_tokens_captured: int = 0
+    per_layer_queries: dict[str, list[torch.Tensor]] = field(default_factory=dict)
+
+
+class ProphetKVQueryCollector:
+    def __init__(self) -> None:
+        self._queries_by_layer: dict[str, list[torch.Tensor]] = {}
+
+    def capture(self, layer_name: str, query: torch.Tensor) -> None:
+        self._queries_by_layer.setdefault(layer_name, []).append(query.detach())
+
+    def get_queries(self) -> dict[str, torch.Tensor]:
+        return {
+            layer_name: (
+                torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+            )
+            for layer_name, chunks in self._queries_by_layer.items()
+        }
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -385,6 +406,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    prophet_kv_scores_by_req_id: dict[str, list[float]] | None
 
 
 class GPUModelRunner(
@@ -851,6 +873,10 @@ class GPUModelRunner(
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
+        self.prophet_kv_query_accumulators: dict[str, ProphetKVQueryAccumulator] = {}
+        self._prophet_kv_attn_layers: dict[str, Attention] | None = None
+        self._prophet_kv_layer_to_group_id: dict[str, int] | None = None
+        self._prophet_kv_warned_messages: set[str] = set()
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -858,6 +884,231 @@ class GPUModelRunner(
             draft_config = self.speculative_config.draft_model_config
             if draft_config is None or draft_config.max_model_len is None:
                 self.effective_drafter_max_model_len = self.max_model_len
+
+    def _is_prophet_kv_enabled(self) -> bool:
+        return (
+            envs.VLLM_V1_SPANS_ENABLED
+            and envs.VLLM_V1_SPANS_PROPHET_KV_ENABLED
+            and not self.use_async_scheduling
+            and not self.is_pooling_model
+            and not self.model_config.is_encoder_decoder
+        )
+
+    def _warn_prophet_kv_once(self, message: str) -> None:
+        if message in self._prophet_kv_warned_messages:
+            return
+        self._prophet_kv_warned_messages.add(message)
+        logger.warning(message)
+
+    def _clear_prophet_kv_state(self, req_id: str) -> None:
+        self.prophet_kv_query_accumulators.pop(req_id, None)
+
+    def _get_prophet_kv_attn_layers(self) -> dict[str, Attention]:
+        if self._prophet_kv_attn_layers is None:
+            self._prophet_kv_attn_layers = get_layers_from_vllm_config(
+                self.vllm_config, Attention
+            )
+        return self._prophet_kv_attn_layers
+
+    def _get_prophet_kv_layer_to_group_id(self) -> dict[str, int]:
+        if self._prophet_kv_layer_to_group_id is not None:
+            return self._prophet_kv_layer_to_group_id
+
+        layer_to_group_id: dict[str, int] = {}
+        for group_id, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if not isinstance(kv_cache_group.kv_cache_spec, AttentionSpec):
+                continue
+            for layer_name in kv_cache_group.layer_names:
+                layer_to_group_id[layer_name] = group_id
+
+        for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
+            if target_layer_name in layer_to_group_id:
+                layer_to_group_id[layer_name] = layer_to_group_id[target_layer_name]
+
+        self._prophet_kv_layer_to_group_id = layer_to_group_id
+        return layer_to_group_id
+
+    def _get_prophet_kv_query_span(
+        self, req_state: CachedRequestState
+    ) -> tuple[int, int] | None:
+        if req_state.is_gap_recompute or req_state.prompt_token_ids is None:
+            return None
+        sampling_params = req_state.sampling_params
+        extra_args = sampling_params.extra_args if sampling_params is not None else None
+        if not extra_args:
+            return None
+        cross_span_starts = extra_args.get("cross_span_starts")
+        if not cross_span_starts:
+            return None
+        query_start = int(cross_span_starts[0])
+        query_end = req_state.num_prompt_tokens
+        if not 0 < query_start < query_end:
+            return None
+        return query_start, query_end
+
+    def _should_collect_prophet_kv_queries(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens_np: np.ndarray,
+    ) -> bool:
+        if not self._is_prophet_kv_enabled():
+            return False
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return False
+
+        for req_idx, req_id in enumerate(self.input_batch.req_ids):
+            req_state = self.requests[req_id]
+            if req_state.output_token_ids:
+                continue
+            if req_state.num_cached_tokens <= 0:
+                continue
+            query_span = self._get_prophet_kv_query_span(req_state)
+            if query_span is None:
+                continue
+            query_start, query_end = query_span
+            step_start = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+            step_end = step_start + int(num_scheduled_tokens_np[req_idx])
+            if step_end <= query_start or step_start >= query_end:
+                continue
+            return True
+        return False
+
+    def _gather_prophet_kv_context_keys(
+        self,
+        req_state: CachedRequestState,
+        layer_name: str,
+        context_len: int,
+        q_dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        if context_len <= 0:
+            return None
+
+        attn_layers = self._get_prophet_kv_attn_layers()
+        attn_layer = attn_layers.get(layer_name)
+        if attn_layer is None:
+            return None
+        if attn_layer.kv_cache_dtype.startswith("fp8"):
+            self._warn_prophet_kv_once(
+                "ProphetKV does not yet support FP8 KV caches; skipping score "
+                "generation for this batch."
+            )
+            return None
+
+        layer_to_group_id = self._get_prophet_kv_layer_to_group_id()
+        group_id = layer_to_group_id.get(layer_name)
+        if group_id is None:
+            return None
+
+        kv_cache_group = self.kv_cache_config.kv_cache_groups[group_id]
+        if not isinstance(kv_cache_group.kv_cache_spec, AttentionSpec):
+            return None
+
+        block_size = kv_cache_group.kv_cache_spec.block_size
+        num_blocks = cdiv(context_len, block_size)
+        block_ids = req_state.block_ids[group_id][:num_blocks]
+        if not block_ids:
+            return None
+
+        kv_cache = attn_layer.kv_cache[0]
+        block_ids_tensor = torch.as_tensor(
+            block_ids, device=kv_cache.device, dtype=torch.long
+        )
+        keys = kv_cache.index_select(0, block_ids_tensor)[:, 0]
+        keys = keys.reshape(-1, attn_layer.num_kv_heads, attn_layer.head_size)
+        return keys[:context_len].to(dtype=q_dtype).transpose(0, 1).contiguous()
+
+    def _compute_prophet_kv_scores(
+        self,
+        num_scheduled_tokens_np: np.ndarray,
+        collector: ProphetKVQueryCollector,
+    ) -> dict[str, list[float]] | None:
+        layer_queries = collector.get_queries()
+        if not layer_queries:
+            return None
+
+        scores_by_req_id: dict[str, list[float]] = {}
+        query_start_loc = self.query_start_loc.np
+        attn_layers = self._get_prophet_kv_attn_layers()
+
+        for req_idx, req_id in enumerate(self.input_batch.req_ids):
+            req_state = self.requests[req_id]
+            if req_state.output_token_ids:
+                continue
+            if req_state.num_cached_tokens <= 0:
+                self._clear_prophet_kv_state(req_id)
+                continue
+
+            query_span = self._get_prophet_kv_query_span(req_state)
+            if query_span is None:
+                continue
+            query_start, query_end = query_span
+            step_start = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+            step_end = step_start + int(num_scheduled_tokens_np[req_idx])
+            overlap_start = max(step_start, query_start)
+            overlap_end = min(step_end, query_end)
+
+            accumulator = self.prophet_kv_query_accumulators.get(req_id)
+            if overlap_start < overlap_end:
+                if accumulator is None:
+                    accumulator = ProphetKVQueryAccumulator(
+                        query_start=query_start,
+                        query_end=query_end,
+                    )
+                    self.prophet_kv_query_accumulators[req_id] = accumulator
+                batch_start = int(query_start_loc[req_idx]) + (overlap_start - step_start)
+                batch_end = batch_start + (overlap_end - overlap_start)
+                for layer_name, query_tensor in layer_queries.items():
+                    query_slice = query_tensor[batch_start:batch_end]
+                    if query_slice.numel() == 0:
+                        continue
+                    # The central Attention.forward hook captures the query
+                    # tensor as it enters the backend, i.e. after model-side
+                    # RoPE has already been applied.
+                    accumulator.per_layer_queries.setdefault(layer_name, []).append(
+                        query_slice.contiguous()
+                    )
+                accumulator.query_tokens_captured += overlap_end - overlap_start
+
+            if step_end < req_state.num_prompt_tokens:
+                continue
+
+            if accumulator is None:
+                continue
+            query_len = query_end - query_start
+            if accumulator.query_tokens_captured < query_len:
+                self._warn_prophet_kv_once(
+                    f"ProphetKV could not capture the full query span for {req_id}; "
+                    "skipping score generation."
+                )
+                self._clear_prophet_kv_state(req_id)
+                continue
+
+            alpha_sum: torch.Tensor | None = None
+            num_layers = 0
+            for layer_name, q_chunks in accumulator.per_layer_queries.items():
+                attn_layer = attn_layers.get(layer_name)
+                if attn_layer is None:
+                    continue
+                q_proj = torch.cat(q_chunks, dim=0).transpose(0, 1).contiguous()
+                k_cache = self._gather_prophet_kv_context_keys(
+                    req_state=req_state,
+                    layer_name=layer_name,
+                    context_len=query_start,
+                    q_dtype=q_proj.dtype,
+                )
+                if k_cache is None:
+                    continue
+                alpha = compute_layer_alpha(q_proj, k_cache, attn_layer.head_size)
+                alpha_sum = alpha if alpha_sum is None else alpha_sum + alpha
+                num_layers += 1
+
+            self._clear_prophet_kv_state(req_id)
+            if alpha_sum is None or num_layers == 0:
+                continue
+
+            scores_by_req_id[req_id] = (alpha_sum / num_layers).cpu().tolist()
+
+        return scores_by_req_id or None
 
     def reset_mm_cache(self) -> None:
         """
@@ -1059,6 +1310,10 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._clear_prophet_kv_state(req_id)
+        if scheduler_output.preempted_req_ids is not None:
+            for req_id in scheduler_output.preempted_req_ids:
+                self._clear_prophet_kv_state(req_id)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1150,8 +1405,11 @@ class GPUModelRunner(
                 generator=generator,
                 block_ids=new_req_data.block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
+                num_cached_tokens=new_req_data.num_cached_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                is_gap_recompute=new_req_data.is_gap_recompute,
+                parent_req_id=new_req_data.parent_req_id,
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -1420,6 +1678,7 @@ class GPUModelRunner(
         """
         self.input_batch.remove_request(req_id)
         req_state = self.requests[req_id]
+        self._clear_prophet_kv_state(req_id)
 
         req_state.prompt_token_ids = new_req_data.prompt_token_ids
         req_state.mm_features = new_req_data.mm_features
@@ -1429,6 +1688,9 @@ class GPUModelRunner(
         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
         req_state.block_ids = new_req_data.block_ids
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
+        req_state.num_cached_tokens = new_req_data.num_cached_tokens
+        req_state.is_gap_recompute = new_req_data.is_gap_recompute
+        req_state.parent_req_id = new_req_data.parent_req_id
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
         )
@@ -3190,6 +3452,7 @@ class GPUModelRunner(
         hidden_states: torch.Tensor,
         num_scheduled_tokens: int,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        prophet_kv_suppressed_req_ids: set[str] | None = None,
     ) -> tuple[
         dict[str, int],
         LogprobsLists | None,
@@ -3242,6 +3505,25 @@ class GPUModelRunner(
                     discard_sampled_tokens_req_indices,
                     logprobs_tensors=logprobs_tensors,
                 )
+
+            # Discard the provisional first decode token for ProphetKV
+            # requests; it will be replayed after virtual recompute refreshes
+            # both the selected context blocks and the query span.
+            if prophet_kv_suppressed_req_ids:
+                for req_id in prophet_kv_suppressed_req_ids:
+                    req_idx = self.input_batch.req_id_to_index.get(req_id)
+                    if req_idx is None:
+                        continue
+                    req_state = self.requests.get(req_id)
+                    if req_state is None or req_state.num_cached_tokens <= 0:
+                        continue
+                    sampled_ids = valid_sampled_token_ids[req_idx]
+                    if not sampled_ids:
+                        continue
+                    gen = self.input_batch.generators.get(int(req_idx))
+                    if gen is not None:
+                        gen.set_offset(gen.get_offset() - 4)
+                    sampled_ids.clear()
         else:
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
@@ -4003,12 +4285,20 @@ class GPUModelRunner(
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
+        prophet_kv_query_collector: ProphetKVQueryCollector | None = None
+        if self._should_collect_prophet_kv_queries(
+            scheduler_output, num_scheduled_tokens_np
+        ):
+            prophet_kv_query_collector = ProphetKVQueryCollector()
+            cudagraph_mode = CUDAGraphMode.NONE
+
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
         has_encoder_input = (
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
+        prophet_kv_scores_by_req_id: dict[str, list[float]] | None = None
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -4025,7 +4315,13 @@ class GPUModelRunner(
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
+                additional_kwargs=(
+                    {"prophet_kv_query_collector": prophet_kv_query_collector}
+                    if prophet_kv_query_collector is not None
+                    else None
+                ),
+                skip_compiled=has_encoder_input
+                or prophet_kv_query_collector is not None,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -4040,6 +4336,11 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if prophet_kv_query_collector is not None:
+                prophet_kv_scores_by_req_id = self._compute_prophet_kv_scores(
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    collector=prophet_kv_query_collector,
+                )
 
         # === DEBUG: KV Cache Hash ===
         if self._should_debug_kv_hash():
@@ -4119,6 +4420,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            prophet_kv_scores_by_req_id,
         )
         self.kv_connector_output = kv_connector_output
         return None
@@ -4157,6 +4459,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            prophet_kv_scores_by_req_id,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -4290,6 +4593,11 @@ class GPUModelRunner(
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
+                prophet_kv_suppressed_req_ids=(
+                    set(prophet_kv_scores_by_req_id)
+                    if prophet_kv_scores_by_req_id
+                    else None
+                ),
             )
 
         if propose_drafts_after_bookkeeping:
@@ -4329,6 +4637,7 @@ class GPUModelRunner(
                 if self.supports_mm_inputs
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
+                prophet_kv_scores=prophet_kv_scores_by_req_id,
                 cudagraph_stats=cudagraph_stats,
             )
 
@@ -4339,6 +4648,7 @@ class GPUModelRunner(
             for req_id in scheduler_output.virtual_gap_req_ids:
                 self.requests.pop(req_id, None)
                 self.num_prompt_logprobs.pop(req_id, None)
+                self._clear_prophet_kv_state(req_id)
                 self.input_batch.remove_request(req_id)
 
         if not self.use_async_scheduling:

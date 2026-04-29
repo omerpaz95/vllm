@@ -25,6 +25,10 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.prophet_kv import (
+    PROPHET_KV_PENDING_RECOMPUTE_KEY,
+    ProphetKVGapPolicy,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -140,6 +144,104 @@ def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders():
     # scheduled again (multi-step in-flight).
     output = scheduler.schedule()
     assert req.request_id in output.num_scheduled_tokens
+
+
+def test_prophet_kv_recomputes_then_continues_decoding():
+    """ProphetKV: prefill samples T1, scheduler then runs a virtual gap recompute,
+    then decoding continues normally for several steps without deadlocking.
+
+    Invariant the test guards: after each step, ``num_tokens_with_spec`` must
+    stay one ahead of ``num_computed_tokens`` so the next ``schedule()`` finds
+    work. If the prefill sample is suppressed without an accompanying
+    placeholder-tracking mechanism, ``num_new_tokens`` collapses to zero after
+    the gap recompute and the engine deadlocks - see scheduler.py's note on
+    keeping the ``num_tokens - num_computed`` ledger consistent.
+    """
+    scheduler = create_scheduler(block_size=1)
+    scheduler.gap_policy = ProphetKVGapPolicy(recomp_ratio=0.25, block_size=1)
+    (req,) = create_requests(num_requests=1, num_tokens=8, max_tokens=4)
+    scheduler.add_request(req)
+
+    prefill_output = scheduler.schedule()
+    assert prefill_output.num_scheduled_tokens[req.request_id] == 8
+
+    scores = [0.0, 0.0, 0.0, 0.0, 0.9, 0.8, 0.0, 0.0]
+    prefill_first_token = 41
+    scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=[req.request_id],
+            req_id_to_index={req.request_id: 0},
+            sampled_token_ids=[[prefill_first_token]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            prophet_kv_scores={req.request_id: scores},
+        ),
+    )
+
+    assert req.kv_transfer_params is not None
+    assert req.kv_transfer_params["prophet_kv_scores"] == scores
+    assert req.kv_transfer_params[PROPHET_KV_PENDING_RECOMPUTE_KEY] is True
+    # T1 flows through normally; no async-style placeholder is needed.
+    assert req.num_output_placeholders == 0
+    assert req.num_tokens_with_spec == 9
+    assert req.num_computed_tokens == 8
+
+    recompute_output = scheduler.schedule()
+    assert req.request_id not in recompute_output.num_scheduled_tokens
+    assert recompute_output.virtual_gap_req_ids == {"0.4"}
+    assert len(recompute_output.scheduled_new_reqs) == 1
+    gap_req = recompute_output.scheduled_new_reqs[0]
+    assert gap_req.req_id == "0.4"
+    assert gap_req.is_gap_recompute is True
+    assert gap_req.parent_req_id == req.request_id
+    assert gap_req.num_computed_tokens == 4
+    assert recompute_output.num_scheduled_tokens[gap_req.req_id] == 2
+    assert PROPHET_KV_PENDING_RECOMPUTE_KEY not in req.kv_transfer_params
+    # Gap step does not touch the parent's ledger.
+    assert req.num_output_placeholders == 0
+    assert req.num_tokens_with_spec == 9
+
+    scheduler.update_from_output(
+        recompute_output,
+        ModelRunnerOutput(
+            req_ids=[gap_req.req_id],
+            req_id_to_index={gap_req.req_id: 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    # The deadlock canary: run two more decode steps and verify the parent
+    # is scheduled each time. A regression of the suppression bug shows up
+    # here as an empty ``num_scheduled_tokens`` on the second decode.
+    next_token = prefill_first_token
+    for step in range(2):
+        decode_output = scheduler.schedule()
+        assert decode_output.virtual_gap_req_ids is None, f"step {step}"
+        assert decode_output.num_scheduled_tokens == {req.request_id: 1}, (
+            f"step {step}: scheduler stalled - "
+            f"num_tokens_with_spec={req.num_tokens_with_spec}, "
+            f"num_computed_tokens={req.num_computed_tokens}, "
+            f"num_output_placeholders={req.num_output_placeholders}"
+        )
+        next_token += 1
+        decode_ecos = scheduler.update_from_output(
+            decode_output,
+            ModelRunnerOutput(
+                req_ids=[req.request_id],
+                req_id_to_index={req.request_id: 0},
+                sampled_token_ids=[[next_token]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        assert decode_ecos[0].outputs[0].new_token_ids == [next_token]
+        assert req.num_output_placeholders == 0
 
 
 def test_schedule_partial_requests():

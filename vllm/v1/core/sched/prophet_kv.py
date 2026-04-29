@@ -22,7 +22,8 @@ factory, so it works through the same `gap_policy_name` /
 
 Turning it on:
   - via env var: VLLM_V1_SPANS_PROPHET_KV_ENABLED=True (other knobs:
-    VLLM_V1_SPANS_PROPHET_KV_RATIO / _MIN_TOKENS / _BLOCK_SIZE / _SCORE_KEY).
+    VLLM_V1_SPANS_PROPHET_KV_RATIO / _MIN_TOKENS /
+    _GAP_THRESHOLD / _MAX_NUM_SPANS / _BLOCK_SIZE / _SCORE_KEY).
     Call prophet_kv_policy_from_env(...) from the scheduler init.
   - via CLI: --gap-policy-name prophet_kv --gap-policy-config '{"recomp_ratio":0.2}'
 """
@@ -43,6 +44,10 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+PROPHET_KV_PENDING_RECOMPUTE_KEY = "_prophet_kv_pending_recompute"
+PROPHET_KV_STAGE_GAP_RECOMPUTE = "gap_recompute"
+PROPHET_KV_STAGE_QUERY_RECOMPUTE = "query_recompute"
 
 
 # --- Stage I / Stage II ---------------------------------------------------
@@ -103,19 +108,22 @@ def fuse_and_select(
 def indices_to_gap_intervals(
     indices: torch.Tensor | Sequence[int],
     total_len: int,
-    block_size: int = 1,
+    gap_threshold: int = 0,
+    max_num_spans: int = 0,
 ) -> list[tuple[int, int]]:
     """Coalesce selected indices into half-open (start, end) intervals.
 
-    If block_size > 1, each interval is padded outward to block boundaries
-    (vLLM's paged KV manager recomputes whole blocks). Overlapping or
-    adjacent blocks are merged. Output matches the GapPolicy contract:
-    sorted, non-overlapping, half-open, all within [0, total_len).
+    Output matches the GapPolicy contract: sorted, non-overlapping, half-open,
+    all within [0, total_len). Optional `gap_threshold` merges nearby spans to
+    reduce fragmentation; optional `max_num_spans` further merges the closest
+    adjacent spans until the cap is satisfied.
     """
     if total_len < 0:
         raise ValueError(f"total_len must be non-negative; got {total_len}")
-    if block_size < 1:
-        raise ValueError(f"block_size must be >= 1; got {block_size}")
+    if gap_threshold < 0:
+        raise ValueError(f"gap_threshold must be non-negative; got {gap_threshold}")
+    if max_num_spans < 0:
+        raise ValueError(f"max_num_spans must be non-negative; got {max_num_spans}")
     if isinstance(indices, torch.Tensor):
         idx = indices.detach().cpu().tolist()
     else:
@@ -137,22 +145,72 @@ def indices_to_gap_intervals(
             runs.append((start, prev + 1))
             start = prev = i
     runs.append((start, prev + 1))
-
-    if block_size == 1:
+    if gap_threshold > 0 and len(runs) > 1:
+        merged_runs: list[tuple[int, int]] = [runs[0]]
+        for s, e in runs[1:]:
+            prev_s, prev_e = merged_runs[-1]
+            if s - prev_e <= gap_threshold:
+                merged_runs[-1] = (prev_s, e)
+            else:
+                merged_runs.append((s, e))
+        runs = merged_runs
+    if max_num_spans == 0 or len(runs) <= max_num_spans:
         return runs
-    aligned: list[tuple[int, int]] = []
-    for s, e in runs:
-        bs = (s // block_size) * block_size
-        be = min(((e + block_size - 1) // block_size) * block_size, total_len)
-        aligned.append((bs, be))
-    aligned.sort()
-    merged: list[tuple[int, int]] = []
-    for s, e in aligned:
-        if merged and s <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-        else:
-            merged.append((s, e))
-    return merged
+
+    spans = runs[:]
+    while len(spans) > max_num_spans:
+        merge_idx = min(
+            range(len(spans) - 1),
+            key=lambda i: (
+                spans[i + 1][0] - spans[i][1],
+                spans[i + 1][1] - spans[i][0],
+                i,
+            ),
+        )
+        spans[merge_idx : merge_idx + 2] = [
+            (spans[merge_idx][0], spans[merge_idx + 1][1])
+        ]
+    return spans
+
+
+def scores_to_gap_intervals(
+    scores: torch.Tensor,
+    total_len: int,
+    recomp_ratio: float,
+    *,
+    min_tokens: int = 0,
+    gap_threshold: int = 0,
+    max_num_spans: int = 0,
+) -> list[tuple[int, int]]:
+    """Select recompute intervals directly from fused scores.
+
+    ProphetKV selects top-scoring tokens, then emits minimal contiguous spans
+    covering those tokens. Optional `gap_threshold` and `max_num_spans`
+    reduce fragmentation while preserving coverage.
+    """
+    if not 0.0 <= recomp_ratio <= 1.0:
+        raise ValueError(f"recomp_ratio must be in [0,1]; got {recomp_ratio}")
+    if total_len < 0:
+        raise ValueError(f"total_len must be non-negative; got {total_len}")
+    if total_len == 0:
+        return []
+
+    scores = scores.detach().float().reshape(-1)
+    if scores.shape[0] < total_len:
+        total_len = scores.shape[0]
+    elif scores.shape[0] > total_len:
+        scores = scores[:total_len]
+
+    k_tokens = min(max(int(min_tokens), int(round(recomp_ratio * total_len))), total_len)
+    if k_tokens == 0:
+        return []
+    idx = torch.topk(scores, k=k_tokens, largest=True, sorted=False).indices
+    return indices_to_gap_intervals(
+        idx,
+        total_len=total_len,
+        gap_threshold=gap_threshold,
+        max_num_spans=max_num_spans,
+    )
 
 
 # --- Selector orchestrator ------------------------------------------------
@@ -163,8 +221,10 @@ class ProphetKVConfig:
     """Tunables for the dual-stage pipeline."""
 
     recomp_ratio: float = 0.2
-    block_size: int = 1
     min_tokens: int = 0
+    gap_threshold: int = 0
+    max_num_spans: int = 0
+    block_size: int = 1
     score_key: str = "prophet_kv_scores"
 
 
@@ -201,9 +261,24 @@ class ProphetKVSelector:
         head_dim: int,
         total_len: int,
     ) -> list[tuple[int, int]]:
-        idx = self.select(q_per_layer, k_per_layer, head_dim)
-        return indices_to_gap_intervals(
-            idx, total_len=total_len, block_size=self.config.block_size
+        if len(q_per_layer) != len(k_per_layer) or len(q_per_layer) == 0:
+            raise ValueError("q_per_layer and k_per_layer must be non-empty, same len")
+        alphas: list[torch.Tensor] = []
+        c_prev: int | None = None
+        for q, k in zip(q_per_layer, k_per_layer):
+            a = compute_layer_alpha(q, k, head_dim)
+            if c_prev is not None and a.shape[0] != c_prev:
+                raise ValueError(f"context length varies: {c_prev} vs {a.shape[0]}")
+            c_prev = a.shape[0]
+            alphas.append(a)
+        alpha_bar = torch.stack(alphas, dim=0).mean(dim=0)
+        return scores_to_gap_intervals(
+            alpha_bar,
+            total_len=total_len,
+            recomp_ratio=self.config.recomp_ratio,
+            min_tokens=self.config.min_tokens,
+            gap_threshold=self.config.gap_threshold,
+            max_num_spans=self.config.max_num_spans,
         )
 
 
@@ -224,6 +299,8 @@ class ProphetKVGapPolicy(GapPolicy):
         recomp_ratio: float = 0.2,
         block_size: int = 1,
         min_tokens: int = 0,
+        gap_threshold: int = 0,
+        max_num_spans: int = 0,
         score_key: str = "prophet_kv_scores",
         score_provider: Callable[["Request"], torch.Tensor | None] | None = None,
     ) -> None:
@@ -232,11 +309,19 @@ class ProphetKVGapPolicy(GapPolicy):
         self.recomp_ratio = recomp_ratio
         self.block_size = max(1, int(block_size))
         self.min_tokens = max(0, int(min_tokens))
+        self.gap_threshold = max(0, int(gap_threshold))
+        self.max_num_spans = max(0, int(max_num_spans))
         self.score_key = score_key
         self.score_provider = score_provider
         logger.info(
-            "ProphetKVGapPolicy: ratio=%.3f block_size=%d min_tokens=%d key=%s",
-            self.recomp_ratio, self.block_size, self.min_tokens, self.score_key,
+            "ProphetKVGapPolicy: ratio=%.3f min_tokens=%d gap_threshold=%d "
+            "max_num_spans=%d block_size=%d key=%s",
+            self.recomp_ratio,
+            self.min_tokens,
+            self.gap_threshold,
+            self.max_num_spans,
+            self.block_size,
+            self.score_key,
         )
 
     def get_gaps(
@@ -251,17 +336,13 @@ class ProphetKVGapPolicy(GapPolicy):
         scores = self._fetch_scores(request)
         if scores is None:
             return []
-        scores = scores.detach().float().reshape(-1)
-        if scores.shape[0] < total:
-            total = scores.shape[0]
-        elif scores.shape[0] > total:
-            scores = scores[:total]
-        k = min(max(self.min_tokens, int(round(self.recomp_ratio * total))), total)
-        if k == 0:
-            return []
-        idx = torch.topk(scores, k=k, largest=True, sorted=False).indices
-        return indices_to_gap_intervals(
-            idx, total_len=total, block_size=self.block_size
+        return scores_to_gap_intervals(
+            scores,
+            total_len=total,
+            recomp_ratio=self.recomp_ratio,
+            min_tokens=self.min_tokens,
+            gap_threshold=self.gap_threshold,
+            max_num_spans=self.max_num_spans,
         )
 
     def _fetch_scores(self, request: "Request") -> torch.Tensor | None:
@@ -293,13 +374,12 @@ def prophet_kv_policy_from_env(
     """
     if policy_name is None and envs.VLLM_V1_SPANS_PROPHET_KV_ENABLED:
         policy_name = "prophet_kv"
-        block_size = envs.VLLM_V1_SPANS_PROPHET_KV_BLOCK_SIZE
-        if block_size == 0:
-            block_size = default_block_size or 1
         policy_config = {
             "recomp_ratio": envs.VLLM_V1_SPANS_PROPHET_KV_RATIO,
-            "block_size": block_size,
             "min_tokens": envs.VLLM_V1_SPANS_PROPHET_KV_MIN_TOKENS,
+            "gap_threshold": envs.VLLM_V1_SPANS_PROPHET_KV_GAP_THRESHOLD,
+            "max_num_spans": envs.VLLM_V1_SPANS_PROPHET_KV_MAX_NUM_SPANS,
+            "block_size": max(1, envs.VLLM_V1_SPANS_PROPHET_KV_BLOCK_SIZE),
             "score_key": envs.VLLM_V1_SPANS_PROPHET_KV_SCORE_KEY,
         }
     return GapPolicyFactory.create_policy(policy_name, policy_config)

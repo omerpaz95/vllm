@@ -82,31 +82,53 @@ def disable_spans() -> None:
 # output equivalent to a full cold-start recompute.
 GAP_LENGTH_HUGE = 1_000_000
 
-MODES: list[str] = ["recompute", "spans_no_kv", "spans_gap_huge"]
-MODE_SPECS: dict[str, tuple[bool, dict | None]] = {
-    # name -> (spans_enabled, gap_policy_config)
-    "recompute": (False, None),
-    "spans_no_kv": (True, None),
+MODES: list[str] = ["recompute", "spans_no_kv", "spans_gap_huge", "prophet_kv"]
+MODE_SPECS: dict[str, tuple[bool, dict | None, bool]] = {
+    # name -> (spans_enabled, gap_policy_config, prophet_kv_enabled)
+    "recompute": (False, None, False),
+    "spans_no_kv": (True, None, False),
     "spans_gap_huge": (
         True,
         {
             "gap_length": GAP_LENGTH_HUGE,
-            "span_marker_token_id": SPAN_TOKEN_PLUS,
             "block_size": 16,
         },
+        False,
     ),
+    "prophet_kv": (True, None, True),
 }
+
+
+def enable_prophet_kv() -> None:
+    os.environ["VLLM_V1_SPANS_PROPHET_KV_ENABLED"] = "True"
+    os.environ["VLLM_V1_SPANS_PROPHET_KV_RATIO"] = "0.2"
+    os.environ["VLLM_V1_SPANS_PROPHET_KV_GAP_THRESHOLD"] = "2"
+    os.environ["VLLM_V1_SPANS_PROPHET_KV_MAX_NUM_SPANS"] = "32"
+    os.environ["VLLM_V1_SPANS_PROPHET_KV_BLOCK_SIZE"] = "1"
+
+
+def disable_prophet_kv() -> None:
+    os.environ.pop("VLLM_V1_SPANS_PROPHET_KV_ENABLED", None)
+    os.environ.pop("VLLM_V1_SPANS_PROPHET_KV_RATIO", None)
+    os.environ.pop("VLLM_V1_SPANS_PROPHET_KV_GAP_THRESHOLD", None)
+    os.environ.pop("VLLM_V1_SPANS_PROPHET_KV_MAX_NUM_SPANS", None)
+    os.environ.pop("VLLM_V1_SPANS_PROPHET_KV_BLOCK_SIZE", None)
 
 
 def build_llm(
     model: str,
     spans_enabled: bool,
     gap_policy_config: dict | None = None,
+    prophet_kv_enabled: bool = False,
 ) -> LLM:
     if spans_enabled:
         enable_spans()
     else:
         disable_spans()
+    if prophet_kv_enabled:
+        enable_prophet_kv()
+    else:
+        disable_prophet_kv()
     extra: dict = {}
     if gap_policy_config is not None:
         extra["gap_policy_name"] = "span_aware"
@@ -125,11 +147,25 @@ def build_llm(
     )
 
 
+def _compute_prophet_kv_query_start(model: str) -> int:
+    """Return a token-position late in the prompt to act as the user-query
+    start for ProphetKV. Everything before this offset becomes the K' "context"
+    that ProphetKV scores; everything from this offset onward is treated as Q_s.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(model)
+    n_tokens = len(tok.encode(PROMPT))
+    # Reserve the last ~25% of the prompt as the user-query span.
+    return max(1, int(n_tokens * 0.75))
+
+
 def _make_sp(
     seed: int,
     temp: float,
     max_toks: int,
     logprobs: int | None = None,
+    extra_args: dict | None = None,
 ) -> SamplingParams:
     # from_optional() has an explicit signature; direct SamplingParams(...)
     # uses msgspec.Struct metaclass magic which the type checker doesn't
@@ -139,6 +175,7 @@ def _make_sp(
         temperature=temp,
         max_tokens=max_toks,
         logprobs=logprobs,
+        extra_args=extra_args,
     )
 
 
@@ -158,13 +195,13 @@ def _extract_step0_topk(out) -> list[tuple[int, float]]:
 
 
 def run_reps(
-    llm: LLM, temp: float
+    llm: LLM, temp: float, extra_args: dict | None = None
 ) -> tuple[list[str], list[list[tuple[int, float]]]]:
     """
     Runs NUM_REPS generations. Returns (texts, top10_per_rep) where top10_per_rep[i]
     is the step-0 top-K logprob list for rep i.
     """
-    sp = _make_sp(SEED, temp, MAX_TOKENS, logprobs=LOGPROBS_TOPK)
+    sp = _make_sp(SEED, temp, MAX_TOKENS, logprobs=LOGPROBS_TOPK, extra_args=extra_args)
     texts: list[str] = []
     top10s: list[list[tuple[int, float]]] = []
     for _ in range(NUM_REPS):
@@ -176,13 +213,13 @@ def run_reps(
 
 
 def get_first_token_logprobs(
-    llm: LLM,
+    llm: LLM, extra_args: dict | None = None,
 ) -> list[tuple[int, str, float]]:
     """
     Returns the top-K logprobs for the first generated token at temperature=0.
     List of (token_id, decoded_text, logprob) sorted by logprob desc.
     """
-    sp = _make_sp(SEED, 0.0, 1, logprobs=LOGPROBS_TOPK)
+    sp = _make_sp(SEED, 0.0, 1, logprobs=LOGPROBS_TOPK, extra_args=extra_args)
     res = llm.generate(PROMPT, sampling_params=sp, use_tqdm=False)
     out = res[0].outputs[0]
     if out.logprobs is None:
@@ -202,9 +239,10 @@ def get_first_token_logprobs(
 
 
 def run_with_seed(
-    llm: LLM, seed: int, temp: float, max_toks: int
+    llm: LLM, seed: int, temp: float, max_toks: int,
+    extra_args: dict | None = None,
 ) -> tuple[str, list[tuple[int, float]]]:
-    sp = _make_sp(seed, temp, max_toks, logprobs=LOGPROBS_TOPK)
+    sp = _make_sp(seed, temp, max_toks, logprobs=LOGPROBS_TOPK, extra_args=extra_args)
     res = llm.generate(PROMPT, sampling_params=sp, use_tqdm=False)
     out = res[0].outputs[0]
     return out.text, _extract_step0_topk(out)
@@ -275,12 +313,20 @@ def run_gap_policy_replay_test(
         gap_policy_name="span_aware",
         gap_policy_config={
             "gap_length": GAP_LENGTH_HUGE,
-            "span_marker_token_id": SPAN_TOKEN_PLUS,
             "block_size": 16,
         },
     )
 
-    sp = _make_sp(SEED, 0.0, MAX_TOKENS, logprobs=LOGPROBS_TOPK)
+    # Start the first span at token 0 so a huge gap length recomputes the
+    # entire cached prefix on replay.
+    replay_extra_args = {"span_starts": [0]}
+    sp = _make_sp(
+        SEED,
+        0.0,
+        MAX_TOKENS,
+        logprobs=LOGPROBS_TOPK,
+        extra_args=replay_extra_args,
+    )
 
     print("  run #1 (cold prefill, populates cache)...")
     res1 = llm.generate(PROMPT, sampling_params=sp, use_tqdm=False)
@@ -325,20 +371,33 @@ def main() -> None:
         str, dict[int, tuple[str, list[tuple[int, float]]]]
     ] = {}
 
+    # Compute the user-query-start position once (needs the tokenizer); used
+    # to pass `cross_span_starts` in extra_args for the prophet_kv mode.
+    prophet_kv_query_start = _compute_prophet_kv_query_start(model)
+    prophet_kv_extra_args: dict | None = {
+        "cross_span_starts": [prophet_kv_query_start]
+    }
+    print(
+        f"ProphetKV query_start (cross_span_starts[0]): "
+        f"{prophet_kv_query_start}"
+    )
+
     for mode in MODES:
-        spans_enabled, gap_policy_config = MODE_SPECS[mode]
+        spans_enabled, gap_policy_config, prophet_kv_enabled = MODE_SPECS[mode]
+        extra_args = prophet_kv_extra_args if prophet_kv_enabled else None
         print(f"\n{'=' * 72}\nBuilding LLM: mode={mode}\n{'=' * 72}")
         llm = build_llm(
             model,
             spans_enabled=spans_enabled,
             gap_policy_config=gap_policy_config,
+            prophet_kv_enabled=prophet_kv_enabled,
         )
 
         # --- Determinism matrix ---
         for temp in TEMPS:
             key = (mode, temp)
             print(f"  running {label(*key)} x{NUM_REPS}...")
-            texts, top10s = run_reps(llm, temp)
+            texts, top10s = run_reps(llm, temp, extra_args=extra_args)
             results[key] = texts
             results_top10[key] = top10s
             for i, r in enumerate(texts):
@@ -346,14 +405,17 @@ def main() -> None:
 
         # --- Logprob equivalence test: logprobs at first token, t=0, top-K ---
         print(f"  collecting top-{LOGPROBS_TOPK} logprobs for step 0 (t=0)...")
-        logprobs_by_mode[mode] = get_first_token_logprobs(llm)
+        logprobs_by_mode[mode] = get_first_token_logprobs(
+            llm, extra_args=extra_args
+        )
 
         # --- Multi-seed drift test: t=1 across several seeds ---
         print(f"  running multi-seed t=1 (seeds={MULTI_SEEDS})...")
         multi_seed_by_mode[mode] = {}
         for s in MULTI_SEEDS:
             multi_seed_by_mode[mode][s] = run_with_seed(
-                llm, s, 1.0, MULTI_SEED_MAX_TOKENS
+                llm, s, 1.0, MULTI_SEED_MAX_TOKENS,
+                extra_args=extra_args,
             )
 
         del llm

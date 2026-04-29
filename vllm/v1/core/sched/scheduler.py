@@ -46,6 +46,12 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.prophet_kv import (
+    PROPHET_KV_PENDING_RECOMPUTE_KEY,
+    PROPHET_KV_STAGE_GAP_RECOMPUTE,
+    PROPHET_KV_STAGE_QUERY_RECOMPUTE,
+    prophet_kv_policy_from_env,
+)
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -138,15 +144,20 @@ class Scheduler(SchedulerInterface):
             self.recompute_kv_load_failures = kv_load_failure_policy == "recompute"
 
         # Initialize gap policy for KV cache recomputation
-        self.gap_policy: GapPolicy | None = None
-        if self.scheduler_config.gap_policy_name is not None:
+        self.gap_policy: GapPolicy | None = prophet_kv_policy_from_env(
+            policy_name=self.scheduler_config.gap_policy_name,
+            policy_config=self.scheduler_config.gap_policy_config,
+            default_block_size=block_size,
+        )
+        if self.gap_policy is None and self.scheduler_config.gap_policy_name is not None:
             self.gap_policy = GapPolicyFactory.create_policy(
                 policy_name=self.scheduler_config.gap_policy_name,
                 policy_config=self.scheduler_config.gap_policy_config,
             )
+        if self.gap_policy is not None:
             logger.info(
                 "Initialized gap policy: %s with config: %s",
-                self.scheduler_config.gap_policy_name,
+                type(self.gap_policy).__name__,
                 self.scheduler_config.gap_policy_config,
             )
 
@@ -378,6 +389,11 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        # RUNNING requests that should schedule only virtual gap recomputes.
+        scheduled_pending_gap_reqs: list[Request] = []
+        # RUNNING requests that should rewrite the user-query span after
+        # context gap recompute and before the first decode token is sampled.
+        scheduled_pending_query_reqs: list[Request] = []
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -388,6 +404,47 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            pending_stage = self._get_prophet_kv_pending_stage(request)
+            if pending_stage == PROPHET_KV_STAGE_GAP_RECOMPUTE:
+                gap_overhead = 0
+                if self.gap_policy is not None:
+                    gap_overhead = sum(
+                        end - start
+                        for start, end in self.gap_policy.get_gaps(
+                            request,
+                            request.num_computed_tokens,
+                            request.num_external_computed_tokens,
+                        )
+                    )
+                if gap_overhead <= 0:
+                    params = self._get_or_create_kv_transfer_params(request)
+                    params.pop(PROPHET_KV_PENDING_RECOMPUTE_KEY, None)
+                    req_index += 1
+                    continue
+                if gap_overhead > token_budget:
+                    req_index += 1
+                    continue
+                token_budget -= gap_overhead
+                scheduled_pending_gap_reqs.append(request)
+                req_index += 1
+                continue
+            if pending_stage == PROPHET_KV_STAGE_QUERY_RECOMPUTE:
+                query_interval = self._get_prophet_kv_query_recompute_interval(request)
+                if query_interval is None:
+                    params = self._get_or_create_kv_transfer_params(request)
+                    params.pop(PROPHET_KV_PENDING_RECOMPUTE_KEY, None)
+                    req_index += 1
+                    continue
+                query_start, query_end = query_interval
+                query_recompute_tokens = query_end - query_start
+                if query_recompute_tokens > token_budget:
+                    req_index += 1
+                    continue
+                token_budget -= query_recompute_tokens
+                scheduled_pending_query_reqs.append(request)
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -911,16 +968,29 @@ class Scheduler(SchedulerInterface):
                 for req in scheduled_new_reqs
             ]
 
+        gap_candidates: list[tuple[Request, NewRequestData]] = list(
+            zip(scheduled_new_reqs, new_reqs_data)
+        )
+        pending_gap_req_ids = {req.request_id for req in scheduled_pending_gap_reqs}
+        for req in scheduled_pending_gap_reqs:
+            prefill_token_ids = req._all_token_ids if self.use_v2_model_runner else None
+            gap_candidates.append(
+                (
+                    req,
+                    NewRequestData.from_request(
+                        req,
+                        self.kv_cache_manager.get_block_ids(req.request_id),
+                        prefill_token_ids,
+                    ),
+                )
+            )
+
         # Track virtual gap request IDs for model runner cleanup
         virtual_gap_req_ids: set[str] = set()
 
         # NEW: Apply gap policy to create gaps in ANY cached tokens
-        if len(new_reqs_data) > 0:
-            for nrd in new_reqs_data:
-                request = self.requests.get(nrd.req_id)
-                if request is None:
-                    continue
-
+        if gap_candidates:
+            for request, nrd in gap_candidates:
                 # Get gaps from policy (works for all cached tokens)
                 computed_token_gaps: list[tuple[int, int]] = []
 
@@ -953,6 +1023,9 @@ class Scheduler(SchedulerInterface):
                     computed_token_gaps = self._merge_gaps(computed_token_gaps)
 
                 if not computed_token_gaps:
+                    if request.request_id in pending_gap_req_ids:
+                        params = self._get_or_create_kv_transfer_params(request)
+                        params.pop(PROPHET_KV_PENDING_RECOMPUTE_KEY, None)
                     continue
 
                 logger.info(
@@ -961,7 +1034,6 @@ class Scheduler(SchedulerInterface):
                     computed_token_gaps,
                 )
                 for start, end in computed_token_gaps:
-                    print(f"Gap: ({start},{end})")
                     nrd_copy = replace(nrd)
                     parent_req_id = nrd_copy.req_id  # Save parent before modification
                     nrd_copy.req_id = nrd_copy.req_id + "." + str(start)
@@ -994,6 +1066,45 @@ class Scheduler(SchedulerInterface):
                     new_reqs_data.append(nrd_copy)
                     # Track this virtual request ID for cleanup
                     virtual_gap_req_ids.add(nrd_copy.req_id)
+                if request.request_id in pending_gap_req_ids:
+                    params = self._get_or_create_kv_transfer_params(request)
+                    if self._get_prophet_kv_query_recompute_interval(request) is None:
+                        params.pop(PROPHET_KV_PENDING_RECOMPUTE_KEY, None)
+                    else:
+                        params[PROPHET_KV_PENDING_RECOMPUTE_KEY] = (
+                            PROPHET_KV_STAGE_QUERY_RECOMPUTE
+                        )
+
+        for request in scheduled_pending_query_reqs:
+            query_interval = self._get_prophet_kv_query_recompute_interval(request)
+            params = self._get_or_create_kv_transfer_params(request)
+            if query_interval is None:
+                params.pop(PROPHET_KV_PENDING_RECOMPUTE_KEY, None)
+                continue
+            query_start, query_end = query_interval
+            prefill_token_ids = request._all_token_ids if self.use_v2_model_runner else None
+            nrd = NewRequestData.from_request(
+                request,
+                self.kv_cache_manager.get_block_ids(request.request_id),
+                prefill_token_ids,
+            )
+            nrd.req_id = f"{request.request_id}.query.{query_start}"
+            nrd.num_computed_tokens = query_start
+            nrd.is_gap_recompute = True
+            nrd.parent_req_id = request.request_id
+            nrd.gap_start = query_start
+            nrd.prompt_token_ids = (
+                nrd.prompt_token_ids[:query_end]
+                if nrd.prompt_token_ids is not None
+                else None
+            )
+            if self.use_v2_model_runner and nrd.prefill_token_ids is not None:
+                nrd.prefill_token_ids = nrd.prefill_token_ids[:query_end]
+            new_reqs_data.append(nrd)
+            num_scheduled_tokens[nrd.req_id] = query_end - query_start
+            total_num_scheduled_tokens += query_end - query_start
+            virtual_gap_req_ids.add(nrd.req_id)
+            params.pop(PROPHET_KV_PENDING_RECOMPUTE_KEY, None)
 
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
@@ -1142,6 +1253,46 @@ class Scheduler(SchedulerInterface):
                 merged.append((current_start, current_end))
 
         return merged
+
+    def _get_prophet_kv_score_key(self) -> str:
+        return getattr(
+            self.gap_policy,
+            "score_key",
+            envs.VLLM_V1_SPANS_PROPHET_KV_SCORE_KEY,
+        )
+
+    @staticmethod
+    def _get_or_create_kv_transfer_params(request: Request) -> dict[str, Any]:
+        if request.kv_transfer_params is None:
+            request.kv_transfer_params = {}
+        return request.kv_transfer_params
+
+    @staticmethod
+    def _get_prophet_kv_pending_stage(request: Request) -> str | None:
+        params = request.kv_transfer_params
+        if not params:
+            return None
+        stage = params.get(PROPHET_KV_PENDING_RECOMPUTE_KEY)
+        if stage is True:
+            return PROPHET_KV_STAGE_GAP_RECOMPUTE
+        if stage in (
+            PROPHET_KV_STAGE_GAP_RECOMPUTE,
+            PROPHET_KV_STAGE_QUERY_RECOMPUTE,
+        ):
+            return stage
+        return None
+
+    @staticmethod
+    def _get_prophet_kv_query_recompute_interval(
+        request: Request,
+    ) -> tuple[int, int] | None:
+        if not request.cross_span_starts:
+            return None
+        query_start = int(request.cross_span_starts[0])
+        query_end = request.num_prompt_tokens
+        if not 0 < query_start < query_end:
+            return None
+        return query_start, query_end
 
     def _update_request_as_session(
         self, session: Request, update: StreamingUpdate
@@ -1444,8 +1595,10 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
+        prophet_kv_scores = model_runner_output.prophet_kv_scores or {}
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        prophet_kv_score_key = self._get_prophet_kv_score_key()
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1495,6 +1648,20 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            prophet_scores = prophet_kv_scores.get(req_id)
+            if (
+                prophet_scores is not None
+                and request.num_output_tokens == 0
+                and request.num_cached_tokens > 0
+            ):
+                params = self._get_or_create_kv_transfer_params(request)
+                params[prophet_kv_score_key] = prophet_scores
+                if self._get_prophet_kv_pending_stage(request) is None:
+                    params[PROPHET_KV_PENDING_RECOMPUTE_KEY] = (
+                        PROPHET_KV_STAGE_GAP_RECOMPUTE
+                    )
+                    request.num_output_placeholders += 1
+                generated_token_ids = []
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
@@ -1774,6 +1941,9 @@ class Scheduler(SchedulerInterface):
             if stopped:
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
+        if request.num_output_placeholders > 0:
+            request.num_output_placeholders -= len(new_token_ids)
+            assert request.num_output_placeholders >= 0
         return new_token_ids, stopped
 
     def _free_encoder_inputs(self, request: Request) -> None:
