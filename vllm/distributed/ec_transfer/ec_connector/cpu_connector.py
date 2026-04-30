@@ -11,8 +11,12 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorMetadata,
     ECConnectorRole,
 )
+from vllm.distributed.ec_transfer.ec_connector.ec_shared_region import (
+    ECSharedRegion,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -23,8 +27,8 @@ logger = init_logger(__name__)
 
 @dataclass
 class ECCPUConnectorMetadata(ECConnectorMetadata):
-    # mm_hash -> (offset, size) in the flat CPU buffer
-    mm_hash_to_cpu_loc: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # mm_hash -> list of block indices in the shared CPU region
+    mm_hash_to_cpu_blocks: dict[str, list[int]] = field(default_factory=dict)
 
 
 class ECCPUConnector(ECConnectorBase):
@@ -35,24 +39,38 @@ class ECCPUConnector(ECConnectorBase):
 
     def __init__(self, vllm_config: "VllmConfig", role: ECConnectorRole):
         super().__init__(vllm_config=vllm_config, role=role)
-        # mm_hash -> (offset, size) in the flat CPU buffer
-        self._encoding_map: dict[str, tuple[int, int]] = {}
 
-        self._cpu_buffer: torch.Tensor | None = None
+        if self.role == ECConnectorRole.SCHEDULER:
+            # mm_hash -> list of block indices in the shared CPU region
+            self._encoding_map: dict[str, list[int]] = {}
+
+        if self.role == ECConnectorRole.WORKER:
+            ec_config = vllm_config.ec_transfer_config
+            assert ec_config is not None
+
+            num_ec_blocks = ec_config.get_from_extra_config("num_ec_blocks", None)
+            ec_hidden_dim = ec_config.get_from_extra_config("ec_hidden_dim", None)
+            if num_ec_blocks is None or ec_hidden_dim is None:
+                raise ValueError(
+                    "ECCPUConnector requires 'num_ec_blocks' and "
+                    "'ec_hidden_dim' in ec_connector_extra_config"
+                )
+
+            parallel_config = vllm_config.parallel_config
+            self._region = ECSharedRegion(
+                instance_id=ec_config.engine_id,
+                num_blocks=int(num_ec_blocks),
+                block_size_bytes=int(ec_hidden_dim),
+                num_workers=parallel_config.world_size,
+                rank=parallel_config.rank,
+            )
+            if is_pin_memory_available():
+                self._region.pin_memory()
+            self._cpu_blocks = self._region.blocks
 
     # ==============================
     # Worker-side methods
     # ==============================
-
-    def register_caches(self, ec_caches: dict[str, torch.Tensor]):
-        """
-        This needs to be called by someone
-        Or, alternatively, create the cpu buffer in init().
-        """
-
-        if "cpu_buffer" not in ec_caches:
-            raise ValueError("ECCPUConnector requires 'cpu_buffer' in ec_caches")
-        self._cpu_buffer = ec_caches["cpu_buffer"]
 
     def start_load_caches(
         self, encoder_cache: dict[str, torch.Tensor], **kwargs
@@ -60,10 +78,10 @@ class ECCPUConnector(ECConnectorBase):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, ECCPUConnectorMetadata)
 
-        for mm_hash, (offset, size) in metadata.mm_hash_to_cpu_loc.items():
-            if mm_hash in encoder_cache or not self._cpu_buffer:
+        for mm_hash, block_indices in metadata.mm_hash_to_cpu_blocks.items():
+            if mm_hash in encoder_cache:
                 continue
-            encoder_cache[mm_hash] = self._cpu_buffer[offset : offset + size].to(
+            encoder_cache[mm_hash] = self._cpu_blocks[block_indices].to(
                 device=current_platform.device_type, non_blocking=True
             )
 
@@ -89,7 +107,7 @@ class ECCPUConnector(ECConnectorBase):
         self, scheduler_output: SchedulerOutput
     ) -> ECCPUConnectorMetadata:
         meta = ECCPUConnectorMetadata(
-            mm_hash_to_cpu_loc=self._encoding_map,
+            mm_hash_to_cpu_blocks=self._encoding_map,
         )
         self._encoding_map = {}
         return meta
