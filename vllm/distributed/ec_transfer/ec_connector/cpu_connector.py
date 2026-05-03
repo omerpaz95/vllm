@@ -10,6 +10,7 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
     ECConnectorMetadata,
     ECConnectorRole,
+    EncoderConfig,
 )
 from vllm.distributed.ec_transfer.ec_connector.ec_shared_region import (
     ECSharedRegion,
@@ -48,25 +49,29 @@ class ECCPUConnector(ECConnectorBase):
             ec_config = vllm_config.ec_transfer_config
             assert ec_config is not None
 
-            num_ec_blocks = ec_config.get_from_extra_config("num_ec_blocks", None)
-            ec_hidden_dim = ec_config.get_from_extra_config("ec_hidden_dim", None)
-            if num_ec_blocks is None or ec_hidden_dim is None:
-                raise ValueError(
-                    "ECCPUConnector requires 'num_ec_blocks' and "
-                    "'ec_hidden_dim' in ec_connector_extra_config"
-                )
-
-            parallel_config = vllm_config.parallel_config
-            self._region = ECSharedRegion(
-                instance_id=ec_config.engine_id,
-                num_blocks=int(num_ec_blocks),
-                block_size_bytes=int(ec_hidden_dim),
-                num_workers=parallel_config.world_size,
-                rank=parallel_config.rank,
+            self._engine_id = ec_config.engine_id
+            self._num_ec_blocks = int(
+                ec_config.get_from_extra_config("num_ec_blocks", 256)
             )
-            if is_pin_memory_available():
-                self._region.pin_memory()
-            self._cpu_blocks = self._region.blocks
+            self._num_workers = vllm_config.parallel_config.world_size
+            self._rank = vllm_config.parallel_config.rank
+
+            self._region: ECSharedRegion | None = None
+            self._cpu_blocks: torch.Tensor | None = None
+
+    def register_caches(  # type: ignore[override]
+        self, encoder_config: EncoderConfig
+    ) -> None:
+        self._region = ECSharedRegion(
+            instance_id=self._engine_id,
+            num_blocks=self._num_ec_blocks,
+            block_size_bytes=encoder_config.block_size_bytes,
+            num_workers=self._num_workers,
+            rank=self._rank,
+        )
+        if is_pin_memory_available():
+            self._region.pin_memory()
+        self._cpu_blocks = self._region.blocks
 
     # ==============================
     # Worker-side methods
@@ -78,6 +83,7 @@ class ECCPUConnector(ECConnectorBase):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, ECCPUConnectorMetadata)
 
+        assert self._cpu_blocks is not None, "register_caches() not called"
         for mm_hash, block_indices in metadata.mm_hash_to_cpu_blocks.items():
             if mm_hash in encoder_cache:
                 continue

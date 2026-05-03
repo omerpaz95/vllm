@@ -24,6 +24,7 @@ The class provides the following primitives:
 
 import enum
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -37,6 +38,17 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class EncoderConfig:
+    hidden_dim: int
+    dtype: torch.dtype
+    element_size: int
+
+    @property
+    def block_size_bytes(self) -> int:
+        return self.hidden_dim * self.element_size
 
 
 class ECConnectorRole(enum.Enum):
