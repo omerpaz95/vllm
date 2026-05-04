@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import safetensors
 
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
+    MM_HASH_TO_ENCODER_KEY,
     ECConnectorBase,
     ECConnectorMetadata,
     ECConnectorRole,
@@ -25,10 +26,18 @@ logger = init_logger(__name__)
 class MMMeta:
     mm_hash: str
     num_token: int
+    # Remote encoder node descriptor copied from
+    # ``request.kv_transfer_params[MM_HASH_TO_ENCODER_KEY][mm_hash]`` when the
+    # routing layer supplied one. ``None`` for locally-served caches.
+    encoder_node: dict[str, Any] | None = field(default=None)
 
     @staticmethod
-    def make_meta(mm_hash, num_token) -> "MMMeta":
-        return MMMeta(mm_hash=mm_hash, num_token=num_token)
+    def make_meta(
+        mm_hash: str,
+        num_token: int,
+        encoder_node: dict[str, Any] | None = None,
+    ) -> "MMMeta":
+        return MMMeta(mm_hash=mm_hash, num_token=num_token, encoder_node=encoder_node)
 
 
 @dataclass
@@ -50,6 +59,10 @@ class ECExampleConnector(ECConnectorBase):
         super().__init__(vllm_config=vllm_config, role=role)
         # req_id -> index
         self._mm_datas_need_loads: dict[str, int] = {}
+        # mm_hash -> remote encoder node descriptor (or None for local-only).
+        # Populated from ``request.kv_transfer_params[MM_HASH_TO_ENCODER_KEY]``
+        # in ``update_state_after_alloc`` and drained in ``build_connector_meta``.
+        self._mm_encoder_nodes: dict[str, dict[str, Any] | None] = {}
         transfer_config = vllm_config.ec_transfer_config
         if transfer_config is not None:
             self._storage_path = transfer_config.get_from_extra_config(
@@ -146,6 +159,10 @@ class ECExampleConnector(ECConnectorBase):
             return
         num_encoder_token = request.get_num_encoder_embeds(index)
         self._mm_datas_need_loads[mm_hash] = num_encoder_token
+        encoder_map = (request.kv_transfer_params or {}).get(MM_HASH_TO_ENCODER_KEY)
+        self._mm_encoder_nodes[mm_hash] = (
+            encoder_map.get(mm_hash) if isinstance(encoder_map, dict) else None
+        )
 
     def build_connector_meta(
         self,
@@ -161,8 +178,15 @@ class ECExampleConnector(ECConnectorBase):
         """
         meta = ECExampleConnectorMetadata()
         for mm_hash, num_encoder_token in self._mm_datas_need_loads.items():
-            meta.add_mm_data(MMMeta.make_meta(mm_hash, num_encoder_token))
+            meta.add_mm_data(
+                MMMeta.make_meta(
+                    mm_hash,
+                    num_encoder_token,
+                    encoder_node=self._mm_encoder_nodes.get(mm_hash),
+                )
+            )
         self._mm_datas_need_loads.clear()
+        self._mm_encoder_nodes.clear()
         return meta
 
     # ==============================

@@ -97,7 +97,12 @@ class Request:
         self.events: list[EngineCoreEvent] = []
         self.stop_reason: int | str | None = None
 
-        # P/D: Connector-specific KV transfer parameters.
+        # P/D: Connector-specific KV transfer parameters. Also carries the
+        # EC routing convention under
+        # ``vllm.distributed.ec_transfer.ec_connector.base.MM_HASH_TO_ENCODER_KEY``:
+        # a ``{mm_hash: {remote_engine_id, remote_host, remote_port}}`` mapping
+        # populated by the routing layer so the EC consumer connector knows
+        # which encoder instance holds each mm cache.
         self.kv_transfer_params: dict[str, Any] | None = None
 
         if pooling_params is not None:

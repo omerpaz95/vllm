@@ -39,6 +39,34 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+# Convention for passing per-mm_hash remote encoder node info through
+# ``Request.kv_transfer_params`` (populated from
+# ``SamplingParams.extra_args["kv_transfer_params"]``).
+#
+# A routing layer (e.g. ``disagg_epd_proxy``) selects an encoder instance per
+# multimodal item and attaches the resulting mapping so the EC consumer
+# connector on the PD instance can pull each encoder cache from the right
+# producer. The per-mm_hash inner dict uses the same flat key names as NIXL
+# P/D (``remote_engine_id`` / ``remote_host`` / ``remote_port``) so both
+# transports share a dispatch shape; like NIXL, this is a loose dict
+# convention rather than a typed schema.
+#
+# Example::
+#
+#     sampling_params.extra_args = {
+#         "kv_transfer_params": {
+#             MM_HASH_TO_ENCODER_KEY: {
+#                 "<mm_hash_1>": {
+#                     "remote_engine_id": "enc-0",
+#                     "remote_host": "10.0.0.1",
+#                     "remote_port": 5557,
+#                 },
+#             },
+#         },
+#     }
+MM_HASH_TO_ENCODER_KEY = "mm_hash_to_encoder"
+
+
 class ECConnectorRole(enum.Enum):
     # Connector running in the scheduler process
     SCHEDULER = 0
