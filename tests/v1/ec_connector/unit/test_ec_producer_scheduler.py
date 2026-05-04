@@ -17,6 +17,7 @@ from vllm.distributed.ec_transfer.ec_connector.cpu_connector import (
     ECCPUConnector,
 )
 from vllm.distributed.ec_transfer.ec_connector.messages import (
+    XferAck,
     XferReq,
 )
 
@@ -141,6 +142,65 @@ def test_producer_parks_xfer_req_when_encoding_absent(producer_config):
             dealer.setsockopt(zmq.RCVTIMEO, 100)
             with pytest.raises(zmq.Again):
                 dealer.recv()
+            dealer.close(linger=0)
+        finally:
+            conn.shutdown()
+
+
+def test_producer_dispatches_when_encoding_present(producer_config):
+    import ctypes
+
+    cfg, port = producer_config
+    with patch(
+        "vllm.distributed.ec_transfer.ec_connector.cpu_connector.NixlWrapper",
+        FakeNixlWrapper,
+    ):
+        conn = ECCPUConnector(cfg, ECConnectorRole.SCHEDULER)
+        try:
+            # Plant an encoding tensor whose bytes we can verify in the fake's dst.
+            n_blocks = 3
+            block_size = conn._block_size_bytes
+            tensor = torch.arange(n_blocks * block_size, dtype=torch.uint8).contiguous()
+            conn._encodings["have-it"] = tensor
+
+            # Create a "consumer" FakeNixlWrapper and a destination buffer
+            # the producer will WRITE into.
+            consumer = FakeNixlWrapper("consumer-agent")
+            dst_buf = (ctypes.c_ubyte * (n_blocks * block_size))()
+            dst_addr = ctypes.addressof(dst_buf)
+            dst_tuples = [
+                (dst_addr + i * block_size, block_size, 0) for i in range(n_blocks)
+            ]
+            consumer_mem_descriptor = msgspec.msgpack.encode(dst_tuples)
+
+            ctx = zmq.Context.instance()
+            dealer = ctx.socket(zmq.DEALER)
+            dealer.connect(f"tcp://127.0.0.1:{port}")
+
+            req = XferReq(
+                mm_hash="have-it",
+                dst_block_indices=list(range(n_blocks)),
+                consumer_agent_name=consumer.name,
+                consumer_nixl_metadata=consumer.get_agent_metadata(),
+                consumer_mem_descriptor=consumer_mem_descriptor,
+                compatibility_hash=conn._compat_hash,
+            )
+            dealer.send(msgspec.msgpack.encode(req))
+
+            # Receive the ack.  Producer uses send_multipart with an empty
+            # delimiter: DEALER receives [b"", payload].  Use recv_multipart
+            # to drain both frames.
+            dealer.setsockopt(zmq.RCVTIMEO, 5000)
+            frames = dealer.recv_multipart()
+            # Empty delimiter may or may not be present depending on producer;
+            # the XferAck is always the last frame.
+            ack_bytes = frames[-1]
+            ack = msgspec.msgpack.decode(ack_bytes, type=XferAck)
+            assert ack.mm_hash == "have-it"
+            assert ack.ok is True
+
+            # Destination now holds the source tensor bytes.
+            assert list(dst_buf) == list(tensor.tolist())
             dealer.close(linger=0)
         finally:
             conn.shutdown()

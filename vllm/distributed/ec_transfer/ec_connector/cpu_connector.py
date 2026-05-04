@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -262,9 +263,100 @@ class ECCPUConnector(ECConnectorBase):
             self._router.send_multipart([identity, payload])
 
     def _do_nixl_xfer(self, req: "XferReq", tensor: "torch.Tensor") -> bool:
-        # Stub: implemented in Task 8.  Returns False.
-        _ = (req, tensor)
-        return False
+        assert self._nixl is not None
+        n = len(req.dst_block_indices)
+        expected = n * self._block_size_bytes
+        if tensor.nbytes != expected:
+            logger.warning(
+                "ec: size mismatch for mm_hash=%s: tensor=%d expected=%d",
+                req.mm_hash,
+                tensor.nbytes,
+                expected,
+            )
+            return False
+
+        reg_tuples = [(tensor.data_ptr(), tensor.nbytes, self._device_id, "")]
+        reg_descs = self._nixl.get_reg_descs(reg_tuples, self._mem_type)
+        self._nixl.register_memory(reg_descs)
+
+        remote_agent_name: str | None = None
+        local_dlist: int | None = None
+        remote_dlist: int | None = None
+        xfer_handle: int | None = None
+        try:
+            remote_agent_name = self._nixl.add_remote_agent(req.consumer_nixl_metadata)
+
+            local_tuples = [
+                (
+                    tensor.data_ptr() + i * self._block_size_bytes,
+                    self._block_size_bytes,
+                    self._device_id,
+                )
+                for i in range(n)
+            ]
+            local_descs = self._nixl.get_xfer_descs(local_tuples, self._mem_type)
+            local_dlist = self._nixl.prep_xfer_dlist("NIXL_INIT_AGENT", local_descs)
+
+            # Consumer sent a msgpack-encoded list[tuple[int,int,int]].
+            # msgpack turns tuples into lists on the wire; convert back.
+            raw_remote = msgspec.msgpack.decode(req.consumer_mem_descriptor)
+            remote_tuples = [tuple(item) for item in raw_remote]
+            remote_descs = self._nixl.get_xfer_descs(remote_tuples, self._mem_type)
+            remote_dlist = self._nixl.prep_xfer_dlist(remote_agent_name, remote_descs)
+
+            xfer_handle = self._nixl.make_prepped_xfer(
+                "WRITE",
+                local_dlist,
+                list(range(n)),
+                remote_dlist,
+                req.dst_block_indices,
+                notif_msg=b"",
+            )
+            self._nixl.transfer(xfer_handle)
+            while True:
+                state = self._nixl.check_xfer_state(xfer_handle)
+                if state == "DONE":
+                    return True
+                if state != "PROC":
+                    logger.warning(
+                        "ec: NIXL xfer ended in state=%s for mm_hash=%s",
+                        state,
+                        req.mm_hash,
+                    )
+                    return False
+                time.sleep(0.0005)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ec: NIXL xfer failed for mm_hash=%s: %s", req.mm_hash, e)
+            return False
+        finally:
+            if xfer_handle is not None:
+                try:
+                    self._nixl.release_xfer_handle(xfer_handle)
+                except Exception:  # noqa: BLE001
+                    logger.debug("ec: release_xfer_handle raised", exc_info=True)
+            if local_dlist is not None:
+                try:
+                    self._nixl.release_dlist_handle(local_dlist)
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "ec: release_dlist_handle(local) raised", exc_info=True
+                    )
+            if remote_dlist is not None:
+                try:
+                    self._nixl.release_dlist_handle(remote_dlist)
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "ec: release_dlist_handle(remote) raised", exc_info=True
+                    )
+            if remote_agent_name is not None:
+                try:
+                    self._nixl.remove_remote_agent(remote_agent_name)
+                except Exception:  # noqa: BLE001
+                    logger.debug("ec: remove_remote_agent raised", exc_info=True)
+            try:
+                self._nixl.deregister_memory(reg_descs)
+            except Exception:  # noqa: BLE001
+                logger.debug("ec: deregister_memory raised", exc_info=True)
 
     def register_caches(
         self,
