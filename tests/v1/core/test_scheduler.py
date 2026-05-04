@@ -4339,7 +4339,10 @@ def test_ec_connector_has_cache_item_none_defers_request(use_kv_connector):
     _assert_right_encoder_cache_allocated(scheduler, expected_total_allocated=0)
 
     # No KV cache allocated for the deferred request
-    assert request_deferred.request_id not in output.scheduled_new_reqs_ids
+    assert all(
+        req.request_id != request_deferred.request_id
+        for req in output.scheduled_new_reqs
+    )
 
     # The text-only request behind the deferred one MUST still be scheduled
     assert request_behind.request_id in output.num_scheduled_tokens
