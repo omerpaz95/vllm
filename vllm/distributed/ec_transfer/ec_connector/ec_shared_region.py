@@ -88,7 +88,31 @@ class ECSharedRegion:
         )
         self.is_pinned: bool = False
 
+        # Scheduler-only free list of block indices.  Workers that also
+        # instantiate ECSharedRegion get their own (unused) copy.
+        self._free_blocks: list[int] = list(range(num_blocks))
+
         self.blocks: torch.Tensor = self._base.view(num_blocks, block_size_bytes)
+
+    def alloc(self, n: int) -> list[int]:
+        """Allocate ``n`` block indices from the free list.
+
+        Returns a list of ints — these are the only way callers refer to
+        a piece of the region, because indices serialize over ZMQ, flow
+        to worker processes via connector metadata, and drive NIXL desc
+        offset math.  For raw bytes, use ``region.blocks[indices]``.
+        """
+        if len(self._free_blocks) < n:
+            raise RuntimeError(
+                f"ECSharedRegion exhausted: need {n} blocks, "
+                f"{len(self._free_blocks)} free"
+            )
+        out, self._free_blocks = self._free_blocks[:n], self._free_blocks[n:]
+        return out
+
+    def free(self, indices: list[int]) -> None:
+        """Return ``indices`` to the free list.  Idempotent on the caller's side."""
+        self._free_blocks.extend(indices)
 
     def pin_memory(self) -> None:
         """Register the entire mmap as CUDA pinned memory for fast DMA."""
