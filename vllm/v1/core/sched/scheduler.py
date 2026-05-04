@@ -1260,11 +1260,14 @@ class Scheduler(SchedulerInterface):
                 has_item = self.ec_connector.has_cache_item(item_identifier)
                 if has_item is None and allow_defer:
                     return None
-                if has_item:
+                if has_item is True:
                     mm_hashes_to_schedule.add(item_identifier)
                     external_load_encoder_input.append(i)
                     num_embeds_to_schedule += num_encoder_embeds
                     continue
+                # has_item is False, or None with allow_defer=False
+                # (running requests can't be deferred — fall through
+                # to local encoder compute).
 
             num_embeds_to_schedule += num_encoder_embeds
             encoder_compute_budget -= num_encoder_embeds

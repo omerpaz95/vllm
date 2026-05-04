@@ -4334,15 +4334,10 @@ def test_ec_connector_has_cache_item_none_defers_request(use_kv_connector):
 
     # Deferred request must NOT be scheduled
     assert request_deferred.request_id not in output.num_scheduled_tokens
-
-    # No encoder cache allocated for the deferred request
     _assert_right_encoder_cache_allocated(scheduler, expected_total_allocated=0)
-
-    # No KV cache allocated for the deferred request
-    assert all(
-        req.request_id != request_deferred.request_id
-        for req in output.scheduled_new_reqs
-    )
+    # No KV blocks allocated for the deferred request
+    for mgr in scheduler.kv_cache_manager.coordinator.single_type_managers:
+        assert request_deferred.request_id not in mgr.req_to_blocks
 
     # The text-only request behind the deferred one MUST still be scheduled
     assert request_behind.request_id in output.num_scheduled_tokens
@@ -4350,23 +4345,16 @@ def test_ec_connector_has_cache_item_none_defers_request(use_kv_connector):
 
     # --- Step 2: has_cache_item returns True → request scheduled ---
     scheduler.ec_connector.has_cache_item = Mock(return_value=True)
-    scheduler.ec_connector.update_state_after_alloc = Mock(
-        wraps=scheduler.ec_connector.update_state_after_alloc
-    )
 
     output = scheduler.schedule()
 
     # Now the deferred request should be scheduled
     assert request_deferred.request_id in output.num_scheduled_tokens
     assert output.num_scheduled_tokens[request_deferred.request_id] == NUM_TOKENS
-
-    # Encoder cache should be allocated
     _assert_right_encoder_cache_allocated(scheduler, requests=[request_deferred])
-
     # EC connector metadata should carry the deferred request's MM data
     _assert_right_ec_connector_metadata(
         output, mm_features_list=request_deferred.mm_features
     )
-
     # No local encoder compute — all loaded externally
     _assert_right_encoder_inputs(output, expected_total_reqs=0)
