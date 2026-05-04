@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import threading
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import msgspec
 import msgspec.msgpack
 import torch
 import zmq
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
@@ -19,12 +22,14 @@ from vllm.distributed.ec_transfer.ec_connector.ec_shared_region import (
     ECSharedRegion,
 )
 from vllm.distributed.ec_transfer.ec_connector.messages import (
+    XferAck,
     XferReq,
     compute_ec_compatibility_hash,
 )
 from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -176,7 +181,6 @@ class ECCPUConnector(ECConnectorBase):
         ec_config,
         num_ec_blocks: int,
     ) -> None:
-        # Producer-side init — scaffolded here; listener thread added in Task 7.
         self._encodings: dict[str, torch.Tensor] = {}
         self._waiting: dict[str, tuple[bytes, XferReq]] = {}
         if NixlWrapper is not None:
@@ -192,10 +196,75 @@ class ECCPUConnector(ECConnectorBase):
                 "will not be able to send encodings via NIXL transfer."
             )
         self._mem_type = current_platform.get_nixl_memory_type()
+        self._device_id = 0
+
         self._zmq_ctx = zmq.Context.instance()
-        self._router: zmq.Socket | None = None
-        self._listener_thread: threading.Thread | None = None
-        self._stop_event: threading.Event | None = None
+        host = envs.VLLM_EC_SIDE_CHANNEL_HOST
+        port = envs.VLLM_EC_SIDE_CHANNEL_PORT
+        path = make_zmq_path("tcp", host, port)
+        self._router = make_zmq_socket(self._zmq_ctx, path, zmq.ROUTER, bind=True)
+        self._router.setsockopt(zmq.RCVTIMEO, 500)
+        self._stop_event = threading.Event()
+        self._listener_thread = threading.Thread(
+            target=self._run_listener,
+            name="ec-listener",
+            daemon=True,
+        )
+        self._listener_thread.start()
+
+    def _run_listener(self) -> None:
+        assert self._router is not None
+        assert self._stop_event is not None
+        decoder = msgspec.msgpack.Decoder(XferReq)
+        while not self._stop_event.is_set():
+            try:
+                frames = self._router.recv_multipart()
+                # DEALER→ROUTER: [identity, payload] (2 frames)
+                # REQ→ROUTER:   [identity, b"", payload] (3 frames)
+                if len(frames) == 2:
+                    identity, payload = frames
+                elif len(frames) == 3:
+                    identity, _, payload = frames
+                else:
+                    logger.warning("ec: unexpected frame count %d", len(frames))
+                    continue
+            except zmq.Again:
+                continue
+            except zmq.ContextTerminated:
+                return
+            try:
+                req = decoder.decode(payload)
+            except (msgspec.DecodeError, msgspec.ValidationError):
+                logger.warning("ec: dropped malformed XferReq")
+                continue
+
+            if req.compatibility_hash != self._compat_hash:
+                logger.warning(
+                    "ec: compatibility hash mismatch from consumer %s",
+                    req.consumer_agent_name,
+                )
+                self._send_ack(identity, req.mm_hash, ok=False)
+                continue
+
+            tensor = self._encodings.get(req.mm_hash)
+            if tensor is None:
+                self._waiting[req.mm_hash] = (identity, req)
+                continue
+
+            ok = self._do_nixl_xfer(req, tensor)
+            self._send_ack(identity, req.mm_hash, ok)
+
+    def _send_ack(self, identity: bytes, mm_hash: str, ok: bool) -> None:
+        assert self._router is not None
+        payload = msgspec.msgpack.encode(XferAck(mm_hash=mm_hash, ok=ok))
+        # DEALER receives [payload]; ROUTER must send [identity, payload].
+        with contextlib.suppress(zmq.ContextTerminated):
+            self._router.send_multipart([identity, payload])
+
+    def _do_nixl_xfer(self, req: "XferReq", tensor: "torch.Tensor") -> bool:
+        # Stub: implemented in Task 8.  Returns False.
+        _ = (req, tensor)
+        return False
 
     def register_caches(
         self,
