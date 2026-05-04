@@ -34,7 +34,6 @@ from vllm.config import (
 )
 from vllm.config.cache import CacheConfig
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
-from vllm.distributed.ec_transfer.ec_connector.base import EncoderConfig
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
@@ -505,7 +504,6 @@ class GPUModelRunner(
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
-        self.encoder_config: EncoderConfig | None = None
         self.late_interaction_runner = LateInteractionRunner()
 
         # Encoder CUDA graph manager (initialized after model load if enabled)
@@ -5849,13 +5847,6 @@ class GPUModelRunner(
                         )
                         for i, output in enumerate(dummy_encoder_outputs):
                             self.encoder_cache[f"tmp_{i}"] = output
-
-                        last_output = dummy_encoder_outputs[-1]
-                        self.encoder_config = EncoderConfig(
-                            hidden_dim=last_output.shape[-1],
-                            dtype=last_output.dtype,
-                            element_size=last_output.element_size(),
-                        )
 
         # Add `is_profile` here to pre-allocate communication buffers
         hidden_states, last_hidden_states = self._dummy_run(

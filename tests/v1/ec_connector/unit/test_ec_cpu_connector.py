@@ -10,10 +10,7 @@ import pytest
 import torch
 
 from vllm.config import VllmConfig
-from vllm.distributed.ec_transfer.ec_connector.base import (
-    ECConnectorRole,
-    EncoderConfig,
-)
+from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
 from vllm.distributed.ec_transfer.ec_connector.cpu_connector import (
     ECCPUConnector,
     ECCPUConnectorMetadata,
@@ -24,10 +21,7 @@ NUM_BLOCKS = 16
 HIDDEN_DIM = 32
 DTYPE = torch.float32
 ELEMENT_SIZE = 4  # float32
-
-ENCODER_CONFIG = EncoderConfig(
-    hidden_dim=HIDDEN_DIM, dtype=DTYPE, element_size=ELEMENT_SIZE
-)
+BLOCK_SIZE_BYTES = HIDDEN_DIM * ELEMENT_SIZE
 
 
 def _make_mock_config(
@@ -46,6 +40,9 @@ def _make_mock_config(
     config.parallel_config = Mock()
     config.parallel_config.world_size = world_size
     config.parallel_config.rank = rank
+    config.model_config = Mock()
+    config.model_config.get_inputs_embeds_size.return_value = HIDDEN_DIM
+    config.model_config.dtype = DTYPE
     return config
 
 
@@ -54,22 +51,20 @@ def _make_worker_connector(
 ) -> ECCPUConnector:
     """Create a worker connector with ECSharedRegion patched out."""
     config = _make_mock_config(num_ec_blocks=num_ec_blocks)
-    connector = ECCPUConnector(
-        vllm_config=config,
-        role=ECConnectorRole.WORKER,
-    )
 
-    block_size_bytes = ENCODER_CONFIG.block_size_bytes
+    cpu_blocks = torch.arange(
+        num_ec_blocks * BLOCK_SIZE_BYTES,
+        dtype=torch.uint8,
+    ).reshape(num_ec_blocks, BLOCK_SIZE_BYTES)
+
     with patch(
         "vllm.distributed.ec_transfer.ec_connector.cpu_connector.ECSharedRegion"
     ) as mock_region_cls:
-        cpu_blocks = torch.arange(
-            num_ec_blocks * block_size_bytes,
-            dtype=torch.uint8,
-        ).reshape(num_ec_blocks, block_size_bytes)
         mock_region_cls.return_value.blocks = cpu_blocks
-
-        connector.register_caches(ENCODER_CONFIG)
+        connector = ECCPUConnector(
+            vllm_config=config,
+            role=ECConnectorRole.WORKER,
+        )
     return connector
 
 
@@ -156,7 +151,7 @@ class TestStartLoadCaches:
     ):
         mock_platform.device_type = "cpu"
 
-        existing_tensor = torch.zeros(2, ENCODER_CONFIG.block_size_bytes)
+        existing_tensor = torch.zeros(2, BLOCK_SIZE_BYTES)
         encoder_cache: dict[str, torch.Tensor] = {"hash_a": existing_tensor}
 
         metadata = ECCPUConnectorMetadata(mm_hash_to_cpu_blocks={"hash_a": [0, 1]})
