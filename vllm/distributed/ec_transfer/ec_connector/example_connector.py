@@ -120,7 +120,7 @@ class ECExampleConnector(ECConnectorBase):
     def has_cache_item(
         self,
         identifier: str,
-    ) -> bool:
+    ) -> bool | None:
         """
         Check if cache exist externally for the media
 
@@ -128,7 +128,8 @@ class ECExampleConnector(ECConnectorBase):
             identifier (str): the identifier of the media.
 
         Returns:
-            Bool indicate that media exists in cache or not
+            True/False if cache status is known, or None if the
+            lookup is pending / not yet determined.
         """
         return self._found_match_for_mm_data(identifier)
 

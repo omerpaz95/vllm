@@ -4288,3 +4288,82 @@ def test_eagle3_mm_encoder_cache_with_shift():
         f"shifted_end={scheduled_end_with_shift}) overlapping MM at "
         f"{start_pos}. The fix must schedule encoder inputs."
     )
+
+
+@pytest.mark.parametrize("use_kv_connector", [False, True])
+def test_ec_connector_has_cache_item_none_defers_request(use_kv_connector):
+    """Test that has_cache_item() returning None defers the request.
+
+    When the EC connector can't yet determine whether an encoding exists
+    (returns None), the scheduler should:
+    1. Not schedule the request (no KV cache or encoder cache allocated)
+    2. Still schedule other requests behind the deferred one
+    3. Schedule the deferred request on the next step when has_cache_item
+       returns a definite answer
+    """
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        enable_prefix_caching=True,
+        use_kv_connector=use_kv_connector,
+        use_ec_connector=True,
+        ec_role="ec_consumer",
+    )
+
+    NUM_TOKENS = 200
+    NUM_ENCODER_TOKENS = 100
+
+    request_deferred = create_requests(
+        num_requests=1,
+        num_tokens=NUM_TOKENS,
+        mm_positions=[[PlaceholderRange(offset=0, length=NUM_ENCODER_TOKENS)]],
+        req_ids=["deferred"],
+    )[0]
+
+    request_behind = create_requests(
+        num_requests=1,
+        num_tokens=20,
+        req_ids=["behind"],
+    )[0]
+
+    # --- Step 1: has_cache_item returns None → request deferred ---
+    scheduler.ec_connector.has_cache_item = Mock(return_value=None)
+
+    scheduler.add_request(request_deferred)
+    scheduler.add_request(request_behind)
+    output = scheduler.schedule()
+
+    # Deferred request must NOT be scheduled
+    assert request_deferred.request_id not in output.num_scheduled_tokens
+
+    # No encoder cache allocated for the deferred request
+    _assert_right_encoder_cache_allocated(scheduler, expected_total_allocated=0)
+
+    # No KV cache allocated for the deferred request
+    assert request_deferred.request_id not in output.scheduled_new_reqs_ids
+
+    # The text-only request behind the deferred one MUST still be scheduled
+    assert request_behind.request_id in output.num_scheduled_tokens
+    assert output.num_scheduled_tokens[request_behind.request_id] == 20
+
+    # --- Step 2: has_cache_item returns True → request scheduled ---
+    scheduler.ec_connector.has_cache_item = Mock(return_value=True)
+    scheduler.ec_connector.update_state_after_alloc = Mock(
+        wraps=scheduler.ec_connector.update_state_after_alloc
+    )
+
+    output = scheduler.schedule()
+
+    # Now the deferred request should be scheduled
+    assert request_deferred.request_id in output.num_scheduled_tokens
+    assert output.num_scheduled_tokens[request_deferred.request_id] == NUM_TOKENS
+
+    # Encoder cache should be allocated
+    _assert_right_encoder_cache_allocated(scheduler, requests=[request_deferred])
+
+    # EC connector metadata should carry the deferred request's MM data
+    _assert_right_ec_connector_metadata(
+        output, mm_features_list=request_deferred.mm_features
+    )
+
+    # No local encoder compute — all loaded externally
+    _assert_right_encoder_inputs(output, expected_total_reqs=0)

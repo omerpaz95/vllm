@@ -190,7 +190,7 @@ class ECConnectorBase(ABC):
     def has_cache_item(
         self,
         identifier: str,
-    ) -> bool:
+    ) -> bool | None:
         """
         Check if a single encoder cache exists
 
@@ -198,8 +198,10 @@ class ECConnectorBase(ABC):
             identifier (str): the identifier of the media.
 
         Returns:
-            A bool where value is True if cache exist for
-            the media
+            True if cache exists for the media, False if it does not,
+            or None if the lookup is pending / not yet determined.
+            When None is returned for a waiting request, the scheduler
+            defers the request's prefill until the next scheduling step.
         """
         pass
 
