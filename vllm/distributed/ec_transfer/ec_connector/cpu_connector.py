@@ -55,17 +55,13 @@ class ECCPUConnector(ECConnectorBase):
             block_size_bytes = hidden_dim * element_size
 
             num_ec_blocks = int(ec_config.get_from_extra_config("num_ec_blocks", 256))
-            num_workers = vllm_config.parallel_config.world_size
-            rank = vllm_config.parallel_config.rank
 
             self._region = ECSharedRegion(
                 instance_id=ec_config.engine_id,
                 num_blocks=num_ec_blocks,
                 block_size_bytes=block_size_bytes,
-                num_workers=num_workers,
-                rank=rank,
             )
-            if is_pin_memory_available():
+            if is_pin_memory_available() and vllm_config.parallel_config.rank == 0:
                 self._region.pin_memory()
             self._cpu_blocks = self._region.blocks
 

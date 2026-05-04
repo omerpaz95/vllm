@@ -26,8 +26,6 @@ BLOCK_SIZE_BYTES = HIDDEN_DIM * ELEMENT_SIZE
 
 def _make_mock_config(
     num_ec_blocks: int = NUM_BLOCKS,
-    world_size: int = 1,
-    rank: int = 0,
 ) -> Mock:
     config = Mock(spec=VllmConfig)
     config.ec_transfer_config = Mock()
@@ -38,8 +36,7 @@ def _make_mock_config(
         "num_ec_blocks": num_ec_blocks,
     }.get(key, default)
     config.parallel_config = Mock()
-    config.parallel_config.world_size = world_size
-    config.parallel_config.rank = rank
+    config.parallel_config.rank = 0
     config.model_config = Mock()
     config.model_config.get_inputs_embeds_size.return_value = HIDDEN_DIM
     config.model_config.dtype = DTYPE
