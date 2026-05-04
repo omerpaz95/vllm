@@ -265,3 +265,12 @@ class ECConnectorBase(ABC):
             get_finished().
         """
         return False, None
+
+    def shutdown(self) -> None:
+        """Release connector resources.
+
+        Subclasses override to close sockets, join threads, and release
+        NIXL state.  The default is a no-op so callers can invoke it
+        unconditionally.
+        """
+        return
