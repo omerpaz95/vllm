@@ -113,3 +113,47 @@ def test_consumer_scheduler_exports_agent_metadata_and_descriptor(vllm_config):
             assert len(conn._mem_descriptor_bytes) > 0
         finally:
             conn.shutdown()
+
+
+def test_has_cache_item_returns_false_for_unknown(vllm_config):
+    with patch(
+        "vllm.distributed.ec_transfer.ec_connector.cpu_connector.NixlWrapper",
+        FakeNixlWrapper,
+    ):
+        conn = ECCPUConnector(vllm_config, ECConnectorRole.SCHEDULER)
+        try:
+            assert conn.has_cache_item("nope") is False
+        finally:
+            conn.shutdown()
+
+
+def test_has_cache_item_none_then_true_on_ack(vllm_config):
+    with patch(
+        "vllm.distributed.ec_transfer.ec_connector.cpu_connector.NixlWrapper",
+        FakeNixlWrapper,
+    ):
+        conn = ECCPUConnector(vllm_config, ECConnectorRole.SCHEDULER)
+        try:
+            conn._encoding_map["h"] = [0, 1, 2]
+            assert conn.has_cache_item("h") is None
+            conn._complete("h", ok=True)
+            assert conn.has_cache_item("h") is True
+        finally:
+            conn.shutdown()
+
+
+def test_complete_on_fail_frees_blocks(vllm_config):
+    with patch(
+        "vllm.distributed.ec_transfer.ec_connector.cpu_connector.NixlWrapper",
+        FakeNixlWrapper,
+    ):
+        conn = ECCPUConnector(vllm_config, ECConnectorRole.SCHEDULER)
+        try:
+            indices = conn._region.alloc(3)
+            conn._encoding_map["h"] = indices
+            conn._complete("h", ok=False)
+            assert "h" not in conn._encoding_map
+            # Blocks returned to the free list.
+            assert set(indices) <= set(conn._region._free_blocks)
+        finally:
+            conn.shutdown()

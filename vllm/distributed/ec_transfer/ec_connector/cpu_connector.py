@@ -405,7 +405,39 @@ class ECCPUConnector(ECConnectorBase):
         self,
         identifier: str,
     ) -> bool | None:
-        raise NotImplementedError
+        if not self.is_consumer:
+            return False
+        self._drain_acks()
+        if identifier in self._ready:
+            return True
+        if identifier in self._encoding_map:
+            return None
+        return False
+
+    def _drain_acks(self) -> None:
+        decoder = msgspec.msgpack.Decoder(XferAck)
+        for sock in self._dealers.values():
+            while True:
+                try:
+                    payload = sock.recv(flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    break
+                try:
+                    ack = decoder.decode(payload)
+                except (msgspec.DecodeError, msgspec.ValidationError):
+                    logger.warning("ec: dropped malformed XferAck")
+                    continue
+                self._complete(ack.mm_hash, ack.ok)
+
+    def _complete(self, mm_hash: str, ok: bool) -> None:
+        if mm_hash not in self._encoding_map:
+            return  # stale / duplicate ack
+        if ok:
+            self._ready.add(mm_hash)
+        else:
+            indices = self._encoding_map.pop(mm_hash)
+            assert self._region is not None
+            self._region.free(indices)
 
     def update_state_after_alloc(self, request: "Request", index: int):
         raise NotImplementedError
