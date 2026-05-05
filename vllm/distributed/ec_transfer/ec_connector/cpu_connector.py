@@ -439,8 +439,56 @@ class ECCPUConnector(ECConnectorBase):
             assert self._region is not None
             self._region.free(indices)
 
-    def update_state_after_alloc(self, request: "Request", index: int):
-        raise NotImplementedError
+    def update_state_after_alloc(self, request: "Request", index: int) -> None:
+        if not self.is_consumer:
+            return
+        feature = request.mm_features[index]
+        mm_hash = feature.mm_hash or feature.identifier
+        if mm_hash in self._encoding_map:
+            return
+
+        n = feature.mm_position.length
+        assert self._region is not None
+        indices = self._region.alloc(n)
+        self._encoding_map[mm_hash] = indices
+
+        addr = self._resolve_encoder_address(request, feature)
+        dealer = self._get_or_create_dealer(addr)
+        xfer = XferReq(
+            mm_hash=mm_hash,
+            dst_block_indices=indices,
+            consumer_agent_name=self._nixl_agent_name,
+            consumer_nixl_metadata=self._agent_metadata,
+            consumer_mem_descriptor=self._mem_descriptor_bytes,
+            compatibility_hash=self._compat_hash,
+        )
+        dealer.send(msgspec.msgpack.encode(xfer))
+
+    def _resolve_encoder_address(self, request: "Request", feature) -> tuple[str, int]:
+        # Preferred path (future PR): the request carries it in kv_transfer_params.
+        params = getattr(request, "kv_transfer_params", None) or {}
+        raw = params.get("encoder_node_address")
+        if raw is None:
+            raw = self._vllm_config.ec_transfer_config.get_from_extra_config(
+                "default_encoder_node", None
+            )
+        if raw is None:
+            raise RuntimeError(
+                "EC consumer has no encoder node address: set "
+                "ec_connector_extra_config.default_encoder_node or populate "
+                "kv_transfer_params.encoder_node_address on the request."
+            )
+        host, _, port = raw.rpartition(":")
+        return host, int(port)
+
+    def _get_or_create_dealer(self, addr: tuple[str, int]) -> zmq.Socket:
+        sock = self._dealers.get(addr)
+        if sock is not None:
+            return sock
+        path = make_zmq_path("tcp", addr[0], addr[1])
+        sock = make_zmq_socket(self._zmq_ctx, path, zmq.DEALER, bind=False)
+        self._dealers[addr] = sock
+        return sock
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

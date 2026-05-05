@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import zmq
 
 from tests.v1.ec_connector._fakes import FakeNixlWrapper, reset_agents
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
@@ -155,5 +156,87 @@ def test_complete_on_fail_frees_blocks(vllm_config):
             assert "h" not in conn._encoding_map
             # Blocks returned to the free list.
             assert set(indices) <= set(conn._region._free_blocks)
+        finally:
+            conn.shutdown()
+
+
+class _FakeMMFeature:
+    def __init__(self, mm_hash: str, length: int):
+        self.mm_hash = mm_hash
+        self.identifier = mm_hash
+
+        class _Pos:
+            length: int
+
+        self.mm_position = _Pos()
+        self.mm_position.length = length
+
+
+class _FakeRequest:
+    def __init__(self, features):
+        self.mm_features = features
+        self.kv_transfer_params = None
+
+
+def test_update_state_after_alloc_sends_xfer_req(vllm_config):
+    with patch(
+        "vllm.distributed.ec_transfer.ec_connector.cpu_connector.NixlWrapper",
+        FakeNixlWrapper,
+    ):
+        conn = ECCPUConnector(vllm_config, ECConnectorRole.SCHEDULER)
+        try:
+            # Start a ROUTER to stand in for the E node.
+            import msgspec as _ms
+
+            ctx = zmq.Context.instance()
+            router = ctx.socket(zmq.ROUTER)
+            router.bind("tcp://127.0.0.1:65000")
+            router.setsockopt(zmq.RCVTIMEO, 2000)
+
+            from vllm.distributed.ec_transfer.ec_connector.messages import XferReq
+
+            req = _FakeRequest([_FakeMMFeature("hash-1", length=3)])
+            conn.update_state_after_alloc(req, 0)
+
+            frames = router.recv_multipart()
+            # DEALER→ROUTER is 2 frames: [identity, payload]
+            payload = frames[-1]
+            decoded = _ms.msgpack.decode(payload, type=XferReq)
+            assert decoded.mm_hash == "hash-1"
+            assert decoded.dst_block_indices == [0, 1, 2]
+            assert decoded.compatibility_hash == conn._compat_hash
+            assert decoded.consumer_nixl_metadata == conn._agent_metadata
+            assert decoded.consumer_mem_descriptor == conn._mem_descriptor_bytes
+            router.close(linger=0)
+        finally:
+            conn.shutdown()
+
+
+def test_update_state_after_alloc_is_idempotent(vllm_config):
+    with patch(
+        "vllm.distributed.ec_transfer.ec_connector.cpu_connector.NixlWrapper",
+        FakeNixlWrapper,
+    ):
+        conn = ECCPUConnector(vllm_config, ECConnectorRole.SCHEDULER)
+        try:
+            ctx = zmq.Context.instance()
+            router = ctx.socket(zmq.ROUTER)
+            router.bind("tcp://127.0.0.1:65001")
+            router.setsockopt(zmq.RCVTIMEO, 500)
+
+            # Override resolve_encoder_address via extra config.
+            conn._vllm_config.ec_transfer_config.ec_connector_extra_config[
+                "default_encoder_node"
+            ] = "127.0.0.1:65001"
+
+            feat = _FakeMMFeature("dup", length=2)
+            req = _FakeRequest([feat])
+            conn.update_state_after_alloc(req, 0)
+            conn.update_state_after_alloc(req, 0)  # second call: no-op
+
+            router.recv_multipart()  # only one XferReq expected
+            with pytest.raises(zmq.Again):
+                router.recv_multipart()
+            router.close(linger=0)
         finally:
             conn.shutdown()
