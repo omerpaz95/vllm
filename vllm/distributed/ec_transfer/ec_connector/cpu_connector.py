@@ -493,11 +493,13 @@ class ECCPUConnector(ECConnectorBase):
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> ECCPUConnectorMetadata:
-        meta = ECCPUConnectorMetadata(
-            mm_hash_to_cpu_blocks=self._encoding_map,
-        )
-        self._encoding_map = {}
-        return meta
+        if self.is_consumer:
+            self._drain_acks()
+            mapping = {h: self._encoding_map.pop(h) for h in self._ready}
+            self._ready.clear()
+            return ECCPUConnectorMetadata(mm_hash_to_cpu_blocks=mapping)
+        # Producer-only role never has anything to hand to local workers.
+        return ECCPUConnectorMetadata(mm_hash_to_cpu_blocks={})
 
     def shutdown(self) -> None:
         if self.role != ECConnectorRole.SCHEDULER:

@@ -240,3 +240,31 @@ def test_update_state_after_alloc_is_idempotent(vllm_config):
             router.close(linger=0)
         finally:
             conn.shutdown()
+
+
+def test_build_connector_meta_hands_off_ready_entries(vllm_config):
+    with patch(
+        "vllm.distributed.ec_transfer.ec_connector.cpu_connector.NixlWrapper",
+        FakeNixlWrapper,
+    ):
+        conn = ECCPUConnector(vllm_config, ECConnectorRole.SCHEDULER)
+        try:
+            conn._encoding_map["a"] = [0, 1]
+            conn._encoding_map["b"] = [2, 3]
+            conn._ready = {"a"}  # only 'a' is ready
+
+            class _SO:
+                pass
+
+            meta = conn.build_connector_meta(_SO())
+
+            assert meta.mm_hash_to_cpu_blocks == {"a": [0, 1]}
+            # 'a' handed off and cleared; 'b' still pending.
+            assert "a" not in conn._encoding_map
+            assert conn._encoding_map == {"b": [2, 3]}
+            assert conn._ready == set()
+            # Second call returns empty mapping.
+            meta2 = conn.build_connector_meta(_SO())
+            assert meta2.mm_hash_to_cpu_blocks == {}
+        finally:
+            conn.shutdown()

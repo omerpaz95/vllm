@@ -80,11 +80,12 @@ def worker_connector():
 
 
 class TestBuildConnectorMeta:
-    def test_returns_metadata_with_encoding_map(self, scheduler_connector):
+    def test_returns_metadata_with_ready_entries(self, scheduler_connector):
         scheduler_connector._encoding_map = {
             "hash_a": [0, 1, 2],
             "hash_b": [3, 4],
         }
+        scheduler_connector._ready = {"hash_a", "hash_b"}
         scheduler_output = Mock(spec=SchedulerOutput)
 
         meta = scheduler_connector.build_connector_meta(scheduler_output)
@@ -95,24 +96,30 @@ class TestBuildConnectorMeta:
             "hash_b": [3, 4],
         }
 
-    def test_resets_encoding_map_after_build(self, scheduler_connector):
+    def test_pending_entries_not_handed_off(self, scheduler_connector):
+        # _encoding_map holds everything; only entries also in _ready leave.
         scheduler_connector._encoding_map = {
             "hash_a": [0, 1],
             "hash_b": [2, 3],
         }
+        scheduler_connector._ready = {"hash_a"}
         scheduler_output = Mock(spec=SchedulerOutput)
 
-        scheduler_connector.build_connector_meta(scheduler_output)
+        meta = scheduler_connector.build_connector_meta(scheduler_output)
 
-        assert scheduler_connector._encoding_map == {}
+        assert meta.mm_hash_to_cpu_blocks == {"hash_a": [0, 1]}
+        assert scheduler_connector._encoding_map == {"hash_b": [2, 3]}
+        assert scheduler_connector._ready == set()
 
     def test_consecutive_builds_are_independent(self, scheduler_connector):
         scheduler_output = Mock(spec=SchedulerOutput)
 
         scheduler_connector._encoding_map = {"hash_a": [0, 1]}
+        scheduler_connector._ready = {"hash_a"}
         meta1 = scheduler_connector.build_connector_meta(scheduler_output)
 
         scheduler_connector._encoding_map = {"hash_b": [5, 6]}
+        scheduler_connector._ready = {"hash_b"}
         meta2 = scheduler_connector.build_connector_meta(scheduler_output)
 
         assert meta1.mm_hash_to_cpu_blocks == {"hash_a": [0, 1]}
