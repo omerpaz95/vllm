@@ -204,3 +204,59 @@ def test_producer_dispatches_when_encoding_present(producer_config):
             dealer.close(linger=0)
         finally:
             conn.shutdown()
+
+
+def test_drain_waiting_fires_parked_request(producer_config):
+    import ctypes
+
+    cfg, port = producer_config
+    with patch(
+        "vllm.distributed.ec_transfer.ec_connector.cpu_connector.NixlWrapper",
+        FakeNixlWrapper,
+    ):
+        conn = ECCPUConnector(cfg, ECConnectorRole.SCHEDULER)
+        try:
+            # Client sends XferReq before producer has the encoding.
+            consumer = FakeNixlWrapper("c-agent")
+            n = 2
+            block_size = conn._block_size_bytes
+            dst_buf = (ctypes.c_ubyte * (n * block_size))()
+            dst_addr = ctypes.addressof(dst_buf)
+            dst_tuples = [(dst_addr + i * block_size, block_size, 0) for i in range(n)]
+            consumer_mem_descriptor = msgspec.msgpack.encode(dst_tuples)
+
+            ctx = zmq.Context.instance()
+            dealer = ctx.socket(zmq.DEALER)
+            dealer.connect(f"tcp://127.0.0.1:{port}")
+
+            req = XferReq(
+                mm_hash="later",
+                dst_block_indices=list(range(n)),
+                consumer_agent_name=consumer.name,
+                consumer_nixl_metadata=consumer.get_agent_metadata(),
+                consumer_mem_descriptor=consumer_mem_descriptor,
+                compatibility_hash=conn._compat_hash,
+            )
+            dealer.send(msgspec.msgpack.encode(req))
+
+            # Wait for listener to park it.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and "later" not in conn._waiting:
+                time.sleep(0.01)
+            assert "later" in conn._waiting
+
+            # Populate encoding and trigger drain.
+            tensor = torch.full((n * block_size,), 7, dtype=torch.uint8).contiguous()
+            conn._encodings["later"] = tensor
+            conn._drain_waiting("later")
+
+            dealer.setsockopt(zmq.RCVTIMEO, 2000)
+            frames = dealer.recv_multipart()
+            ack = msgspec.msgpack.decode(frames[-1], type=XferAck)
+            assert ack.ok is True
+            assert ack.mm_hash == "later"
+            assert list(dst_buf) == [7] * (n * block_size)
+            assert "later" not in conn._waiting
+            dealer.close(linger=0)
+        finally:
+            conn.shutdown()

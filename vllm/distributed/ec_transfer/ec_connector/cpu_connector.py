@@ -262,6 +262,19 @@ class ECCPUConnector(ECConnectorBase):
         with contextlib.suppress(zmq.ContextTerminated):
             self._router.send_multipart([identity, payload])
 
+    def _drain_waiting(self, mm_hash: str) -> None:
+        """Triggered by future save_caches after populating _encodings."""
+        entry = self._waiting.pop(mm_hash, None)
+        if entry is None:
+            return
+        identity, req = entry
+        tensor = self._encodings.get(mm_hash)
+        if tensor is None:
+            self._send_ack(identity, mm_hash, ok=False)
+            return
+        ok = self._do_nixl_xfer(req, tensor)
+        self._send_ack(identity, mm_hash, ok)
+
     def _do_nixl_xfer(self, req: "XferReq", tensor: "torch.Tensor") -> bool:
         assert self._nixl is not None
         n = len(req.dst_block_indices)
