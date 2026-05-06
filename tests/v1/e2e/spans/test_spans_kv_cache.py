@@ -11,14 +11,18 @@ Tests:
   test_gap_size_larger_than_chunk
       gap_length > block_size → SpanAwareGapPolicy.get_gaps yields an
       interval covering multiple blocks (structural check, no LLM).
-  test_two_requests_same_pic_different_surrounding_blocks
+  test_same_pic_chunk_hashes_match_across_requests_no_recompute
       same PIC chunk in two requests with different prefixes → identical
       chunk hash but different pre-chunk hashes (the "fan-in" guarantee
-      from the user's perspective: same content, different chain).
-  test_legolink_replay_changes_kv_cache
-      LL-FULL + prefix caching, run the same prompt twice. The KV cache
-      after run #2 must differ from the snapshot taken between runs:
-      proves recompute wrote new K/V into the cache.
+      from the user's perspective: same content, different chain). Pure
+      structural hash check, no recompute.
+  test_legolink_recompute_overwrites_pic_chunk_kv_in_place
+      LL-FULL + prefix caching: run the same prompt twice. Run #2 hits the
+      cache, gap policy fires, and the virtual gap request shares the
+      parent's block_ids (see scheduler.py:963-996) → K/V is recomputed
+      and written back into the same physical slots, overwriting them.
+      The KV-cache snapshot after run #2 must differ from the one taken
+      between runs.
 """
 import hashlib
 
@@ -67,10 +71,12 @@ def test_gap_size_larger_than_chunk():
     assert (gap_end - gap_start) // BLOCK_SIZE == 2
 
 
-def test_two_requests_same_pic_different_surrounding_blocks():
-    """Two requests with the same PIC chunk but different surrounding tokens:
-    the chunk block hashes match (position-invariant), the surrounding block
-    hashes do not."""
+def test_same_pic_chunk_hashes_match_across_requests_no_recompute():
+    """Pure block-hash check (NO recompute, no LLM): two requests with the
+    same PIC chunk but different surrounding tokens hash the chunk to the
+    same block hash (fan-in / position-invariant), and the surrounding
+    blocks to different hashes. This is structural — gap policy and runtime
+    K/V overwrite are not involved."""
     original = envs.VLLM_V1_SPANS_ENABLED
     try:
         envs.VLLM_V1_SPANS_ENABLED = True
@@ -137,13 +143,17 @@ def _kv_cache_block_hashes(llm, layer_idx: int) -> list[str]:
     return results[0]
 
 
-def test_legolink_replay_changes_kv_cache(model, monkeypatch):
-    """LL-FULL with prefix caching: cold prefill (run #1) populates the cache
-    with one set of K/V values; cache-hit replay (run #2) recomputes the
-    cached prefix, which must write *new* K/V content into the cache.
-    Therefore the KV-cache snapshot taken after run #2 must differ from the
-    one taken between runs.
-    """
+def test_legolink_recompute_overwrites_pic_chunk_kv_in_place(model, monkeypatch):
+    """End-to-end check that gap-policy recompute actually writes new K/V
+    into the cache (and, by the design at scheduler.py:963-996, into the
+    *same* physical blocks the parent already owns).
+
+    Run #1: cold prefill populates the KV cache with one set of K/V.
+    Run #2: prefix-cache hit, gap policy fires with gap_length >> prompt,
+            virtual gap request runs the model and writes K/V at the
+            recomputed positions back into the parent's block_ids.
+    Therefore the KV-cache snapshot taken after run #2 must differ from
+    the one taken between runs."""
     prompt = "Hello world! Please write a short greeting in one sentence."
     sp = SamplingParams.from_optional(
         seed=SEED, temperature=0.0, max_tokens=MAX_TOKENS

@@ -2411,11 +2411,16 @@ def test_pic_chunk_hash_invariant_across_positions():
 
 
 @pytest.mark.spans
-def test_span_starts_only_change_marked_and_downstream_blocks():
-    """span_starts at position P resets the hash chain at P. Blocks before P
-    keep their hashes; the block at P and every downstream block change because
-    their parent chain changed. This pins the "hashes land where the API call
-    asked" guarantee."""
+def test_span_boundary_resets_block_hash_chain_no_recompute():
+    """Pure block-hash-chain check (NO recompute, no LLM): span_starts at
+    position P resets the hash chain at P at request construction time. Blocks
+    before P keep their hashes; the block AT P and every downstream block
+    change because their parent chain changed.
+
+    This pins the "hashes land where the API call asked" guarantee — i.e. when
+    you ask for span_starts=[20-aligned position], only that block and its
+    downstream see a hash change. Nothing here exercises gap policy / runtime
+    recompute; that's covered by the e2e suite."""
     import vllm.envs as envs
 
     original = envs.VLLM_V1_SPANS_ENABLED
