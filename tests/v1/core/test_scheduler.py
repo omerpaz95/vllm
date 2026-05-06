@@ -4291,15 +4291,15 @@ def test_eagle3_mm_encoder_cache_with_shift():
 
 
 @pytest.mark.parametrize("use_kv_connector", [False, True])
-def test_ec_connector_has_cache_item_none_defers_request(use_kv_connector):
-    """Test that has_cache_item() returning None defers the request.
+def test_ec_connector_has_pending_prefetch_defers_request(use_kv_connector):
+    """Test that has_pending_prefetch() returning True defers the request.
 
-    When the EC connector can't yet determine whether an encoding exists
-    (returns None), the scheduler should:
+    When the EC connector signals a prefetch is in progress (returns True),
+    the scheduler should:
     1. Not schedule the request (no KV cache or encoder cache allocated)
     2. Still schedule other requests behind the deferred one
-    3. Schedule the deferred request on the next step when has_cache_item
-       returns a definite answer
+    3. Schedule the deferred request on the next step when has_pending_prefetch
+       returns False and has_cache_item returns True
     """
     scheduler = create_scheduler(
         model="llava-hf/llava-1.5-7b-hf",
@@ -4325,13 +4325,15 @@ def test_ec_connector_has_cache_item_none_defers_request(use_kv_connector):
         req_ids=["behind"],
     )[0]
 
-    # --- Step 1: has_cache_item returns None → request deferred ---
-    scheduler.ec_connector.has_cache_item = Mock(return_value=None)
+    # --- Step 1: has_pending_prefetch returns True → request deferred ---
+    scheduler.ec_connector.has_pending_prefetch = Mock(return_value=True)
 
     scheduler.add_request(request_deferred)
     scheduler.add_request(request_behind)
     output = scheduler.schedule()
 
+    # has_pending_prefetch must have been the actual gate
+    scheduler.ec_connector.has_pending_prefetch.assert_called()
     # Deferred request must NOT be scheduled
     assert request_deferred.request_id not in output.num_scheduled_tokens
     _assert_right_encoder_cache_allocated(scheduler, expected_total_allocated=0)
@@ -4343,7 +4345,10 @@ def test_ec_connector_has_cache_item_none_defers_request(use_kv_connector):
     assert request_behind.request_id in output.num_scheduled_tokens
     assert output.num_scheduled_tokens[request_behind.request_id] == 20
 
-    # --- Step 2: has_cache_item returns True → request scheduled ---
+    # --- Step 2: prefetch done, cache exists → request scheduled ---
+    # has_cache_item is called inside _try_schedule_encoder_inputs (not during
+    # deferral), so it is only relevant here in step 2.
+    scheduler.ec_connector.has_pending_prefetch = Mock(return_value=False)
     scheduler.ec_connector.has_cache_item = Mock(return_value=True)
 
     output = scheduler.schedule()
