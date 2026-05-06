@@ -60,7 +60,14 @@ def build_llm(
     mode: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> LLM:
-    """Construct an LLM configured for one of FR / SPANS / LL-16 / LL-FULL."""
+    """Construct an LLM configured for one of FR / SPANS / SPANS-PC / LL-16 / LL-FULL.
+
+    SPANS-PC: spans on, prefix caching on, NO gap policy. This is the mode
+    that surfaces "K/V reuse across requests": chunk + tail block hashes
+    collide across requests that share chunk + tail tokens, the cache hits,
+    and no recompute fires - so the K/V bytes stored under those hashes are
+    whichever request wrote them first.
+    """
     if mode == "FR":
         spans_enabled = False
         gap_policy_name = None
@@ -71,6 +78,11 @@ def build_llm(
         gap_policy_name = None
         gap_policy_config = None
         enable_prefix_caching = False
+    elif mode == "SPANS-PC":
+        spans_enabled = True
+        gap_policy_name = None
+        gap_policy_config = None
+        enable_prefix_caching = True
     elif mode == "LL-16":
         spans_enabled = True
         gap_policy_name = "span_aware"
