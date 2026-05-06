@@ -190,7 +190,7 @@ class ECConnectorBase(ABC):
     def has_cache_item(
         self,
         identifier: str,
-    ) -> bool:
+    ) -> bool | None:
         """
         Check if a single encoder cache exists
 
@@ -200,6 +200,9 @@ class ECConnectorBase(ABC):
         Returns:
             A bool where value is True if cache exist for
             the media
+            If None, it means that the connector needs more time to
+            determine whether the item is actually in the cache, or
+            was computed by E node and still isn't available.
         """
         pass
 
@@ -250,3 +253,12 @@ class ECConnectorBase(ABC):
             get_finished().
         """
         return False, None
+
+    def shutdown(self) -> None:
+        """Release connector resources.
+
+        Subclasses override to close sockets, join threads, and release
+        NIXL state.  The default is a no-op so callers can invoke it
+        unconditionally.
+        """
+        return
