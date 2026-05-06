@@ -2172,6 +2172,7 @@ def test_unify_hybrid_kv_cache_specs():
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
 
 
+@pytest.mark.spans
 def test_request_span_metadata_extracted():
     """span_starts/cross_span_starts extracted from extra_args when SPANS_ENABLED."""
     import vllm.envs as envs
@@ -2199,6 +2200,7 @@ def test_request_span_metadata_extracted():
         envs.VLLM_V1_SPANS_ENABLED = original
 
 
+@pytest.mark.spans
 def test_request_span_metadata_ignored_when_disabled():
     """span_starts/cross_span_starts are None when SPANS_ENABLED is False."""
     import vllm.envs as envs
@@ -2226,6 +2228,7 @@ def test_request_span_metadata_ignored_when_disabled():
         envs.VLLM_V1_SPANS_ENABLED = original
 
 
+@pytest.mark.spans
 def test_request_span_metadata_none_when_no_extra_args():
     """span_starts/cross_span_starts are None when extra_args is absent."""
     import vllm.envs as envs
@@ -2247,6 +2250,7 @@ def test_request_span_metadata_none_when_no_extra_args():
         envs.VLLM_V1_SPANS_ENABLED = original
 
 
+@pytest.mark.spans
 def test_request_block_hasher_span_start_resets_hash():
     """Block at a span_start position gets NONE_HASH as parent."""
     import vllm.envs as envs
@@ -2285,6 +2289,7 @@ def test_request_block_hasher_span_start_resets_hash():
         envs.VLLM_V1_SPANS_ENABLED = original
 
 
+@pytest.mark.spans
 def test_request_block_hasher_validates_alignment():
     """span_starts not aligned to block_size raises ValueError."""
     import vllm.envs as envs
@@ -2311,6 +2316,7 @@ def test_request_block_hasher_validates_alignment():
         envs.VLLM_V1_SPANS_ENABLED = original
 
 
+@pytest.mark.spans
 def test_request_block_hasher_cross_span_folds_tokens():
     """Block at a cross_span_starts position folds preceding tokens into extra_keys."""
     import vllm.envs as envs
@@ -2345,5 +2351,117 @@ def test_request_block_hasher_cross_span_folds_tokens():
             expected_extra,
         )
         assert hashes[1] == expected_hash
+    finally:
+        envs.VLLM_V1_SPANS_ENABLED = original
+
+
+def _make_span_request(
+    request_id: str,
+    prompt_token_ids: list[int],
+    block_size: int,
+    span_starts: list[int] | None = None,
+) -> Request:
+    extra_args: dict | None = None
+    if span_starts is not None:
+        extra_args = {"span_starts": span_starts}
+    sampling_params = SamplingParams(max_tokens=17, extra_args=extra_args)
+    sampling_params.update_from_generation_config({}, eos_token_id=100)
+    return Request(
+        request_id=request_id,
+        prompt_token_ids=prompt_token_ids,
+        sampling_params=sampling_params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(block_size, sha256_cbor),
+    )
+
+
+@pytest.mark.spans
+def test_pic_chunk_hash_invariant_across_positions():
+    """A PIC chunk (block at a span_starts boundary) hashes the same regardless
+    of where it appears in a request."""
+    import vllm.envs as envs
+
+    original = envs.VLLM_V1_SPANS_ENABLED
+    try:
+        envs.VLLM_V1_SPANS_ENABLED = True
+        block_size = 16
+        chunk = list(range(100, 116))
+
+        # Request A: 1-block prefix, then chunk at position 16.
+        req_a = _make_span_request(
+            request_id="pic_a",
+            prompt_token_ids=list(range(16)) + chunk,
+            block_size=block_size,
+            span_starts=[16],
+        )
+        # Request B: 3-block prefix (different tokens), then chunk at position 48.
+        req_b = _make_span_request(
+            request_id="pic_b",
+            prompt_token_ids=list(range(200, 248)) + chunk,
+            block_size=block_size,
+            span_starts=[48],
+        )
+
+        assert len(req_a.block_hashes) == 2
+        assert len(req_b.block_hashes) == 4
+        # The PIC chunk's hash is position-invariant.
+        assert req_a.block_hashes[1] == req_b.block_hashes[3]
+    finally:
+        envs.VLLM_V1_SPANS_ENABLED = original
+
+
+@pytest.mark.spans
+def test_span_starts_only_change_marked_and_downstream_blocks():
+    """span_starts at position P resets the hash chain at P. Blocks before P
+    keep their hashes; the block at P and every downstream block change because
+    their parent chain changed. This pins the "hashes land where the API call
+    asked" guarantee."""
+    import vllm.envs as envs
+
+    original = envs.VLLM_V1_SPANS_ENABLED
+    try:
+        envs.VLLM_V1_SPANS_ENABLED = True
+        block_size = 16
+        prompt = list(range(64))  # 4 full blocks: [0..15] [16..31] [32..47] [48..63]
+
+        baseline = _make_span_request(
+            request_id="baseline", prompt_token_ids=prompt, block_size=block_size
+        )
+        marked = _make_span_request(
+            request_id="marked",
+            prompt_token_ids=prompt,
+            block_size=block_size,
+            span_starts=[32],
+        )
+
+        assert len(baseline.block_hashes) == 4
+        assert len(marked.block_hashes) == 4
+
+        # Pre-span blocks: identical.
+        assert marked.block_hashes[0] == baseline.block_hashes[0]
+        assert marked.block_hashes[1] == baseline.block_hashes[1]
+
+        # Marked block: parent reset → must equal a fresh "first-block" hash.
+        expected_marked_block_2 = hash_block_tokens(
+            sha256_cbor,
+            None,
+            tuple(range(32, 48)),
+            None,
+            is_span_start=True,
+        )
+        assert marked.block_hashes[2] == expected_marked_block_2
+        assert marked.block_hashes[2] != baseline.block_hashes[2]
+
+        # Downstream block: parent chain diverged at block 2, so block 3 must
+        # also differ from baseline.
+        assert marked.block_hashes[3] != baseline.block_hashes[3]
+        # ...but it should equal what you'd get by chaining marked.block_hashes[2].
+        expected_marked_block_3 = hash_block_tokens(
+            sha256_cbor,
+            marked.block_hashes[2],
+            tuple(range(48, 64)),
+            None,
+        )
+        assert marked.block_hashes[3] == expected_marked_block_3
     finally:
         envs.VLLM_V1_SPANS_ENABLED = original
