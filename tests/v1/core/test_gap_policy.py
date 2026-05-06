@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
+
 import vllm.envs as envs
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.gap_policy import (
@@ -9,6 +11,8 @@ from vllm.v1.core.sched.gap_policy import (
     SpanAwareGapPolicy,
 )
 from vllm.v1.request import Request
+
+pytestmark = pytest.mark.spans
 
 
 def make_span_request(
