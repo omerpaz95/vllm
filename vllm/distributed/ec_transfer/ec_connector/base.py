@@ -24,6 +24,7 @@ The class provides the following primitives:
 
 import enum
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -190,7 +191,7 @@ class ECConnectorBase(ABC):
     def has_cache_item(
         self,
         identifier: str,
-    ) -> bool | None:
+    ) -> bool:
         """
         Check if a single encoder cache exists
 
@@ -198,10 +199,26 @@ class ECConnectorBase(ABC):
             identifier (str): the identifier of the media.
 
         Returns:
-            True if cache exists for the media, False if it does not,
-            or None if the lookup is pending / not yet determined.
+            A bool where value is True if cache exist for
+            the media
         """
         pass
+
+    @abstractmethod
+    def has_pending_prefetch(self, mm_hashes: Iterable[str]) -> bool:
+        """
+        Check if any of the given mm_hashes need prefetching to CPU.
+        Kicks off async prefetch for hashes that exist remotely
+        but aren't yet in the CPU staging buffer.
+
+        Args:
+            mm_hashes: identifiers of the multimodal inputs.
+
+        Returns:
+            True  - prefetch is in progress, request should be delayed.
+            False - ready to proceed (nothing to fetch, or all fetched).
+        """
+        return False
 
     @abstractmethod
     def update_state_after_alloc(self, request: "Request", index: int):

@@ -425,20 +425,18 @@ class Scheduler(SchedulerInterface):
             external_load_encoder_input: list[int] = []
             new_encoder_compute_budget = encoder_compute_budget
             if request.has_encoder_inputs:
-                result = self._try_schedule_encoder_inputs(
+                (
+                    encoder_inputs_to_schedule,
+                    num_new_tokens,
+                    new_encoder_compute_budget,
+                    external_load_encoder_input,
+                ) = self._try_schedule_encoder_inputs(
                     request,
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
                     shift_computed_tokens=1 if self.use_eagle else 0,
                 )
-                assert result is not None
-                (
-                    encoder_inputs_to_schedule,
-                    num_new_tokens,
-                    new_encoder_compute_budget,
-                    external_load_encoder_input,
-                ) = result
 
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
@@ -648,6 +646,21 @@ class Scheduler(SchedulerInterface):
                     )
                     assert num_computed_tokens <= request.num_tokens
 
+                    # Skip request with pending mm encoding prefetches
+                    if (
+                        self.ec_connector is not None
+                        and request.mm_features
+                        and self.ec_connector.has_pending_prefetch(
+                            f.identifier
+                            for f in request.mm_features
+                            if f.mm_position.offset + f.mm_position.length
+                            > num_computed_tokens
+                        )
+                    ):
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+
                     # Track first scheduled prefill, not post-preemption repeat prefills
                     if request.prefill_stats is not None:
                         assert num_computed_tokens <= request.num_prompt_tokens
@@ -696,24 +709,18 @@ class Scheduler(SchedulerInterface):
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
-                        result = self._try_schedule_encoder_inputs(
-                            request,
-                            num_computed_tokens,
-                            num_new_tokens,
-                            encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
-                            allow_defer=True,
-                        )
-                        if result is None:
-                            request_queue.pop_request()
-                            step_skipped_waiting.prepend_request(request)
-                            continue
                         (
                             encoder_inputs_to_schedule,
                             num_new_tokens,
                             new_encoder_compute_budget,
                             external_load_encoder_input,
-                        ) = result
+                        ) = self._try_schedule_encoder_inputs(
+                            request,
+                            num_computed_tokens,
+                            num_new_tokens,
+                            encoder_compute_budget,
+                            shift_computed_tokens=1 if self.use_eagle else 0,
+                        )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
                             break
@@ -1115,8 +1122,7 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         encoder_compute_budget: int,
         shift_computed_tokens: int = 0,
-        allow_defer: bool = False,
-    ) -> tuple[list[int], int, int, list[int]] | None:
+    ) -> tuple[list[int], int, int, list[int]]:
         """
         Determine which encoder inputs need to be scheduled in the current step,
         and update `num_new_tokens` and encoder token budget accordingly.
@@ -1129,10 +1135,6 @@ class Scheduler(SchedulerInterface):
         - It is not exist on remote encoder cache (via ECConnector)
         - There is sufficient encoder token budget to process it.
         - The encoder cache has space to store it.
-
-        Returns None when allow_defer is True and the EC connector
-        returns None (pending lookup) for any multimodal input,
-        signaling that the request should be deferred.
 
         If an encoder input cannot be scheduled due to cache or budget
         limitations, the method adjusts `num_new_tokens` to schedule only the
@@ -1256,18 +1258,13 @@ class Scheduler(SchedulerInterface):
             if curr_embeds_end - curr_embeds_start == 0:
                 continue
 
-            if self.ec_connector is not None:
-                has_item = self.ec_connector.has_cache_item(item_identifier)
-                if has_item is None and allow_defer:
-                    return None
-                if has_item is True:
-                    mm_hashes_to_schedule.add(item_identifier)
-                    external_load_encoder_input.append(i)
-                    num_embeds_to_schedule += num_encoder_embeds
-                    continue
-                # has_item is False, or None with allow_defer=False
-                # (running requests can't be deferred — fall through
-                # to local encoder compute).
+            if self.ec_connector is not None and self.ec_connector.has_cache_item(
+                item_identifier
+            ):
+                mm_hashes_to_schedule.add(item_identifier)
+                external_load_encoder_input.append(i)
+                num_embeds_to_schedule += num_encoder_embeds
+                continue
 
             num_embeds_to_schedule += num_encoder_embeds
             encoder_compute_budget -= num_encoder_embeds
