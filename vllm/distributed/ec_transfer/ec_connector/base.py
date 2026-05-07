@@ -204,19 +204,17 @@ class ECConnectorBase(ABC):
         """
         pass
 
-    @abstractmethod
-    def has_pending_prefetch(self, mm_hashes: Iterable[str]) -> bool:
+    def ensure_cache_available(self, mm_hashes: Iterable[str]) -> bool:
         """
-        Check if any of the given mm_hashes need prefetching to CPU.
-        Kicks off async prefetch for hashes that exist remotely
-        but aren't yet in the CPU staging buffer.
+        Ensure encoder cache items are available for the given identifiers.
+        May initiate asynchronous transfers for items not yet local.
 
         Args:
-            mm_hashes: identifiers of the multimodal inputs.
+            mm_hashes: identifiers of the multimodal inputs to check.
 
         Returns:
-            True  - prefetch is in progress, request should be delayed.
-            False - ready to proceed (nothing to fetch, or all fetched).
+            True if any items are still in transit (request should be deferred).
+            False if all items are ready or no transfer is needed.
         """
         return False
 

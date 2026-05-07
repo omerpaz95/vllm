@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -118,9 +117,6 @@ class ECExampleConnector(ECConnectorBase):
         safetensors.torch.save_file(tensors, filename)
         logger.debug("Save cache successful for mm_hash %s", mm_hash)
 
-    def has_pending_prefetch(self, mm_hashes: Iterable[str]) -> bool:
-        return False
-
     def has_cache_item(
         self,
         identifier: str,
@@ -132,7 +128,7 @@ class ECExampleConnector(ECConnectorBase):
             identifier (str): the identifier of the media.
 
         Returns:
-            True if cache exists for the media, False otherwise.
+            Bool indicate that media exists in cache or not
         """
         return self._found_match_for_mm_data(identifier)
 
