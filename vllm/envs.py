@@ -196,6 +196,8 @@ if TYPE_CHECKING:
     VLLM_DISABLE_REQUEST_ID_RANDOMIZATION: bool = False
     VLLM_NIXL_SIDE_CHANNEL_HOST: str = "localhost"
     VLLM_NIXL_SIDE_CHANNEL_PORT: int = 5600
+    VLLM_EC_SIDE_CHANNEL_HOST: str = "localhost"
+    VLLM_EC_SIDE_CHANNEL_PORT: int = 5601
     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
@@ -1507,6 +1509,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Port used for NIXL handshake between remote agents.
     "VLLM_NIXL_SIDE_CHANNEL_PORT": lambda: int(
         os.getenv("VLLM_NIXL_SIDE_CHANNEL_PORT", "5600")
+    ),
+    # IP address used for EC (encoder-cache) NIXL side channel.
+    "VLLM_EC_SIDE_CHANNEL_HOST": lambda: os.getenv(
+        "VLLM_EC_SIDE_CHANNEL_HOST", "localhost"
+    ),
+    # Port used for EC (encoder-cache) NIXL side channel.
+    "VLLM_EC_SIDE_CHANNEL_PORT": lambda: int(
+        os.getenv("VLLM_EC_SIDE_CHANNEL_PORT", "5601")
     ),
     # Port used for Mooncake handshake between remote agents.
     "VLLM_MOONCAKE_BOOTSTRAP_PORT": lambda: int(
