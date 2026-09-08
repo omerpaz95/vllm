@@ -118,7 +118,9 @@ class Target:
         self.pod = pod
 
     def _argv(self, script: str) -> list[str]:
-        argv = ["bash", "-lc", script]
+        # Not a login shell: a container's /etc/profile resets PATH for root
+        # and drops the image's venv, which is how `python` goes missing.
+        argv = ["bash", "-c", script]
         if self.pod:
             return ["oc", "exec", self.pod, "--", *argv]
         return argv

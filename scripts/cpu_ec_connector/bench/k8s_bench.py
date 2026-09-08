@@ -703,7 +703,11 @@ def preflight(oc: Oc, client: ClientPod, args: argparse.Namespace) -> None:
     print(f"[k8s] authenticated as {who.stdout.strip()} in {args.namespace}")
     if not oc.exists("secret", args.hf_secret):
         raise SystemExit(f"[k8s] secret {args.hf_secret} not found in {args.namespace}")
-    stale = oc.pods(f"app={APP_LABEL}")
+    stale = [
+        p
+        for p in oc.pods(f"app={APP_LABEL}")
+        if p["metadata"].get("labels", {}).get("run-id") != args.run_id
+    ]
     if stale:
         names = ", ".join(p["metadata"]["name"] for p in stale)
         print(
@@ -711,8 +715,17 @@ def preflight(oc: Oc, client: ClientPod, args: argparse.Namespace) -> None:
             "--cleanup",
             file=sys.stderr,
         )
+    probe = client.target.sh(f"{args.python} -c 'import vllm' && echo ok", check=False)
+    if "ok" not in probe.stdout:
+        raise SystemExit(
+            f"[k8s] {args.python} cannot import vllm in {args.image} "
+            f"(rc={probe.returncode}); set --python to the image's interpreter.\n"
+            f"{probe.stderr[-500:]}"
+        )
     if any(ARMS[a].connector == "ECCPUConnector" for a in args.arms):
-        probe = client.target.sh("python -c 'import nixl' && echo ok", check=False)
+        probe = client.target.sh(
+            f"{args.python} -c 'import nixl' && echo ok", check=False
+        )
         if "ok" not in probe.stdout:
             raise SystemExit(
                 f"[k8s] `import nixl` fails in {args.image}; the CPU arms need "
@@ -841,6 +854,13 @@ def parse_args() -> argparse.Namespace:
         help="delete every bench object in the namespace (the PVC stays)",
     )
     k.add_argument("--cleanup-run-id", action="store_true", help="only --run-id")
+    k.add_argument(
+        "--python",
+        default="",
+        help="interpreter inside the image for the servers, the proxy and the "
+        "load generator; default python3, which the vllm-openai image symlinks "
+        "into /usr/bin",
+    )
     k.add_argument("--delete-pvc", action="store_true")
     p.set_defaults(startup_timeout_s=1800)
     args = p.parse_args()
@@ -859,8 +879,10 @@ def parse_args() -> argparse.Namespace:
         if "=" not in pair:
             raise SystemExit(f"[k8s] --pod-env {pair!r} is not NAME=VALUE")
 
-    # What run_bench's server construction reads, pinned for pods.
-    args.python = "python"
+    # What run_bench's server construction reads, pinned for pods. python3 is
+    # symlinked into /usr/bin in the vllm-openai image, so it resolves even
+    # when a shell profile has reset PATH and dropped /opt/venv/bin.
+    args.python = args.python or "python3"
     args.work_dir = f"{PVC_MOUNT}/runs/{args.run_id}"
     args.hf_home = f"{PVC_MOUNT}/hf"
     args.proxy_script = f"{SCRIPTS_MOUNT}/disagg_epd_proxy.py"
