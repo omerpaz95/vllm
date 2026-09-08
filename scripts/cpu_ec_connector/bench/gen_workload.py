@@ -32,7 +32,7 @@ decode land inside the TTFT being measured. Sources:
 Example:
 
     python gen_workload.py --photo-source dir:/data/photos \
-        --out-dir /vllm-workspace/bench/wl --pool-size 128 --rounds 6
+        --out-dir /data/wl --pool-size 128 --rounds 6
 """
 
 from __future__ import annotations
@@ -549,7 +549,11 @@ def main() -> int:
         previous = json.loads(manifest_path.read_text())
         pool = [
             PoolImage(
-                Path(e["path"]), e["w"], e["h"], e["embeds"], e["region_bytes"],
+                Path(e["path"]),
+                e["w"],
+                e["h"],
+                e["embeds"],
+                e["region_bytes"],
                 e.get("upscale", 1.0),
             )
             for e in previous["pool"]

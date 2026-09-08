@@ -18,8 +18,8 @@ than from a GPU-resident hit. Each request carries a unique text prefix
 
 Run inside the pod, alongside the server:
 
-    venv-vllm/bin/python bench/phase0_hit_check.py \
-        --log /vllm-workspace/logs/phase0_ec.log
+    python phase0_hit_check.py \
+        --log /tmp/ec_bench/logs/single.log
 """
 
 from __future__ import annotations

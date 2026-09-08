@@ -1,43 +1,50 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Serving A/B for the EC CPU offload connector.
+"""Serving benchmark for the encoder-cache (EC) connectors.
 
-Runs one workload twice against identical engine configs that differ only in
-whether `--ec-transfer-config` is set:
+Replays one workload (from `gen_workload.py`) against six arms that differ
+only in topology, connector and what the decode instance receives:
 
-    recompute   no connector; a re-requested image is re-encoded
-    connector   ECCPUConnector in ec_both mode; a re-request reloads from CPU
+    baseline      one instance, no connector: encodes and decodes itself
+    offload       one instance, ECCPUConnector in ec_both: repeats reload from
+                  the CPU region instead of re-running the vision tower
+    cpu-data      encoder + decode, ECCPUConnector over NIXL; decode gets the
+                  pixels plus the connector's transfer params
+    cpu-grid      as cpu-data, but the proxy substitutes the image grid for
+                  the pixels (the rewrite from PR #50390)
+    example-data  encoder + decode, ECExampleConnector over shared storage,
+                  pixels forwarded
+    example-grid  as example-data, grid substituted
 
-Load is driven by `vllm bench serve` over the `custom_image` dataset that
-`gen_workload.py` emits, so the reported latencies are the ones a client sees.
-Alongside them it reads the connector's own DEBUG accounting out of the server
-log, and re-applies Phase 0's two gates to the real workload: the connector arm
-must actually load entries, and must compute fewer encoder inputs than the
-recompute arm. If those fail the timings measure nothing, and this says so
-instead of printing a delta.
+`data` vs `grid` isolates what the grid substitution saves with the transport
+held fixed; `cpu` vs `example` compares the transports. `--no-rewrite` on the
+EPD proxy is the `data` mode: since the proxy started carrying the connector's
+handles regardless of rewriting, no proxy modification is needed.
 
-Because both arms share a port and a GPU, every arm verifies from the fresh log
-that the server it is about to measure really is the arm it asked for -- the
-connector arm by the EC region's creation line, the recompute arm by that line's
-absence. Killing the previous server and hoping is not enough: a survivor would
-answer /health and be measured under the wrong label.
+Load comes from `vllm bench serve` over the `custom_image` dataset, so the
+latencies are the ones a client sees. Alongside them the connector's own DEBUG
+accounting is read from the server logs, and every arm is gated on having done
+what its name says: a connector arm must have loaded entries, a rewrite arm
+must have rewritten most of the workload, a fan-out must have reached every
+encoder, and every request must have completed. A run that fails a gate is
+not a measurement, and this raises instead of printing a delta.
 
-`--frag` runs the connector arm with a region deliberately smaller than the
-working set and descriptor counting enabled, reporting bandwidth per time window
--- the question being whether an entry still collapses to one descriptor once the
-region has churned.
+Each arm's servers verify from their fresh logs that they are what was asked
+for, because a survivor from the previous arm would answer /health and be
+measured under the wrong name.
 
-Typical use, driving a server in a pod:
+The servers this launches run on the target: locally, or inside a pod with
+`--pod`. All of the target's scratch state lives under `--work-dir`.
 
-    python run_bench.py --pod vllm-omer-2 \
-        --workload-dir /vllm-workspace/bench/wl --out-dir results/
+Typical use:
 
-Against a server somebody else is running (an EPD proxy, for instance), where
-this cannot manage the process and needs to be told where the log is:
+    python run_bench.py --workload-dir /data/wl --out-dir results \
+        --arms baseline,offload,cpu-grid --max-concurrency 1,4,8
 
-    python run_bench.py --base-url http://proxy:8000 \
-        --server-log /vllm-workspace/logs/consumer.log --arms connector
+`--frag` runs the offload arm with a region deliberately smaller than the
+working set and descriptor counting enabled, to see whether entries still
+collapse to one descriptor once the region has churned.
 """
 
 from __future__ import annotations
@@ -48,7 +55,7 @@ import shlex
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -60,70 +67,47 @@ from ec_log_stats import (
     window_stats,
 )
 
-ARMS = ("recompute", "connector")
-LOG_DIR = "/vllm-workspace/logs"
-FRAG_FILE = "/tmp/ec_bench_frag.jsonl"
-# Instrumentation lives in its own directory so it is not auto-imported by the
-# scripts beside this one; only the server gets it on PYTHONPATH.
-PATCH_DIR = "/vllm-workspace/bench/patches"
 PROXY = "examples/disaggregated/disaggregated_encoder/disagg_epd_proxy.py"
-QUEUE_CSV = "/tmp/ec_bench_queue.csv"
-QUEUE_SAMPLER = "/vllm-workspace/bench/queue_sampler.sh"
+BENCH_DIR = Path(__file__).resolve().parent
 QUEUE_SAMPLE_INTERVAL_S = 1.0
-# Each EPD configuration is (send the grid instead of the pixels, device the
-# encoder's image transform runs on) -- the two independent changes in #50390.
-# (send the grid instead of the pixels, encoder transform device, connector).
-# An empty connector means no --ec-transfer-config at all.
-#
-# "cpu" is deliberately kept even though it can transfer nothing: the CPU
-# connector locates a peer's entry only through `ec_transfer_params`, which the
-# proxy relays exclusively when it rewrites, so without hints the consumer
-# recomputes and this arm prices the producer's save with no benefit. The
-# example connector has no such dependency -- it finds entries by hash on shared
-# storage -- which is why its no-hint arm does transfer.
-EPD_CONFIGS: dict[str, tuple[bool, str, str]] = {
-    "none": (False, "cpu", ""),
-    "example": (False, "cpu", "ECExampleConnector"),
-    "cpu": (False, "cpu", "ECCPUConnector"),
-    "example-grid": (True, "cpu", "ECExampleConnector"),
-    "cpu-grid": (True, "cpu", "ECCPUConnector"),
-    "baseline": (False, "cpu", "ECExampleConnector"),
-    "grid": (True, "cpu", "ECExampleConnector"),
-    "gpu": (False, "cuda", "ECExampleConnector"),
-    "both": (True, "cuda", "ECExampleConnector"),
-}
-# Arms where the consumer must end up loading an encoding from the producer. The
-# rest must load nothing, and both directions are asserted.
-EPD_EXPECT_LOADS = {
-    "example",
-    "example-grid",
-    "cpu-grid",
-    "baseline",
-    "grid",
-    "gpu",
-    "both",
-}
-# Proof each change actually engaged, read from the log of the process that
-# would emit it. A configuration that did not engage is not a measurement.
-_GPU_PROCESSOR_MARKER = "Running the multi-modal processor on cuda"
-
 _HEALTH_POLL_S = 5.0
-# Generous because an orderly exit has to tear down CUDA and, on the connector
-# arm, unlink the EC region; escalating early is what leaks multi-GiB
-# /dev/shm files.
+# Generous because an orderly exit has to tear down CUDA and, on a connector
+# arm, unlink the EC region; escalating early is what leaks multi-GiB /dev/shm
+# files.
 _STOP_TIMEOUT_S = 180
 _DETACH_TIMEOUT_S = 120
 _PGID_READ_ATTEMPTS = 10
 _PGID_READ_DELAY_S = 1.0
 _EC_REGION_MARKER = "Created EC mmap file"
-# Either line proves the log belongs to a server that got as far as serving.
-# Two of them because the exact wording is version-dependent, while uvicorn's
-# is stable.
+_GPU_PROCESSOR_MARKER = "Running the multi-modal processor on cuda"
+# Either line proves the log belongs to a server that got as far as serving;
+# the exact wording is version-dependent, uvicorn's is stable.
 _STARTUP_MARKERS = ("Application startup complete", "Starting vLLM server on")
 
 
+@dataclass(frozen=True)
+class Arm:
+    topology: str  # "single" or "epd"
+    connector: str  # "", "ECCPUConnector" or "ECExampleConnector"
+    rewrite: bool = False  # EPD only: the proxy substitutes the grid
+
+    @property
+    def expects_loads(self) -> bool:
+        return bool(self.connector)
+
+
+ARMS: dict[str, Arm] = {
+    "baseline": Arm("single", ""),
+    "offload": Arm("single", "ECCPUConnector"),
+    "cpu-data": Arm("epd", "ECCPUConnector"),
+    "cpu-grid": Arm("epd", "ECCPUConnector", rewrite=True),
+    "example-data": Arm("epd", "ECExampleConnector"),
+    "example-grid": Arm("epd", "ECExampleConnector", rewrite=True),
+}
+
+
 class ServerMismatchError(RuntimeError):
-    """The running server is not the arm that was requested."""
+    """The running system is not the arm that was requested."""
 
 
 class Target:
@@ -151,26 +135,19 @@ class Target:
             )
         return result
 
-    def sh_detached(
-        self, script: str, *, timeout: int = _DETACH_TIMEOUT_S
-    ) -> subprocess.CompletedProcess[bytes]:
+    def sh_detached(self, script: str) -> None:
         """Run a command that leaves a daemon behind.
 
         Output must not be captured: a backgrounded server inherits the pipes
         and never closes them, so waiting on them would block until the timeout
         even though the launching shell exited immediately.
-
-        The returned `CompletedProcess` describes the launching shell, which has
-        already exited -- it is not a handle on the daemon. The daemon is
-        addressed by the pid it records inside the target, since with `--pod` it
-        does not even live on this machine.
         """
-        return subprocess.run(
+        subprocess.run(
             self._argv(script),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=timeout,
+            timeout=_DETACH_TIMEOUT_S,
             check=True,
         )
 
@@ -187,142 +164,115 @@ class Target:
     def read_text(self, path: str) -> str:
         return self.sh(f"cat {shlex.quote(path)} 2>/dev/null || true").stdout
 
+    def exists(self, path: str) -> bool:
+        probe = f"test -s {shlex.quote(path)} && echo ok"
+        return bool(self.sh(probe, check=False).stdout.strip())
+
 
 @dataclass
 class BenchServer:
     """One process this harness starts and stops: a vLLM server, or the proxy.
 
-    `managed` is False when `--base-url` points at something this process did not
-    start: then start/stop are no-ops and the caller supplies the log path,
-    because there is no launch command to derive it from.
-
-    The optional fields exist for the EPD topology, which needs several
-    processes at once; the single-server topology leaves them at their defaults.
     `command` runs something that is not a vLLM server (the proxy) through the
-    same launch and teardown path, rather than duplicating it.
+    same launch and teardown path. `ec_config` is the instance's
+    `--ec-transfer-config`, or None for no connector.
     """
 
     target: Target
     args: argparse.Namespace
-    arm: str
-    log_path: str
-    managed: bool = True
-    name: str = ""
-    port: int = 0
+    name: str
+    port: int
     gpu: str = ""
     command: str = ""
     ec_config: dict[str, Any] | None = None
     gpu_util: float = 0.0
+    tp: int = 1
+    batched_tokens: int = 0
     extra_args: tuple[str, ...] = ()
     extra_env: tuple[str, ...] = ()
     match: tuple[str, str] = ()
+    log_path: str = field(init=False)
 
     def __post_init__(self) -> None:
-        self.name = self.name or self.arm
-        self.port = self.port or self.args.port
-        self.gpu = self.gpu or self.args.gpu
+        self.log_path = f"{self.args.work_dir}/logs/{self.name}.log"
+        if self.ec_config is not None:
+            self.ec_config = {"engine_id": self.engine_id, **self.ec_config}
 
     @property
     def base_url(self) -> str:
-        return self.args.base_url or f"http://127.0.0.1:{self.port}"
+        return f"http://127.0.0.1:{self.port}"
 
     @property
     def pid_file(self) -> str:
-        return f"/tmp/ec_bench_{self.name}.pid"
+        return f"{self.args.work_dir}/{self.name}.pid"
 
     @property
     def pgid_file(self) -> str:
-        return f"/tmp/ec_bench_{self.name}.pgid"
-
-    @property
-    def batched_tokens(self) -> int:
-        """Token budget per engine step for this instance.
-
-        An encode-only instance needs a budget above one image's token count or
-        it can never batch two image requests, which pins it to one image per
-        step regardless of load -- the artefact that made every rate=inf
-        measurement a queue-depth measurement. The example's README asks for
-        "a very high value (effectively unlimited)" here for the same reason.
-        Decode keeps the ordinary budget, identical across arms.
-        """
-        if self.name == "encoder":
-            return self.args.encoder_max_num_batched_tokens
-        return self.args.max_num_batched_tokens
-
-    @property
-    def kill_match(self) -> tuple[str, str]:
-        """Two substrings that together identify this process and nothing else.
-
-        Both are required: the port alone also appears in the proxy's
-        `--encode-servers-urls`, and the command alone would match every vLLM
-        server on a shared dev pod.
-        """
-        return self.match or ("cli.main serve", f"--port {self.port}")
+        return f"{self.args.work_dir}/{self.name}.pgid"
 
     @property
     def engine_id(self) -> str:
         return f"ec-bench-{self.args.run_id}-{self.name}"
 
-    def ec_transfer_config(self) -> str:
-        """Connector config for this instance.
+    @property
+    def is_vllm(self) -> bool:
+        return not self.command
 
-        Defaults to the local-offload config the single-server A/B uses; the EPD
-        topology passes producer and consumer configs in `ec_config`.
+    @property
+    def kill_match(self) -> tuple[str, str]:
+        """Two substrings that together identify this process and nothing else.
 
-        `ec_enable_nixl` is a setting of the connector, so it goes in
-        `ec_connector_extra_config`, and is sent only when asked for.
+        The port alone also appears in the proxy's `--encode-servers-urls`, and
+        the command alone would match every vLLM server on a shared host.
         """
-        config: dict[str, Any] = dict(self.ec_config) if self.ec_config else {
-            "ec_connector": "ECCPUConnector",
-            "ec_role": "ec_both",
-            "ec_connector_extra_config": {"ec_cpu_bytes": self.args.ec_cpu_bytes},
-        }
-        config.setdefault("engine_id", self.engine_id)
-        if self.args.ec_enable_nixl:
-            # Copy before mutating: `config` is a shallow copy of `ec_config`,
-            # so the nested dict is still the caller's.
-            extra = dict(config.get("ec_connector_extra_config") or {})
-            extra.setdefault("ec_enable_nixl", True)
-            config["ec_connector_extra_config"] = extra
-        return json.dumps(config)
+        return self.match or ("cli.main serve", f"--port {self.port}")
 
     def launch_script(self, *, instrument: bool) -> str:
         """Build the launch command.
 
-        `cd /tmp` matters: from /vllm-workspace, `import vllm` resolves the repo
-        directory as a namespace package and top-level attributes disappear.
-        DEBUG matters: the connector's transfer accounting is on debug lines.
+        The `cd` matters: from the repository root, `import vllm` resolves the
+        source directory as a namespace package. DEBUG matters: the
+        connector's transfer accounting is on debug lines. The V2 model runner
+        is required by the CPU connector, so every arm runs it.
         """
         env = [
-            f"CUDA_VISIBLE_DEVICES={self.gpu}",
             "VLLM_USE_V2_MODEL_RUNNER=1",
             "VLLM_LOGGING_LEVEL=DEBUG",
             "VLLM_SERVER_DEV_MODE=1",
-            "HF_HOME=/vllm-workspace",
         ]
+        if self.gpu:
+            env.insert(0, f"CUDA_VISIBLE_DEVICES={self.gpu}")
+        if self.args.hf_home:
+            env.append(f"HF_HOME={self.args.hf_home}")
         if instrument:
-            env += [f"PYTHONPATH={PATCH_DIR}", f"EC_BENCH_FRAG_FILE={FRAG_FILE}"]
+            env += [
+                f"PYTHONPATH={self.args.patch_dir}",
+                f"EC_BENCH_FRAG_FILE={self.args.frag_file}",
+            ]
         env += list(self.extra_env)
         serve = [self.command] if self.command else self._serve_args()
         # setsid puts the process in a new session so its children -- for a vLLM
         # server the API server, EngineCore and workers -- share one process
-        # group that teardown can signal as a unit.
+        # group that teardown can signal as a unit. The setsid'd shell records
+        # its OWN pid, which is the group id, then execs the command into it;
+        # reading the group back with `ps` would race setsid.
         #
-        # The setsid'd shell records its OWN pid, which is the new session leader
-        # and therefore the group id, then execs the command into that same pid.
-        # Reading the group back with `ps` instead would race: setsid has not
-        # necessarily moved the process by the time the launching shell looks,
-        # and the check then silently falls back to parent-only kills.
+        # Env assignments precede setsid because setsid execs its first
+        # argument, so `setsid VAR=x cmd` would look for a program named "VAR=x".
         #
-        # Env assignments precede setsid because setsid execs its first argument,
-        # so `setsid VAR=x cmd` would look for a program named "VAR=x".
+        # Only the setsid command is backgrounded. `a && b && c & d` would
+        # background the whole `&&` list as one subshell, so `$!` would name
+        # that subshell and `d` would race its `mkdir`.
         inner = f"echo $$ > {self.pgid_file}; exec " + " ".join(serve)
-        return (
-            f"mkdir -p {LOG_DIR} && cd /tmp && "
-            + " ".join(env)
-            + f" setsid bash -c {shlex.quote(inner)}"
-            + f" < /dev/null > {self.log_path} 2>&1 &"
-            + f" echo $! > {self.pid_file}; disown"
+        return "\n".join(
+            [
+                f"mkdir -p {self.args.work_dir}/logs && cd {self.args.work_dir} "
+                "|| exit 1",
+                " ".join(env)
+                + f" setsid bash -c {shlex.quote(inner)}"
+                + f" < /dev/null > {self.log_path} 2>&1 &",
+                f"echo $! > {self.pid_file}; disown",
+            ]
         )
 
     def _serve_args(self) -> list[str]:
@@ -333,30 +283,27 @@ class BenchServer:
             f"--max-model-len {self.args.max_model_len}",
             f"--gpu-memory-utilization "
             f"{self.gpu_util or self.args.gpu_memory_utilization}",
-            f"--max-num-batched-tokens {self.batched_tokens}",
+            f"--max-num-batched-tokens "
+            f"{self.batched_tokens or self.args.max_num_batched_tokens}",
             f"--max-num-seqs {self.args.max_num_seqs}",
-            f"--tensor-parallel-size {self.args.tensor_parallel_size}",
+            f"--tensor-parallel-size {self.tp}",
             # Identical across arms, and both are required by the accounting
             # this harness reads: iteration details print encoder inputs, and
             # excluding video drops the encoder budget floor 32768 -> 16384.
             "--enable-logging-iteration-details",
             """--limit-mm-per-prompt '{"video":0}'""",
         ]
-        if self.ec_config is not None or (
-            self.arm == "connector" and self.arm in ARMS
-        ):
+        if self.ec_config is not None:
             serve.append(
-                f"--ec-transfer-config {shlex.quote(self.ec_transfer_config())}"
+                f"--ec-transfer-config {shlex.quote(json.dumps(self.ec_config))}"
             )
         serve.extend(self.extra_args)
         return serve
 
-    def start(self, *, instrument: bool) -> None:
-        if not self.managed:
-            print(f"[bench] using existing server at {self.base_url}")
-            return
+    def start(self, *, instrument: bool = False) -> None:
         self.target.sh(
-            f"rm -f {self.log_path} {FRAG_FILE} {self.pgid_file}", check=False
+            f"rm -f {self.log_path} {self.args.frag_file} {self.pgid_file}",
+            check=False,
         )
         self.stop()
         print(f"[bench] launching {self.name}")
@@ -369,8 +316,6 @@ class BenchServer:
                 f"launch did not record a pid in {self.pid_file} "
                 f"(got {pid!r}); see {self.log_path}"
             )
-        # The setsid'd shell writes its group id a moment after launch, so give
-        # it a bounded number of tries rather than reading once and giving up.
         pgid = ""
         for _ in range(_PGID_READ_ATTEMPTS):
             pgid = self.target.read_text(self.pgid_file).strip()
@@ -388,21 +333,15 @@ class BenchServer:
             )
 
     def stop(self) -> None:
-        """Stop the whole server tree, waiting for it to actually exit.
+        """Stop the whole process tree, waiting for it to actually exit.
 
-        SIGTERM to the process group, not to the parent alone: vLLM's EngineCore
-        and worker processes are children, and signalling only the parent leaves
-        them alive holding the GPU and the port -- which then presents as the
-        next arm's server never becoming healthy.
-
-        SIGTERM before SIGKILL so the EC region's cleanup runs and unlinks its
-        /dev/shm file; that cleanup is best-effort and does not survive SIGKILL,
-        which is how stale multi-GiB mmap files accumulate. The pattern fallback
-        is scoped to this port rather than every vLLM server on the host, which
-        would kill unrelated work on a shared dev pod.
+        SIGTERM to the process group, not the parent alone: EngineCore and the
+        workers are children, and signalling only the parent leaves them
+        holding the GPU and the port -- which presents as the next arm's server
+        never becoming healthy. SIGTERM before SIGKILL so the EC region's
+        cleanup runs and unlinks its /dev/shm file. The pattern fallback is
+        scoped to this port rather than every vLLM server on the host.
         """
-        if not self.managed:
-            return
         p1, p2 = self.kill_match
         pattern = f"[{p1[0]}]{p1[1:]}.*{p2}"
         script = f"""
@@ -418,8 +357,8 @@ class BenchServer:
             pkill -f "{pattern}" 2>/dev/null || true
         fi
         # Liveness must ignore zombies: a reaped-late <defunct> child still
-        # matches pgrep, which would make every teardown look hung and escalate
-        # to SIGKILL even though the tree exited cleanly. Lines in this shell's
+        # matches, which would make every teardown look hung and escalate to
+        # SIGKILL even though the tree exited cleanly. Lines in this shell's
         # own group are skipped so the ps/awk pipeline cannot match itself.
         for _ in $(seq {_STOP_TIMEOUT_S}); do
             alive=$(ps -eo pgid=,stat=,args= | awk \
@@ -446,9 +385,8 @@ class BenchServer:
         result = self.target.sh(script, check=False, timeout=_STOP_TIMEOUT_S + 60)
         if "escalated" in result.stdout:
             detail = (
-                f"; the EC region's /dev/shm file for {self.engine_id} may have "
-                "leaked"
-                if self.arm == "connector"
+                f"; the EC region's /dev/shm file for {self.engine_id} may have leaked"
+                if self.ec_config
                 else ""
             )
             print(
@@ -471,54 +409,50 @@ class BenchServer:
             f"(see {self.log_path})"
         )
 
-    def verify_arm(self) -> None:
-        """Confirm the live server is this arm, from its own log.
+    def wait_for_log(self, marker: str, timeout_s: int = 120) -> None:
+        """For the proxy, which serves no /health endpoint of its own."""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if marker in self.target.read_text(self.log_path):
+                return
+            time.sleep(2.0)
+        raise RuntimeError(f"{self.name}: {marker!r} never appeared in {self.log_path}")
 
-        Guards the case that makes an A/B silently meaningless: a survivor from
-        the previous arm answers /health, and its numbers get recorded under
-        this arm's name.
+    def verify(self) -> None:
+        """Confirm the live server is the one just launched, from its own log.
+
+        A survivor from the previous arm would answer /health and have its
+        numbers recorded under this arm's name. For the CPU connector the
+        region's creation line, tagged with this run's engine id, also proves
+        the connector is active and the region is not a reused one.
         """
-        if not self.managed:
-            print("[bench] skipping arm verification for an unmanaged server")
-            return
         log = self.target.read_text(self.log_path)
         if not any(marker in log for marker in _STARTUP_MARKERS):
             raise ServerMismatchError(
                 f"{self.log_path} contains none of {_STARTUP_MARKERS}: the "
                 "server answering /health is not the one just launched"
             )
-        if self.arm not in ARMS:
-            print(f"[bench] verified {self.name} started from {self.log_path}")
-            return
         has_region = _EC_REGION_MARKER in log and self.engine_id in log
-        if self.arm == "connector" and not has_region:
+        connector = (self.ec_config or {}).get("ec_connector", "")
+        if connector == "ECCPUConnector" and not has_region:
             raise ServerMismatchError(
-                f"connector arm: no '{_EC_REGION_MARKER}' for {self.engine_id}. "
-                "Either the connector is not active, or the region was reused "
-                "from a previous run (which would hand this arm unearned hits)."
+                f"{self.name}: no '{_EC_REGION_MARKER}' for {self.engine_id}; "
+                "the CPU connector is not active, or a region was reused"
             )
-        if self.arm == "recompute" and has_region:
+        if not connector and _EC_REGION_MARKER in log:
             raise ServerMismatchError(
-                "recompute arm: an EC region was created, so a connector is "
-                "active in the arm that is supposed to have none"
+                f"{self.name}: an EC region was created, so a connector is "
+                "active in an instance that is supposed to have none"
             )
-        print(f"[bench] verified {self.arm} arm from {self.log_path}")
-
-    def wait_for_log(self, marker: str, timeout_s: int = 120) -> None:
-        """Wait for a line in this process's log.
-
-        For the proxy, which serves no /health endpoint of its own.
-        """
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            if marker in self.target.read_text(self.log_path):
-                return
-            time.sleep(2.0)
-        raise RuntimeError(
-            f"{self.name}: {marker!r} never appeared in {self.log_path}"
-        )
+        print(f"[bench] verified {self.name} from {self.log_path}")
 
     def reset_caches(self) -> None:
+        """Drop the prefix and processor caches (VLLM_SERVER_DEV_MODE routes).
+
+        There is no route for the EC region or shared storage; those persist
+        for the life of the process, which is what --restart-per-load-point
+        is for.
+        """
         for endpoint in ("reset_prefix_cache", "reset_mm_cache"):
             self.target.sh(
                 f"curl -s -X POST {self.base_url}/{endpoint} >/dev/null || true",
@@ -551,83 +485,213 @@ class BenchServer:
         ]
         if concurrency:
             cmd.append(f"--max-concurrency {concurrency}")
-        return f"cd /tmp && HF_HOME=/vllm-workspace {' '.join(cmd)}"
+        env = f"HF_HOME={self.args.hf_home} " if self.args.hf_home else ""
+        return f"cd {self.args.work_dir} && {env}{' '.join(cmd)}"
 
 
-def run_arm(
-    target: Target, args: argparse.Namespace, arm: str, num_prompts: int
-) -> list[dict[str, Any]]:
-    """Measure one arm across every requested request rate."""
-    log_path = args.server_log or f"{LOG_DIR}/bench_{arm}.log"
-    server = BenchServer(
+@dataclass
+class System:
+    """Every process one arm needs, and which of them plays which role."""
+
+    front: BenchServer  # what the load generator talks to
+    consumer: BenchServer  # where connector loads land and the LM runs
+    encoders: list[BenchServer] = field(default_factory=list)
+    proxy: BenchServer | None = None
+
+    @property
+    def servers(self) -> list[BenchServer]:
+        return [*self.encoders, self.consumer] + ([self.proxy] if self.proxy else [])
+
+    @property
+    def vllm_servers(self) -> list[BenchServer]:
+        return [s for s in self.servers if s.is_vllm]
+
+
+def _cpu_connector_config(args: argparse.Namespace, role: str) -> dict[str, Any]:
+    extra: dict[str, Any] = {"ec_cpu_bytes": args.ec_cpu_bytes}
+    if role != "ec_both":
+        # Two processes cannot share one instance's mmap region, so the
+        # peer-to-peer transport carries entries across: the producer announces
+        # its side-channel address in ec_transfer_params and the consumer
+        # dials it. Set inside extra config; ECTransferConfig rejects it as a
+        # top-level key.
+        extra["ec_enable_nixl"] = True
+    return {
+        "ec_connector": "ECCPUConnector",
+        "ec_role": role,
+        "ec_connector_extra_config": extra,
+    }
+
+
+def _connector_config(
+    args: argparse.Namespace, arm: Arm, role: str
+) -> dict[str, Any] | None:
+    if not arm.connector:
+        return None
+    if arm.connector == "ECCPUConnector":
+        return _cpu_connector_config(args, role)
+    return {
+        "ec_connector": arm.connector,
+        "ec_role": role,
+        "ec_connector_extra_config": {"shared_storage_path": args.shared_storage_path},
+    }
+
+
+def build_system(target: Target, args: argparse.Namespace, name: str) -> System:
+    arm = ARMS[name]
+    if arm.topology == "single":
+        server = BenchServer(
+            target=target,
+            args=args,
+            name="single",
+            port=args.port,
+            gpu=args.gpu,
+            tp=args.tensor_parallel_size,
+            ec_config=_connector_config(args, arm, "ec_both"),
+        )
+        return System(front=server, consumer=server)
+
+    # The device list's length is the encoder count; a device repeated in it
+    # means those encoders share one GPU and must split its memory.
+    devices = [d.strip() for d in args.encoder_devices.split(",") if d.strip()]
+    if not devices:
+        raise SystemExit("[bench] --encoder-devices names no device")
+    shared = {dev: devices.count(dev) for dev in set(devices)}
+    encoder_ports = {args.encoder_port + i for i in range(len(devices))}
+    for label, port in (("decode", args.decode_port), ("proxy", args.proxy_port)):
+        if port in encoder_ports:
+            raise SystemExit(
+                f"[bench] the {label} port {port} lies inside the encoder range "
+                f"{min(encoder_ports)}-{max(encoder_ports)}; move --{label}-port "
+                "or --encoder-port"
+            )
+    if args.decode_port == args.proxy_port:
+        raise SystemExit("[bench] --decode-port and --proxy-port are the same")
+
+    encoders: list[BenchServer] = []
+    for index, dev in enumerate(devices):
+        util = args.encoder_gpu_memory_utilization or round(
+            args.gpu_memory_utilization / shared[dev], 3
+        )
+        env: tuple[str, ...] = ()
+        if arm.connector == "ECCPUConnector":
+            # Each producer binds its own side channel and announces it through
+            # ec_transfer_params; the consumer needs no side-channel setting.
+            env = (
+                "VLLM_EC_SIDE_CHANNEL_HOST=127.0.0.1",
+                f"VLLM_EC_SIDE_CHANNEL_PORT={args.side_channel_port + index}",
+            )
+        # The encoder needs a token budget several images deep or it can never
+        # batch two image requests, which pins it to one image per step and
+        # turns every rate=inf number into queue depth.
+        extra = [
+            "--no-enable-prefix-caching",
+            f"--mm-processor-device {args.mm_processor_device}",
+            # torch_shm is the one transport that carries device tensors; any
+            # other copies the result to host and `auto` declines the
+            # accelerator.
+            f"--mm-tensor-ipc {args.mm_tensor_ipc}",
+            # A different knob despite the similar name: with "shm" the engine
+            # keeps no receiver cache, the processed data is refilled in the
+            # worker, and the connector reports no grid for the proxy to
+            # substitute.
+            f"--mm-processor-cache-type {args.mm_processor_cache_type}",
+        ]
+        if args.mm_encoder_only:
+            extra.append("--mm-encoder-only")
+        if args.encoder_enforce_eager:
+            extra.append("--enforce-eager")
+        encoders.append(
+            BenchServer(
+                target=target,
+                args=args,
+                name=f"encoder{index}",
+                port=args.encoder_port + index,
+                gpu=dev,
+                gpu_util=util,
+                batched_tokens=args.encoder_max_num_batched_tokens,
+                ec_config=_connector_config(args, arm, "ec_producer"),
+                extra_env=env,
+                extra_args=tuple(extra),
+            )
+        )
+    decode = BenchServer(
         target=target,
         args=args,
-        arm=arm,
-        log_path=log_path,
-        managed=not args.base_url,
+        name="decode",
+        port=args.decode_port,
+        gpu=args.decode_gpu,
+        tp=args.tensor_parallel_size,
+        ec_config=_connector_config(args, arm, "ec_consumer"),
+        # Without this the decode instance rejects an image_embeds part, which
+        # is what a rewritten request is made of. Set in every EPD arm: a flag
+        # that differs between arms is a confound rather than a switch.
+        extra_args=("--enable-mm-embeds",),
     )
-    server.start(instrument=args.frag)
-    try:
-        server.wait_healthy()
-        server.verify_arm()
-
-        print(f"[bench] {arm}: warmup")
-        warm = max(4, min(16, num_prompts // 10))
-        target.sh(
-            server.bench_serve_script(warm, "inf", "/tmp/warmup.json"),
-            timeout=args.bench_timeout_s,
-            check=False,
-        )
-
-        results: list[dict[str, Any]] = []
-        for rate, conc in args.load_points:
-            server.reset_caches()
-            start = target.file_size(log_path)
-            out_path = f"/tmp/bench_{arm}_{rate}_c{conc}.json"
-            print(
-                f"[bench] {arm}: rate={rate} concurrency={conc or 'unbounded'}, "
-                f"{num_prompts} prompts"
-            )
-            target.sh(
-                server.bench_serve_script(num_prompts, rate, out_path, conc),
-                timeout=args.bench_timeout_s,
-            )
-            # Completion reports land after the last response.
-            time.sleep(args.settle_s)
-            log_text = target.read_bytes(log_path, start, target.file_size(log_path))
-            raw = target.read_text(out_path)
-            entry: dict[str, Any] = {
-                "arm": arm,
-                "request_rate": rate,
-                "concurrency": conc,
-                "client": json.loads(raw) if raw.strip() else {},
-                "server": summarize(log_text),
-            }
-            if args.frag:
-                entry["windows"] = window_stats(log_text, args.frag_window_s)
-                entry["decay"] = decay_report(entry["windows"], "load")
-                entry["descriptors"] = parse_frag(target.read_text(FRAG_FILE))
-            results.append(entry)
-        return results
-    finally:
-        server.stop()
+    encode_urls = ",".join(e.base_url for e in encoders)
+    proxy_cmd = " ".join(
+        [
+            f"{args.python} {args.vllm_repo}/{PROXY}",
+            f"--host 127.0.0.1 --port {args.proxy_port}",
+            f"--encode-servers-urls {encode_urls}",
+            "--prefill-servers-urls disable",
+            f"--decode-servers-urls {decode.base_url}",
+        ]
+        + ([] if arm.rewrite else ["--no-rewrite"])
+    )
+    proxy = BenchServer(
+        target=target,
+        args=args,
+        name="proxy",
+        port=args.proxy_port,
+        command=proxy_cmd,
+        match=("disagg_epd_proxy.py", f"--port {args.proxy_port}"),
+    )
+    return System(front=proxy, consumer=decode, encoders=encoders, proxy=proxy)
 
 
-def start_queue_sampler(target: Target, instances: dict[str, int]) -> None:
-    """Begin sampling each instance's queue depth in the background."""
-    pairs = " ".join(f"{name}={port}" for name, port in instances.items())
-    target.sh(f"rm -f {QUEUE_CSV}", check=False)
+# --------------------------------------------------------------------------
+# Queue-depth sampling
+# --------------------------------------------------------------------------
+
+# Samples vllm:num_requests_{running,waiting} from every instance's /metrics.
+# Queue depth is what distinguishes "the system is working" from "the system
+# is a queue with a benchmark attached", which is what invalidated the first
+# rate=inf measurements. Emits "epoch,name,metric,value".
+_QUEUE_SAMPLER = r"""
+while true; do
+    NOW=$(date +%s.%N)
+    for pair in "$@"; do
+        NAME=${pair%%=*}
+        PORT=${pair##*=}
+        curl -s --max-time 2 "http://127.0.0.1:${PORT}/metrics" 2>/dev/null \
+            | grep -E '^vllm:num_requests_(running|waiting)[ {]' \
+            | awk -v t="$NOW" -v n="$NAME" \
+                '{split($1, f, "{"); print t "," n "," f[1] "," $NF}' \
+            >> "$OUT"
+    done
+    sleep "$INTERVAL"
+done
+"""
+
+
+def start_queue_sampler(target: Target, args: argparse.Namespace, sys_: System):
+    pairs = " ".join(f"{s.name}={s.port}" for s in sys_.vllm_servers)
+    csv = args.queue_csv
+    target.sh(f"rm -f {csv}", check=False)
     target.sh_detached(
-        f"setsid bash {QUEUE_SAMPLER} {QUEUE_SAMPLE_INTERVAL_S} {QUEUE_CSV} "
-        f"{pairs} < /dev/null > /dev/null 2>&1 & echo $! > {QUEUE_CSV}.pid; disown"
+        f"INTERVAL={QUEUE_SAMPLE_INTERVAL_S} OUT={csv} setsid bash -c "
+        f"{shlex.quote(_QUEUE_SAMPLER)} _ {pairs} < /dev/null > /dev/null 2>&1 & "
+        f"echo $! > {csv}.pid; disown"
     )
 
 
-def stop_queue_sampler(target: Target) -> None:
+def stop_queue_sampler(target: Target, args: argparse.Namespace) -> None:
+    csv = args.queue_csv
     target.sh(
-        f'pid=$(cat {QUEUE_CSV}.pid 2>/dev/null || true); '
+        f"pid=$(cat {csv}.pid 2>/dev/null || true); "
         f'if [ -n "$pid" ]; then kill -TERM -"$pid" 2>/dev/null || '
-        f'kill "$pid" 2>/dev/null || true; fi; rm -f {QUEUE_CSV}.pid',
+        f'kill "$pid" 2>/dev/null || true; fi; rm -f {csv}.pid',
         check=False,
     )
 
@@ -663,13 +727,17 @@ def queue_stats(csv_text: str, t_start: float, t_end: float) -> dict[str, Any]:
     return out
 
 
+# --------------------------------------------------------------------------
+# Gates
+# --------------------------------------------------------------------------
+
+
 def image_refs_in_prefix(target: Target, workload_dir: str, num_prompts: int) -> int:
     """Image references in the first `num_prompts` lines of the workload.
 
-    The manifest counts the whole workload, so comparing a short run's rewrite
-    count against it understates coverage purely arithmetically -- 120 of 400
-    requests can never cover 370 references. `--disable-shuffle` means the
-    client replays the file in order, so the prefix is exactly what was sent.
+    The manifest counts the whole workload, so a short run's rewrite count
+    must be measured against the prefix it actually sent. `--disable-shuffle`
+    means the client replays the file in order, so the prefix is exact.
     """
     text = target.read_text(f"{workload_dir}/workload.jsonl")
     refs = 0
@@ -690,355 +758,97 @@ def image_refs_in_prefix(target: Target, workload_dir: str, num_prompts: int) ->
     return refs
 
 
-def _epd_instances(
-    target: Target, args: argparse.Namespace, config: str
-) -> tuple[list[BenchServer], BenchServer, BenchServer]:
-    """Encoder, decode and proxy for one EPD configuration.
-
-    The encoder is an EC producer, the decode instance an EC consumer, and the
-    proxy is what turns one client request into an encode call plus a decode
-    call. Only two things vary between configurations: whether the proxy rewrites
-    the image into a grid reference, and where the encoder's image transform
-    runs.
-    """
-    rewrite, device, connector = EPD_CONFIGS[config]
-
-    def ec_for(role: str) -> dict[str, Any] | None:
-        """Connector config for one role, or None for the no-connector arm."""
-        if not connector:
-            return None
-        if connector == "ECCPUConnector":
-            # Two separate processes cannot share one instance's mmap region, so
-            # the peer-to-peer transport is what carries an entry across; the
-            # producer announces its side-channel address through
-            # ec_transfer_params and the consumer dials it.
-            return {
-                "ec_connector": connector,
-                "ec_role": role,
-                "ec_connector_extra_config": {
-                    "ec_enable_nixl": "True",
-                    "ec_cpu_bytes": args.ec_cpu_bytes,
-                },
-            }
-        return {
-            "ec_connector": connector,
-            "ec_role": role,
-            "ec_connector_extra_config": {
-                "shared_storage_path": args.shared_storage_path
-            },
-        }
-
-    # The device list's length is the encoder count; a device repeated in it
-    # means those encoders share one GPU and must split its memory.
-    devices = [d.strip() for d in args.encoder_devices.split(",") if d.strip()]
-    if not devices:
-        raise SystemExit("[bench] --encoder-devices names no device")
-    shared = {dev: devices.count(dev) for dev in set(devices)}
-
-    # Encoder ports grow from --encoder-port, so they can silently swallow the
-    # decode or proxy port as the encoder count rises.
-    encoder_ports = {args.encoder_port + i for i in range(len(devices))}
-    for label, port in (("decode", args.decode_port), ("proxy", args.proxy_port)):
-        if port in encoder_ports:
-            raise SystemExit(
-                f"[bench] the {label} port {port} lies inside the encoder range "
-                f"{min(encoder_ports)}-{max(encoder_ports)} for "
-                f"{len(devices)} encoder(s); move --{label}-port or "
-                "--encoder-port"
-            )
-    if args.decode_port == args.proxy_port:
-        raise SystemExit("[bench] --decode-port and --proxy-port are the same")
-
-    encoders: list[BenchServer] = []
-    for index, dev in enumerate(devices):
-        util = args.encoder_gpu_memory_utilization or round(
-            args.gpu_memory_utilization / shared[dev], 3
-        )
-        nixl_env: tuple[str, ...] = ()
-        if connector == "ECCPUConnector":
-            # Each producer binds its own side channel, and each announces its
-            # own address through ec_transfer_params, which is how a consumer
-            # ends up holding one session per peer.
-            nixl_env = (
-                "VLLM_EC_SIDE_CHANNEL_HOST=127.0.0.1",
-                f"VLLM_EC_SIDE_CHANNEL_PORT={args.side_channel_port + index}",
-            )
-        encoders.append(
-            BenchServer(
-                target=target, args=args, arm=config, name=f"encoder{index}",
-                log_path=f"{LOG_DIR}/epd_encoder{index}.log",
-                port=args.encoder_port + index, gpu=dev, gpu_util=util,
-                ec_config=ec_for("ec_producer"),
-                extra_env=nixl_env,
-                # mm_tensor_ipc is load-bearing for the device choice: any
-                # transport but torch_shm copies the result back to host, so
-                # `auto` declines the accelerator and logs that it did.
-                # mm_processor_cache_type is a different knob despite the
-                # similar name: with "shm" the engine keeps no receiver cache,
-                # the processed data is refilled in the worker instead, and the
-                # connector reports no grid -- so the proxy would have nothing
-                # to substitute.
-                extra_args=(
-                    f"--mm-processor-device {device}",
-                    f"--mm-tensor-ipc {args.mm_tensor_ipc}",
-                    f"--mm-processor-cache-type {args.mm_processor_cache_type}",
-                )
-                + (("--mm-encoder-only",) if args.mm_encoder_only else ())
-                + (("--enforce-eager",) if args.encoder_enforce_eager else ()),
-            )
-        )
-    decode = BenchServer(
-        target=target, args=args, arm=config, name="decode",
-        log_path=f"{LOG_DIR}/epd_decode.log",
-        port=args.decode_port, gpu=args.decode_gpu,
-        ec_config=ec_for("ec_consumer"),
-        extra_env=nixl_env,
-        # Without this the decode instance rejects any image_embeds part with
-        # "You must set `--enable-mm-embeds`", which is what a rewritten request
-        # is made of. Set in every configuration, not just the rewriting ones:
-        # it also affects encoder-budget accounting (multimodal/encoder_budget.py),
-        # and a flag that differs between arms is a confound rather than a switch.
-        extra_args=("--enable-mm-embeds",),
-    )
-    encode_urls = ",".join(f"http://127.0.0.1:{e.port}" for e in encoders)
-    proxy_cmd = " ".join(
-        [
-            f"{args.python} {args.vllm_repo}/{PROXY}",
-            f"--host 127.0.0.1 --port {args.proxy_port}",
-            f"--encode-servers-urls {encode_urls}",
-            "--prefill-servers-urls disable",
-            f"--decode-servers-urls http://127.0.0.1:{args.decode_port}",
-        ]
-        + ([] if rewrite else ["--no-rewrite"])
-    )
-    proxy = BenchServer(
-        target=target, args=args, arm=config, name="proxy",
-        log_path=f"{LOG_DIR}/epd_proxy.log",
-        port=args.proxy_port, command=proxy_cmd,
-        match=("disagg_epd_proxy.py", f"--port {args.proxy_port}"),
-    )
-    return encoders, decode, proxy
-
-
-def _check_coverage(
-    config: str,
-    rewrote: int,
-    image_refs: int,
-    floor: float,
-    when: str,
-    *,
-    require_coverage: bool = True,
+def check_rewrite(
+    name: str, rewrote: int, image_refs: int, floor: float, when: str
 ) -> float:
-    """Coverage of the rewrite change, raising when it is too low to measure.
+    """Coverage of the grid substitution, raising when it is too low to measure.
 
     The proxy logs "Rewrote N" for any N >= 1 and falls back per item, so
-    presence proves nothing about how much of the workload was covered.
-
-    An item is rewritable when the encoder reported a grid for it, which needs
-    the item's processed data to be present on the scheduler side. A processor
-    cache hit does not prevent that: the engine refills it before scheduling
-    (`engine/core.py:997`). It goes missing under
-    `mm_processor_cache_type=shm`, where the engine keeps no receiver cache and
-    the refill happens in the worker instead -- too late for the connector to
-    see. Hence the floor is a knob: it catches that configuration empirically
-    rather than trusting the reasoning above.
+    presence proves nothing about how much of the workload was covered. An
+    item is rewritable only when the encoder reported a grid for it, which
+    needs its processed data on the scheduler side -- missing under
+    `mm_processor_cache_type=shm`, and legitimately absent for a repeat the
+    encoder served from its processor cache. `floor=0` only checks presence,
+    which is what the warmup's handful of requests can support.
     """
-    rewrite = EPD_CONFIGS[config][0]
+    rewrite = ARMS[name].rewrite
     coverage = rewrote / image_refs if image_refs else 0.0
     if not rewrite:
         if rewrote:
             raise ServerMismatchError(
-                f"{config} ({when}): --no-rewrite was passed, but the proxy "
-                f"still rewrote {rewrote} item(s)"
+                f"{name} ({when}): --no-rewrite was passed, but the proxy still "
+                f"rewrote {rewrote} item(s)"
             )
         return 0.0
     if not rewrote:
         raise ServerMismatchError(
-            f"{config} ({when}): the proxy rewrote nothing, so the change under "
-            "test never engaged"
+            f"{name} ({when}): the proxy rewrote nothing, so the grid "
+            "substitution never engaged"
         )
-    # The warmup sends a fraction of the workload, so its rewrite count cannot be
-    # measured against the whole workload's reference count -- only the rated
-    # runs, which replay all of it, have the right denominator.
-    if not require_coverage:
-        return coverage
     if coverage < floor:
         raise ServerMismatchError(
-            f"{config} ({when}): the proxy rewrote {rewrote} of {image_refs} "
-            f"image references ({coverage:.0%}), below the {floor:.0%} floor. "
-            "An item is only rewritable when the encoder reported a grid for it, "
-            "which needs its processed data on the scheduler side; check the "
-            "encoder is not running with mm_processor_cache_type=shm, where the "
-            "refill happens in the worker and the connector never sees it. "
-            "Lower --min-rewrite-coverage only after checking that."
+            f"{name} ({when}): the proxy rewrote {rewrote} of {image_refs} image "
+            f"references ({coverage:.0%}), below the {floor:.0%} floor. Check the "
+            "encoder is not running with mm_processor_cache_type=shm; lower "
+            "--min-rewrite-coverage only after that."
         )
     return coverage
 
 
-def verify_epd(
-    config: str,
-    encoders: list[BenchServer],
-    proxy: BenchServer,
-    image_refs: int,
-) -> float:
-    """Fail unless both switches for this configuration actually took effect.
-
-    The GPU transform declines silently when its preconditions are unmet, and a
-    proxy that rewrote nothing looks identical in the timings to one that was
-    asked not to. Measuring either without checking would attribute a
-    configuration's numbers to a change that never happened.
-
-    Coverage, not just presence: the proxy falls back per item, and logs
-    "Rewrote N" for any N >= 1, so a run that rewrote one item of hundreds would
-    otherwise pass as the rewrite configuration while behaving like baseline.
-    An item is only rewritable when the encoder actually ran the transform for
-    it -- a repeat served from the encoder's processor cache reports no metadata
-    -- so on a reuse-heavy workload coverage is legitimately far below 1.0, and
-    the floor is a knob rather than a constant.
-
-    Returns the measured coverage.
-    """
-    rewrite, device, _connector = EPD_CONFIGS[config]
-    encoder = encoders[0]
-    encoder_log = encoder.target.read_text(encoder.log_path)
-    on_gpu = _GPU_PROCESSOR_MARKER in encoder_log
-    if (device == "cuda") != on_gpu:
+def check_loads(name: str, when: str, consumer: dict[str, Any]) -> None:
+    """A connector arm that transferred nothing looks, in the timings, exactly
+    like the no-connector arm; assert the direction both ways."""
+    loads = consumer["ec_load_entries"]
+    if ARMS[name].expects_loads and not loads:
         raise ServerMismatchError(
-            f"{config}: asked for the image transform on {device}, but the "
-            f"encoder log {'shows' if on_gpu else 'does not show'} "
-            f"{_GPU_PROCESSOR_MARKER!r}. With mm_tensor_ipc="
-            f"{encoder.args.mm_tensor_ipc} the accelerator may have been "
-            "declined; the encoder log states the reason."
+            f"{name} ({when}): the consumer loaded no encodings, so nothing was "
+            "transferred and this arm measures local recompute"
         )
-    rewrote = rewritten_items(proxy.target.read_text(proxy.log_path))
-    _check_coverage(
-        config, rewrote, image_refs, encoder.args.min_rewrite_coverage, "warmup",
-        require_coverage=False,
-    )
-    print(
-        f"[bench] verified {config}: transform on {device}, proxy rewrote "
-        f"{rewrote} item(s) during warmup"
-    )
-    return 0.0
-
-
-def run_epd_config(
-    target: Target, args: argparse.Namespace, config: str, num_prompts: int
-) -> list[dict[str, Any]]:
-    """Measure one EPD configuration across every requested request rate."""
-    encoders, decode, proxy = _epd_instances(target, args, config)
-    try:
-        for server in [*encoders, decode]:
-            server.start(instrument=False)
-            server.wait_healthy()
-            server.verify_arm()
-        proxy.start(instrument=False)
-        proxy.wait_for_log("Uvicorn running")
-
-        print(f"[bench] {config}: warmup")
-        warm = max(4, min(16, num_prompts // 10))
-        target.sh(
-            proxy.bench_serve_script(warm, "inf", "/tmp/warmup.json"),
-            timeout=args.bench_timeout_s, check=False,
+    if not ARMS[name].expects_loads and loads:
+        raise ServerMismatchError(
+            f"{name} ({when}): the consumer loaded {loads} encodings, but this "
+            "arm is not supposed to transfer anything"
         )
-        verify_epd(config, encoders, proxy, args.image_refs)
 
-        results: list[dict[str, Any]] = []
-        start_queue_sampler(
-            target,
-            {e.name: e.port for e in encoders} | {"decode": args.decode_port},
+
+def check_fanout(name: str, when: str, per_encoder: dict[str, int]) -> None:
+    """If the proxy's round-robin left an encoder idle, fewer encoders were
+    measured than configured, with the rest burning memory for nothing."""
+    idle = [enc for enc, done in per_encoder.items() if not done]
+    if len(per_encoder) > 1 and idle:
+        raise ServerMismatchError(
+            f"{name} ({when}): {idle} computed no encoder inputs, so the fan-out "
+            f"reached only {len(per_encoder) - len(idle)} of {len(per_encoder)} "
+            "encoders"
         )
-        for rate, conc in args.load_points:
-            decode.reset_caches()
-            trio = (*encoders, decode, proxy)
-            marks = {s.name: target.file_size(s.log_path) for s in trio}
-            out_path = f"/tmp/bench_epd_{config}_{rate}_c{conc}.json"
-            print(
-                f"[bench] {config}: rate={rate} concurrency={conc or 'unbounded'}, "
-                f"{num_prompts} prompts"
-            )
-            t_start = time.time()
-            target.sh(
-                proxy.bench_serve_script(num_prompts, rate, out_path, conc),
-                timeout=args.bench_timeout_s,
-            )
-            t_end = time.time()
-            time.sleep(args.settle_s)
-            slices = {
-                s.name: target.read_bytes(
-                    s.log_path, marks[s.name], target.file_size(s.log_path)
-                )
-                for s in trio
-            }
-            client_stats = json.loads(raw) if raw.strip() else {}
-            done = client_stats.get("completed", 0)
-            if done < num_prompts:
-                raise ServerMismatchError(
-                    f"{config} (c={conc}): only {done} of {num_prompts} requests "
-                    "completed, so the latencies describe the few that survived. "
-                    f"Check {decode.log_path} and {proxy.log_path} for errors"
-                )
-            rewrote_this_rate = rewritten_items(slices["proxy"])
-            rate_coverage = _check_coverage(
-                config, rewrote_this_rate, args.image_refs,
-                args.min_rewrite_coverage, f"rate={rate}",
-            )
-            raw = target.read_text(out_path)
-            # A connector arm that transferred nothing looks, in the timings,
-            # exactly like the no-connector arm. Assert the direction both ways.
-            decode_stats = summarize(slices["decode"])
-            loads = decode_stats["ec_load_entries"] or decode_stats["ec_example_loads"]
-            expects_loads = config in EPD_EXPECT_LOADS
-            if expects_loads and not loads:
-                raise ServerMismatchError(
-                    f"{config} (c={conc}): the consumer loaded no encodings, so "
-                    "nothing was transferred and this arm measures local "
-                    "recompute rather than the connector"
-                )
-            if not expects_loads and loads:
-                raise ServerMismatchError(
-                    f"{config} (c={conc}): the consumer loaded {loads} encodings, "
-                    "but this arm is not supposed to transfer anything"
-                )
-            # Fan-out must actually reach every encoder: if the proxy's
-            # round-robin left one idle we are measuring fewer encoders than we
-            # think, with the rest burning memory for nothing.
-            per_encoder = {
-                e.name: summarize(slices[e.name])["encoder_inputs_computed"]
-                for e in encoders
-            }
-            idle = [name for name, done in per_encoder.items() if not done]
-            if len(encoders) > 1 and idle:
-                raise ServerMismatchError(
-                    f"{config} (c={conc}): {idle} computed no encoder inputs, so "
-                    f"the fan-out reached only {len(encoders) - len(idle)} of "
-                    f"{len(encoders)} encoders"
-                )
-            results.append(
-                {
-                    "arm": config,
-                    "encoders": len(encoders),
-                    "per_encoder_inputs": per_encoder,
-                    "request_rate": rate,
-                    "concurrency": conc,
-                    "queue": queue_stats(
-                        target.read_text(QUEUE_CSV), t_start, t_end
-                    ),
-                    "client": client_stats,
-                    "server": decode_stats,
-                    "encoder": summarize(slices[encoders[0].name]),
-                    # Per-stage attribution the proxy already logs, which is what
-                    # says whether a win came from the decode side or elsewhere.
-                    "stages": stage_summary(slices["proxy"]),
-                    "rewritten": rewrote_this_rate,
-                    "rewrite_coverage": round(rate_coverage, 4),
-                }
-            )
-        return results
-    finally:
-        stop_queue_sampler(target)
-        for server in (proxy, decode, *reversed(encoders)):
-            server.stop()
+
+
+def verify_epd_engaged(
+    name: str, args: argparse.Namespace, sys_: System, when: str
+) -> None:
+    """Fail unless the transform device and the rewrite switch took effect.
+
+    The GPU transform declines silently when its preconditions are unmet, and
+    a proxy that rewrote nothing looks identical in the timings to one that
+    was asked not to.
+    """
+    encoder = sys_.encoders[0]
+    on_gpu = _GPU_PROCESSOR_MARKER in encoder.target.read_text(encoder.log_path)
+    if (args.mm_processor_device == "cuda") != on_gpu:
+        raise ServerMismatchError(
+            f"{name}: asked for the image transform on {args.mm_processor_device}, "
+            f"but the encoder log {'shows' if on_gpu else 'does not show'} "
+            f"{_GPU_PROCESSOR_MARKER!r}; the encoder log states the reason"
+        )
+    assert sys_.proxy is not None
+    rewrote = rewritten_items(sys_.proxy.target.read_text(sys_.proxy.log_path))
+    check_rewrite(name, rewrote, args.image_refs, 0.0, when)
+    print(f"[bench] verified {name}: proxy rewrote {rewrote} item(s) during {when}")
+
+
+# --------------------------------------------------------------------------
+# Measurement
+# --------------------------------------------------------------------------
 
 
 def parse_frag(text: str) -> dict[str, Any]:
@@ -1069,112 +879,249 @@ def parse_frag(text: str) -> dict[str, Any]:
     return {"rows": len(rows), "by_caller": by_caller}
 
 
+def measure_point(
+    target: Target,
+    args: argparse.Namespace,
+    name: str,
+    sys_: System,
+    num_prompts: int,
+    rate: str,
+    conc: int,
+) -> dict[str, Any]:
+    """One load point: drive the workload once and account for it."""
+    when = f"rate={rate} c={conc}"
+    for server in sys_.vllm_servers:
+        server.reset_caches()
+    marks = {s.name: target.file_size(s.log_path) for s in sys_.servers}
+    out_path = f"{args.work_dir}/bench_{name}_{rate}_c{conc}.json"
+    print(f"[bench] {name}: {when} ({conc or 'unbounded'}), {num_prompts} prompts")
+    t_start = time.time()
+    target.sh(
+        sys_.front.bench_serve_script(num_prompts, rate, out_path, conc),
+        timeout=args.bench_timeout_s,
+    )
+    t_end = time.time()
+    # Completion reports land after the last response.
+    time.sleep(args.settle_s)
+    slices = {
+        s.name: target.read_bytes(
+            s.log_path, marks[s.name], target.file_size(s.log_path)
+        )
+        for s in sys_.servers
+    }
+    raw = target.read_text(out_path)
+    client = json.loads(raw) if raw.strip() else {}
+    done = client.get("completed", 0)
+    if done < num_prompts:
+        raise ServerMismatchError(
+            f"{name} ({when}): only {done} of {num_prompts} requests completed, so "
+            f"the latencies describe the few that survived; see "
+            f"{sys_.consumer.log_path}"
+        )
+    consumer = summarize(slices[sys_.consumer.name])
+    check_loads(name, when, consumer)
+    per_encoder = {
+        e.name: summarize(slices[e.name])["encoder_inputs_computed"]
+        for e in sys_.encoders
+    }
+    check_fanout(name, when, per_encoder)
+    entry: dict[str, Any] = {
+        "arm": name,
+        "topology": ARMS[name].topology,
+        "request_rate": rate,
+        "concurrency": conc,
+        "client": client,
+        # Where loads land and the language model runs: the single instance,
+        # or the decode instance.
+        "server": consumer,
+        "encoders": len(sys_.encoders),
+        "per_encoder_inputs": per_encoder,
+        "queue": queue_stats(target.read_text(args.queue_csv), t_start, t_end),
+    }
+    if sys_.proxy is not None:
+        rewrote = rewritten_items(slices["proxy"])
+        entry["encoder"] = summarize(slices[sys_.encoders[0].name])
+        # Per-stage attribution the proxy logs, which says whether a win came
+        # from the decode side or elsewhere.
+        entry["stages"] = stage_summary(slices["proxy"])
+        entry["rewritten"] = rewrote
+        entry["rewrite_coverage"] = round(
+            check_rewrite(
+                name, rewrote, args.image_refs, args.min_rewrite_coverage, when
+            ),
+            4,
+        )
+    if args.frag:
+        log = slices[sys_.consumer.name]
+        entry["windows"] = window_stats(log, args.frag_window_s)
+        entry["decay"] = decay_report(entry["windows"], "load")
+        entry["descriptors"] = parse_frag(target.read_text(args.frag_file))
+    return entry
+
+
+def run_points(
+    target: Target,
+    args: argparse.Namespace,
+    name: str,
+    num_prompts: int,
+    points: list[tuple[str, int]],
+) -> list[dict[str, Any]]:
+    """Start the arm's system once, measure `points` on it, tear it down."""
+    sys_ = build_system(target, args, name)
+    if ARMS[name].topology == "epd":
+        # A config must not inherit encodings the previous one saved: those
+        # would be free hits it never paid for.
+        target.sh(
+            f"rm -rf {args.shared_storage_path} && mkdir -p {args.shared_storage_path}",
+            check=False,
+        )
+    try:
+        for server in sys_.vllm_servers:
+            server.start(instrument=args.frag)
+            server.wait_healthy()
+            server.verify()
+        if sys_.proxy is not None:
+            sys_.proxy.start()
+            sys_.proxy.wait_for_log("Uvicorn running")
+
+        # The warmup replays the first lines of the workload, so those images
+        # enter every cache before measurement starts; the manifest's hit rate
+        # is an upper bound for that reason too.
+        print(f"[bench] {name}: warmup")
+        warm = max(4, min(16, num_prompts // 10))
+        target.sh(
+            sys_.front.bench_serve_script(warm, "inf", f"{args.work_dir}/warmup.json"),
+            timeout=args.bench_timeout_s,
+            check=False,
+        )
+        if sys_.proxy is not None:
+            verify_epd_engaged(name, args, sys_, "warmup")
+
+        results = []
+        start_queue_sampler(target, args, sys_)
+        try:
+            for rate, conc in points:
+                results.append(
+                    measure_point(target, args, name, sys_, num_prompts, rate, conc)
+                )
+        finally:
+            stop_queue_sampler(target, args)
+        return results
+    finally:
+        for server in reversed(sys_.servers):
+            server.stop()
+
+
+def run_arm(
+    target: Target, args: argparse.Namespace, name: str, num_prompts: int
+) -> list[dict[str, Any]]:
+    """Measure one arm across every load point.
+
+    With `--restart-per-load-point` each point gets fresh servers, so the EC
+    region (which no reset route touches) starts empty every time and every
+    point pays its saves. Otherwise the first point pays them and later points
+    run against a warm region: arm-to-arm comparison at one point stays fair,
+    the within-arm scaling curve does not.
+    """
+    if args.restart_per_load_point:
+        results = []
+        for point in args.load_points:
+            results.extend(run_points(target, args, name, num_prompts, [point]))
+        return results
+    return run_points(target, args, name, num_prompts, args.load_points)
+
+
+# --------------------------------------------------------------------------
+# Reporting
+# --------------------------------------------------------------------------
+
+
 def _metric(client: dict[str, Any], key: str) -> Any:
     value = client.get(key)
     return round(value, 2) if isinstance(value, (int, float)) else "-"
 
 
-def print_table(results: list[dict[str, Any]]) -> None:
-    header = (
-        f"{'arm':<10} {'rate':>5} {'ttft_p50':>9} {'ttft_p99':>9} {'itl_p50':>8} "
-        f"{'out_tok/s':>10} {'ec_loads':>9} {'enc_inputs':>11} {'load_GB/s':>10}"
-    )
-    print("\n" + header)
-    print("-" * len(header))
-    for entry in results:
-        client, server = entry["client"], entry["server"]
-        print(
-            f"{entry['arm']:<10} {str(entry['request_rate']):>5} "
-            f"{_metric(client, 'median_ttft_ms'):>9} "
-            f"{_metric(client, 'p99_ttft_ms'):>9} "
-            f"{_metric(client, 'median_itl_ms'):>8} "
-            f"{_metric(client, 'output_throughput'):>10} "
-            f"{server['ec_load_entries']:>9} "
-            f"{server['encoder_inputs_computed']:>11} "
-            f"{server['ec_load_gbps']:>10}"
-        )
-
-
 def _max_encoder_queue(queue: dict[str, Any]) -> Any:
-    """Worst waiting depth across however many encoders ran."""
     depths = [
-        v
-        for k, v in queue.items()
-        if k.startswith("encoder") and "waiting_max" in k
+        v for k, v in queue.items() if k.startswith("encoder") and "waiting_max" in k
     ]
     return max(depths) if depths else "-"
 
 
-def print_epd_table(results: list[dict[str, Any]]) -> None:
-    """One row per configuration, with ratios against `baseline` where present.
+def print_table(results: list[dict[str, Any]]) -> None:
+    """One row per (arm, load point), with throughput ratios against baseline.
 
-    `encode` and `decode_ttfb` are the proxy's own stage timings, which is what
-    separates "the decode instance stopped redoing the transform" from a change
-    somewhere else.
+    `saves`/`loads` are connector entries on the consumer side; `enc_inputs`
+    is what the consumer still computed itself. `encode`/`dec_ttfb` are the
+    proxy's stage medians, EPD arms only. The baseline runs on one GPU while
+    EPD arms use two: x_base credits disaggregation with the extra hardware
+    unless --tensor-parallel-size 2 evens it out.
     """
     header = (
-        f"{'config':<9} {'conc':>5} {'ttft_p50':>9} {'ttft_p99':>9} "
-        f"{'out_tok/s':>10} {'x_base':>7} {'encode':>8} {'dec_ttfb':>9} "
-        f"{'encQmax':>8} {'decQmax':>8} {'rewrote':>8}"
+        f"{'arm':<13} {'rate':>5} {'conc':>5} {'ttft_p50':>9} {'ttft_p99':>9} "
+        f"{'out_tok/s':>10} {'x_base':>7} {'saves':>6} {'loads':>6} "
+        f"{'enc_inputs':>10} {'encode':>8} {'dec_ttfb':>9} {'encQmax':>8} "
+        f"{'decQmax':>8} {'rewrote':>8}"
     )
     print("\n" + header)
     print("-" * len(header))
     base = {
-        (r["request_rate"], r.get("concurrency")): r["client"].get("output_throughput")
+        (r["request_rate"], r["concurrency"]): r["client"].get("output_throughput")
         for r in results
         if r["arm"] == "baseline"
     }
     for r in results:
-        stages, client = r["stages"], r["client"]
-        ref = base.get((r["request_rate"], r.get("concurrency")))
+        client, server = r["client"], r["server"]
+        stages, queue = r.get("stages", {}), r.get("queue", {})
+        ref = base.get((r["request_rate"], r["concurrency"]))
         got = client.get("output_throughput")
-        ratio = (
-            f"{got / ref:.2f}" if isinstance(ref, float) and isinstance(got, float)
-            and ref else "-"
-        )
-        q = r.get("queue", {})
+        ratio = f"{got / ref:.2f}" if isinstance(ref, float) and got and ref else "-"
+        consumer = "single" if r["topology"] == "single" else "decode"
         print(
-            f"{r['arm']:<9} {str(r.get('concurrency', 0)):>5} "
+            f"{r['arm']:<13} {str(r['request_rate']):>5} {r['concurrency']:>5} "
             f"{_metric(client, 'median_ttft_ms'):>9} "
             f"{_metric(client, 'p99_ttft_ms'):>9} "
             f"{_metric(client, 'output_throughput'):>10} {ratio:>7} "
+            f"{server['ec_save_entries']:>6} {server['ec_load_entries']:>6} "
+            f"{server['encoder_inputs_computed']:>10} "
             f"{stages.get('encode_ms_median', '-'):>8} "
             f"{stages.get('decode_ttfb_ms_median', '-'):>9} "
-            f"{_max_encoder_queue(q):>8} "
-            f"{q.get('decode_waiting_max', '-'):>8} "
-            f"{r.get('rewritten', 0):>8}"
+            f"{_max_encoder_queue(queue):>8} "
+            f"{queue.get(f'{consumer}_waiting_max', '-'):>8} "
+            f"{r.get('rewritten', '-'):>8}"
         )
 
 
 def check_gates(results: list[dict[str, Any]]) -> bool:
-    """Phase 0's gates, re-applied to the real workload.
-
-    Without these a timing delta is unattributable: if the connector never
-    loaded anything, the arms differ by noise and configuration rather than by
-    the mechanism under test.
-    """
-    by_arm = {arm: [r for r in results if r["arm"] == arm] for arm in ARMS}
-    if not all(by_arm.values()):
-        print("\n[bench] single arm only; both arms are needed for the gates")
-        return False
+    """Every connector arm must have computed fewer encoder inputs on its
+    consumer than the baseline did at the same load point, and loaded
+    something; otherwise the arms differ by noise and configuration rather
+    than by the mechanism under test."""
+    base = {
+        (r["request_rate"], r["concurrency"]): r["server"]["encoder_inputs_computed"]
+        for r in results
+        if r["arm"] == "baseline"
+    }
+    if not base:
+        print("\n[bench] no baseline arm; the encoder-compute gate needs one")
+        return True
     ok = True
-    for conn, base in zip(by_arm["connector"], by_arm["recompute"]):
-        rate = conn["request_rate"]
-        loads = conn["server"]["ec_load_entries"]
-        conn_enc = conn["server"]["encoder_inputs_computed"]
-        base_enc = base["server"]["encoder_inputs_computed"]
-        gate_load = loads > 0
-        gate_skip = conn_enc < base_enc
-        ok = ok and gate_load and gate_skip
+    for r in results:
+        if not ARMS[r["arm"]].expects_loads:
+            continue
+        ref = base.get((r["request_rate"], r["concurrency"]))
+        if ref is None:
+            continue
+        loads = r["server"]["ec_load_entries"]
+        computed = r["server"]["encoder_inputs_computed"]
+        passed = loads > 0 and computed < ref
+        ok = ok and passed
+        avoided = f"{(1 - computed / ref) * 100:.1f}%" if ref else "-"
         print(
-            f"[bench] rate={rate}: ec_load fired "
-            f"{'PASS' if gate_load else 'FAIL'} ({loads} entries); "
-            f"encoder compute dropped {'PASS' if gate_skip else 'FAIL'} "
-            f"({conn_enc} vs {base_enc})"
+            f"[bench] {r['arm']} rate={r['request_rate']} c={r['concurrency']}: "
+            f"{'PASS' if passed else 'FAIL'} ({loads} loads; consumer computed "
+            f"{computed} vs baseline {ref}, avoided {avoided})"
         )
-        if base_enc:
-            avoided = 1 - conn_enc / base_enc
-            print(f"[bench] rate={rate}: encoder inputs avoided {avoided * 100:.1f}%")
     return ok
 
 
@@ -1190,26 +1137,55 @@ def print_frag(results: list[dict[str, Any]]) -> None:
             )
 
 
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--pod", default="vllm-omer-2", help="empty string runs locally")
-    p.add_argument("--python", default="/vllm-workspace/venv-vllm/bin/python")
+    p.add_argument("--pod", default="", help="run the servers inside this pod (oc)")
+    p.add_argument(
+        "--python",
+        default="",
+        help="interpreter on the target; defaults to this one locally, or "
+        "`python` inside a pod",
+    )
+    p.add_argument(
+        "--vllm-repo",
+        default=str(BENCH_DIR.parents[2]),
+        help="checkout on the target, for the EPD proxy script",
+    )
+    p.add_argument(
+        "--work-dir",
+        default="/tmp/ec_bench",
+        help="scratch directory on the target: logs, pid files, bench outputs",
+    )
+    p.add_argument("--hf-home", default="", help="HF_HOME for the servers")
     p.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
-    p.add_argument("--workload-dir", default="/vllm-workspace/bench/wl")
+    p.add_argument("--workload-dir", required=True, help="from gen_workload.py")
     p.add_argument("--out-dir", type=Path, default=Path("bench_results"))
-    p.add_argument("--port", type=int, default=8100)
-    p.add_argument("--gpu", default="0")
-    p.add_argument("--arms", default=",".join(ARMS))
+    p.add_argument(
+        "--arms",
+        default=",".join(ARMS),
+        help=f"comma-separated subset of {', '.join(ARMS)}",
+    )
     p.add_argument("--request-rates", default="inf")
     p.add_argument(
         "--max-concurrency",
-        default="0",
-        help="comma-separated in-flight limits to sweep, e.g. 1,2,4,8. 0 means "
-        "unbounded, which at --request-rate inf floods the system and makes "
-        "every latency a queue measurement",
+        default="1,4,8",
+        help="comma-separated in-flight limits to sweep. 0 means unbounded, "
+        "which at --request-rate inf floods the system and makes every latency "
+        "a queue measurement",
     )
     p.add_argument("--num-prompts", type=int, default=0, help="0 = whole workload")
     p.add_argument("--output-len", type=int, default=32)
+    p.add_argument(
+        "--restart-per-load-point",
+        action="store_true",
+        help="fresh servers for every load point, so the EC region starts "
+        "empty each time and every point pays its saves",
+    )
     p.add_argument("--ec-cpu-bytes", type=int, default=0, help="0 = from manifest")
     p.add_argument("--max-model-len", type=int, default=32768)
     p.add_argument("--max-num-batched-tokens", type=int, default=8192)
@@ -1225,52 +1201,35 @@ def parse_args() -> argparse.Namespace:
         "--tensor-parallel-size",
         type=int,
         default=1,
-        help="for the monolithic reference, whether it gets one GPU or matches "
-        "the two an EPD pair occupies",
+        help="for the single-instance arms and the decode instance: 1 gives the "
+        "baseline one GPU, 2 matches the two an EPD pair occupies",
     )
     p.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     p.add_argument("--startup-timeout-s", type=int, default=900)
     p.add_argument("--bench-timeout-s", type=int, default=3600)
     p.add_argument("--settle-s", type=float, default=5.0)
-    p.add_argument(
-        "--base-url",
-        default="",
-        help="measure a server this process does not manage (an EPD proxy, "
-        "say); requires --server-log and a single --arms value",
-    )
-    p.add_argument(
-        "--server-log",
-        default="",
-        help="server log to read EC accounting from; required with --base-url",
-    )
+    p.add_argument("--port", type=int, default=8100, help="single-instance arms")
+    p.add_argument("--gpu", default="0", help="single-instance arms")
     p.add_argument(
         "--frag",
         action="store_true",
-        help="connector arm only, region under the working set, descriptor "
+        help="offload arm only, region under the working set, descriptor "
         "counting on: measures whether entries stay contiguous as it churns",
     )
-    p.add_argument(
-        "--ec-enable-nixl",
-        action="store_true",
-        help="set ec_enable_nixl in the connector arm's extra config; "
-        "irrelevant to local offload",
-    )
     p.add_argument("--frag-window-s", type=float, default=30.0)
-    epd = p.add_argument_group("EPD topology (PR #50390)")
-    epd.add_argument("--topology", choices=("single", "epd"), default="single")
-    epd.add_argument(
-        "--epd-configs",
-        default=",".join(EPD_CONFIGS),
-        help="which of baseline,grid,gpu,both to measure",
+    p.add_argument(
+        "--patch-dir",
+        default=str(BENCH_DIR / "patches"),
+        help="directory holding the --frag sitecustomize.py, on the target",
     )
-    epd.add_argument("--vllm-repo", default="/vllm-workspace/vllm")
+    epd = p.add_argument_group("EPD arms")
     epd.add_argument(
         "--encoder-devices",
         default="0",
         help="comma-separated devices for the encoder instances; the list's "
         "length is the encoder count, and a device repeated in it means those "
         "encoders share one GPU and split its memory. Accepts plain indices or "
-        "MIG UUIDs (MIG-...)",
+        "MIG UUIDs",
     )
     epd.add_argument(
         "--encoder-gpu-memory-utilization",
@@ -1290,31 +1249,25 @@ def parse_args() -> argparse.Namespace:
         "--encoder-enforce-eager",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="the EPD example states encoder instances are only compatible with "
-        "eager mode",
+        help="the EPD example requires eager mode on encoder instances",
     )
-    epd.add_argument(
-        "--encoder-port",
-        type=int,
-        default=8101,
-        help="first encoder's port; instance i uses this + i",
-    )
-    epd.add_argument(
-        "--decode-port",
-        type=int,
-        default=8200,
-        help="kept clear of the encoder range, which grows from --encoder-port",
-    )
+    epd.add_argument("--encoder-port", type=int, default=8101, help="+i per encoder")
+    epd.add_argument("--decode-port", type=int, default=8200)
     epd.add_argument("--proxy-port", type=int, default=8000)
-    epd.add_argument("--encoder-gpu", default="0")
     epd.add_argument("--decode-gpu", default="1")
+    epd.add_argument("--side-channel-port", type=int, default=5577, help="+i")
+    epd.add_argument("--shared-storage-path", default="", help="example connector")
     epd.add_argument(
-        "--ec-connector",
-        default="ECExampleConnector",
-        help="only used by the legacy baseline/grid/gpu/both configs",
+        "--mm-processor-device",
+        default="cpu",
+        choices=("cpu", "cuda"),
+        help="where the encoder's image transform runs; verified from its log",
     )
-    epd.add_argument("--side-channel-port", type=int, default=5577)
-    epd.add_argument("--shared-storage-path", default="/tmp/ec_bench_shared")
+    epd.add_argument(
+        "--mm-tensor-ipc",
+        default="torch_shm",
+        help="torch_shm is required for the transform to run on the accelerator",
+    )
     epd.add_argument(
         "--mm-processor-cache-type",
         default="lru",
@@ -1327,144 +1280,90 @@ def parse_args() -> argparse.Namespace:
         "--min-rewrite-coverage",
         type=float,
         default=0.5,
-        help="fraction of image references the proxy must rewrite for a rewrite "
-        "configuration to count as engaged; repeats served from the encoder's "
-        "processor cache legitimately keep their pixels",
-    )
-    epd.add_argument(
-        "--mm-tensor-ipc",
-        default="torch_shm",
-        help="torch_shm is required for the encoder's transform to run on the "
-        "accelerator; any other transport copies the result back to host and "
-        "the device choice is declined",
+        help="fraction of image references the proxy must rewrite for a grid "
+        "arm to count as engaged; repeats served from the encoder's processor "
+        "cache legitimately keep their pixels",
     )
     p.add_argument("--run-id", default=time.strftime("%Y%m%d-%H%M%S"))
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--dry-run", action="store_true")
-    return p.parse_args()
+    args = p.parse_args()
+
+    args.python = args.python or ("python" if args.pod else sys.executable)
+    args.shared_storage_path = args.shared_storage_path or f"{args.work_dir}/shared"
+    args.queue_csv = f"{args.work_dir}/queue.csv"
+    args.frag_file = f"{args.work_dir}/frag.jsonl"
+    rates = [r.strip() for r in args.request_rates.split(",") if r.strip()]
+    concurrencies = [int(c) for c in args.max_concurrency.split(",") if c.strip()]
+    args.load_points = [(r, c) for r in rates for c in concurrencies or [0]]
+    args.arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    if args.frag:
+        args.arms = ["offload"]
+    unknown = set(args.arms) - set(ARMS)
+    if unknown:
+        raise SystemExit(f"[bench] unknown arm(s): {sorted(unknown)}")
+    return args
+
+
+def load_manifest(target: Target, args: argparse.Namespace) -> dict[str, Any]:
+    raw = target.read_text(f"{args.workload_dir}/manifest.json")
+    manifest = json.loads(raw) if raw.strip() else {}
+    if not manifest:
+        raise SystemExit(
+            f"[bench] no manifest.json in {args.workload_dir}; run gen_workload.py"
+        )
+    # A manifest can outlive its images. Check they are there rather than
+    # failing deep inside the load generator with a confusing error.
+    pool = manifest.get("pool") or []
+    probes = sorted({pool[0]["path"], pool[-1]["path"]}) if pool else []
+    missing = [path for path in probes if not target.exists(path)]
+    if missing:
+        raise SystemExit(
+            f"[bench] the manifest references images that are not on the target "
+            f"({missing}); rebuild the pool with gen_workload.py"
+        )
+    return manifest
 
 
 def main() -> int:
     sys.stdout.reconfigure(line_buffering=True)
     args = parse_args()
-    args.request_rates = [r.strip() for r in args.request_rates.split(",") if r.strip()]
-    concurrencies = [
-        int(c) for c in str(args.max_concurrency).split(",") if c.strip()
-    ] or [0]
-    args.load_points = [(r, c) for r in args.request_rates for c in concurrencies]
-    if args.topology == "epd":
-        arms = [c.strip() for c in args.epd_configs.split(",") if c.strip()]
-        unknown = set(arms) - set(EPD_CONFIGS)
-    else:
-        arms = [a.strip() for a in args.arms.split(",") if a.strip()]
-        unknown = set(arms) - set(ARMS)
-    if unknown:
-        raise SystemExit(f"[bench] unknown arm(s)/config(s): {sorted(unknown)}")
-
-    if args.base_url:
-        if not args.server_log:
-            raise SystemExit("[bench] --base-url requires --server-log")
-        if len(arms) != 1:
-            raise SystemExit(
-                "[bench] --base-url measures one existing server, so name "
-                "exactly one arm with --arms"
-            )
-    if args.frag:
-        arms = ["connector"]
-
     target = Target(args.pod or None)
-    raw_manifest = target.read_text(f"{args.workload_dir}/manifest.json")
-    manifest = json.loads(raw_manifest) if raw_manifest.strip() else {}
-    if not manifest:
-        raise SystemExit(
-            f"[bench] no manifest.json in {args.workload_dir}; "
-            "run gen_workload.py first"
-        )
-    # A manifest can outlive its images (the pool lives on disk, and /tmp does
-    # not survive a pod recreate). Check the images are actually there rather
-    # than failing deep inside a load generator with a confusing error.
-    pool_entries = manifest.get("pool") or []
-    if pool_entries:
-        probes = {pool_entries[0]["path"], pool_entries[-1]["path"]}
-        missing = [
-            path
-            for path in sorted(probes)
-            # sh() runs a command; read_text() cats a path -- not interchangeable.
-            if not target.sh(
-                f"test -s {shlex.quote(path)} && echo ok", check=False
-            ).stdout.strip()
-        ]
-        if missing:
-            raise SystemExit(
-                f"[bench] the manifest in {args.workload_dir} references images "
-                f"that are not on disk ({missing}); rebuild the pool with "
-                "gen_workload.py"
-            )
+    manifest = load_manifest(target, args)
     expected = manifest["expected"]
     num_prompts = args.num_prompts or manifest["sequence"]["requests"]
     args.image_refs = image_refs_in_prefix(target, args.workload_dir, num_prompts)
     if not args.ec_cpu_bytes:
-        args.ec_cpu_bytes = (
-            expected["fragmentation_arm_ec_cpu_bytes"]
-            if args.frag
-            else expected["suggested_ec_cpu_bytes"]
-        )
-
+        args.ec_cpu_bytes = expected[
+            "fragmentation_arm_ec_cpu_bytes" if args.frag else "suggested_ec_cpu_bytes"
+        ]
     print(
-        f"[bench] workload {num_prompts} requests, working set "
-        f"{expected['working_set_bytes'] / 1024**3:.2f} GiB, ec_cpu_bytes "
-        f"{args.ec_cpu_bytes / 1024**3:.2f} GiB, max hit rate "
+        f"[bench] workload {num_prompts} requests ({args.image_refs} image refs), "
+        f"working set {expected['working_set_bytes'] / 1024**3:.2f} GiB, "
+        f"ec_cpu_bytes {args.ec_cpu_bytes / 1024**3:.2f} GiB, max hit rate "
         f"{expected['max_hit_rate'] * 100:.1f}%"
     )
 
-    if args.dry_run and args.topology == "epd":
-        rate0, conc0 = args.load_points[0]
-        for config in arms:
-            encoders, decode, proxy = _epd_instances(target, args, config)
-            for server in [*encoders, decode, proxy]:
-                print(f"\n=== {config}: {server.name} ===")
-                print(server.launch_script(instrument=False))
-            print(f"\n=== {config}: load ===")
-            print(
-                proxy.bench_serve_script(
-                    num_prompts, rate0, "/tmp/bench_epd.json", conc0
-                )
-            )
-        return 0
-
     if args.dry_run:
-        for arm in arms:
-            server = BenchServer(
-                target=target,
-                args=args,
-                arm=arm,
-                log_path=args.server_log or f"{LOG_DIR}/bench_{arm}.log",
-                managed=not args.base_url,
-            )
-            print(f"\n=== {arm} launch ===")
-            print(server.launch_script(instrument=args.frag))
-            print(f"\n=== {arm} load ===")
-            rate0, conc0 = args.load_points[0]
+        rate0, conc0 = args.load_points[0]
+        for name in args.arms:
+            sys_ = build_system(target, args, name)
+            for server in sys_.servers:
+                print(f"\n=== {name}: {server.name} ===")
+                print(server.launch_script(instrument=args.frag))
+            print(f"\n=== {name}: load ===")
             print(
-                server.bench_serve_script(
-                    num_prompts, rate0, f"/tmp/bench_{arm}.json", conc0
+                sys_.front.bench_serve_script(
+                    num_prompts, rate0, f"{args.work_dir}/bench.json", conc0
                 )
             )
         return 0
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    if args.topology == "epd":
-        out_name = "epd.json"
-    else:
-        out_name = "frag.json" if args.frag else "ab.json"
-    out_path = args.out_dir / out_name
+    out_path = args.out_dir / ("frag.json" if args.frag else "bench.json")
 
     def persist(results: list[dict[str, Any]]) -> None:
-        """Write what has been measured so far.
-
-        Called after every arm so a failure in the second arm does not discard
-        the first arm's data, which is expensive to reproduce.
-        """
+        """After every arm, so a failure does not discard the earlier arms."""
         out_path.write_text(
             json.dumps(
                 {
@@ -1478,29 +1377,14 @@ def main() -> int:
 
     results: list[dict[str, Any]] = []
     try:
-        for arm in arms:
-            if args.topology == "epd":
-                # A config must not inherit encodings the previous one saved:
-                # those would be free hits it never paid for.
-                target.sh(
-                    f"rm -rf {args.shared_storage_path} && "
-                    f"mkdir -p {args.shared_storage_path}",
-                    check=False,
-                )
-                results.extend(run_epd_config(target, args, arm, num_prompts))
-            else:
-                results.extend(run_arm(target, args, arm, num_prompts))
+        for name in args.arms:
+            results.extend(run_arm(target, args, name, num_prompts))
             persist(results)
     except Exception:
         persist(results)
         print(f"[bench] partial results saved to {out_path}", file=sys.stderr)
         raise
 
-    if args.topology == "epd":
-        print_epd_table(results)
-        gates_ok = True
-        print(f"\n[bench] wrote {out_path}")
-        return 0
     print_table(results)
     if args.frag:
         print_frag(results)

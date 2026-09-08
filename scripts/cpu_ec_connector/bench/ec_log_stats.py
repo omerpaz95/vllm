@@ -27,9 +27,13 @@ _EC_XFER_RE = re.compile(
     _TS + r"[^\]]+\] EC (save|load): (\d+) entr\w+ \((\d+) bytes\) took ([\d.]+) ms"
 )
 # ECExampleConnector reports one line per item instead of the CPU connector's
-# batched "EC load:" line, so a run over shared storage would otherwise read as
-# zero loads.
-_EC_EXAMPLE_LOAD_RE = re.compile(r"Success load encoder cache for hash")
+# batched "EC save:"/"EC load:" lines, so a run over shared storage would
+# otherwise read as zero transfers. It reports no bytes or duration, so its
+# entries count while its bandwidth stays 0.
+_EC_EXAMPLE_RE = {
+    "save": re.compile(r"Save cache successful for mm_hash"),
+    "load": re.compile(r"Success load encoder cache for hash"),
+}
 _ENCODER_INPUTS_RE = re.compile(r"encoder inputs: (\d+)")
 _ENCODER_EMBEDS_RE = re.compile(r"encoder output embeddings: (\d+)")
 
@@ -71,7 +75,7 @@ def iter_transfers(text: str) -> Iterator[tuple[float, Transfer]]:
 
 
 def summarize(text: str) -> dict:
-    """Totals for one log slice."""
+    """Totals for one log slice, for either connector."""
     out = {
         f"ec_{d}_{k}": 0
         for d in ("save", "load")
@@ -87,7 +91,8 @@ def summarize(text: str) -> dict:
         ms, nbytes = out[f"ec_{key}_ms"], out[f"ec_{key}_bytes"]
         out[f"ec_{key}_ms"] = round(ms, 3)
         out[f"ec_{key}_gbps"] = round(nbytes / (ms / 1000) / 1e9, 1) if ms else 0.0
-    out["ec_example_loads"] = len(_EC_EXAMPLE_LOAD_RE.findall(text))
+    for direction, pattern in _EC_EXAMPLE_RE.items():
+        out[f"ec_{direction}_entries"] += len(pattern.findall(text))
     out["encoder_inputs_computed"] = sum(
         int(m) for m in _ENCODER_INPUTS_RE.findall(text)
     )
@@ -175,6 +180,8 @@ def stage_summary(text: str) -> dict:
             modes.add(parts[0])
         for part in parts[1:]:
             key, _, value = part.partition("=")
+            if key == "attempt":  # a retry counter, not a duration
+                continue
             try:
                 per_field.setdefault(key, []).append(float(value))
             except ValueError:

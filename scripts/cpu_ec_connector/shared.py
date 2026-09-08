@@ -454,11 +454,7 @@ def _producer_encode(h, rendered: dict) -> tuple[dict, list[str]]:
 
 def test_baseline(h, image: Path, prompt: str) -> None:
     print("\n=== test_baseline ===")
-    # DIAGNOSTIC: swapped from image_data_url(image) (hato.jpg, ~100MB
-    # base64 tensor payload) to a small synthetic image to isolate whether
-    # the multinode oc port-forward stall is payload-size-dependent. Revert
-    # to `image_data_url(image)` once diagnosed.
-    data_url = synth_image_data_url(seed=999)
+    data_url = image_data_url(image)
     rendered = render(h.consumer.base_url, h.model, data_url, prompt)
     target_hash = rendered["features"]["mm_hashes"]["image"][0]
     print(f"  rendered: token_ids={len(rendered['token_ids'])}, mm_hash={target_hash}")

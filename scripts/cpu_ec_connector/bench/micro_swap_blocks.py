@@ -42,11 +42,11 @@ a per-entry cache would reach.
 
 Run inside the pod, on a GPU the server is not using:
 
-    CUDA_VISIBLE_DEVICES=1 /vllm-workspace/venv-vllm/bin/python \
-        /vllm-workspace/bench/micro_swap_blocks.py --verify
+    CUDA_VISIBLE_DEVICES=1 python \
+        micro_swap_blocks.py --verify
 
-    CUDA_VISIBLE_DEVICES=1 /vllm-workspace/venv-vllm/bin/python \
-        /vllm-workspace/bench/micro_swap_blocks.py --host-descriptors
+    CUDA_VISIBLE_DEVICES=1 python \
+        micro_swap_blocks.py --host-descriptors
 """
 
 from __future__ import annotations

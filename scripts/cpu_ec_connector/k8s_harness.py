@@ -131,6 +131,14 @@ def patch_manifests(
     _set_env(container, "EC_TRANSFER_CONFIG", ec_config)
     _set_env(container, "VLLM_EC_SIDE_CHANNEL_PORT", str(side_channel_port))
     _set_env(container, "EC_TEST_EVENT_FILE", EVENT_FILE)
+    # The templates' ports are placeholders; keep the container, the Service
+    # and (for the producer) the side channel in step with the env above, or
+    # the Route forwards to a port nothing listens on.
+    container["ports"][0]["containerPort"] = port
+    if producer:
+        container["ports"][1]["containerPort"] = side_channel_port
+    service_port = by_kind["Service"]["spec"]["ports"][0]
+    service_port["port"] = service_port["targetPort"] = port
 
     for vol in doc["spec"]["template"]["spec"]["volumes"]:
         if vol["name"] == "sitecustomize":
