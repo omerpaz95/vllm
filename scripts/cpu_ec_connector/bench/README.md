@@ -40,12 +40,14 @@ table therefore credits disaggregation with the extra hardware unless
 ## Running
 
 ```bash
-# 1. Workload: 96 real photos enlarged to 2048x2048, 400 requests, zipf reuse.
-#    dir:<path> is any directory of photos (jpg/png/webp/bmp/tif, searched
-#    recursively); hf-tar:<repo>[:<file>] streams a tar.gz from Hugging Face.
-python gen_workload.py --photo-source dir:/path/to/photos --out-dir /data/wl \
-    --pool-size 96 --buckets 2048x2048:1.0 --allow-upscale \
-    --num-requests 400 --reuse zipf:1.1 --self-check
+# 1. Workload: 96 images at 2048x2048, 400 requests, zipf reuse. The default
+#    --photo-source is `synth`: generated fractal noise, no download, each
+#    image's JPEG calibrated to 0.17 MB/MP (what a real-photo pool measured
+#    at q85), about 4 s per image. `dir:<path>` uses a directory of photos
+#    (searched recursively; add --allow-upscale for sources smaller than the
+#    bucket) and `hf-tar:<repo>[:<file>]` streams a tar.gz from Hugging Face.
+python gen_workload.py --out-dir /data/wl --pool-size 96 \
+    --buckets 2048x2048:1.0 --num-requests 400 --reuse zipf:1.1 --self-check
 
 # 2. Always dry-run first: it prints every launch command and the load
 #    command, and has caught port collisions before they cost a run.
@@ -66,13 +68,13 @@ and descriptor counting on, to see whether entries still collapse to one
 descriptor after the region has churned. `--patch-dir` must point at
 `patches/` on the target.
 
-The default `--photo-source` is `hf-tar:ofsoundof/LSDIR`, which is gated and
-licensed for academic research only; any directory of photos works.
-
-Upscaling the source photos is deliberate. Every measured quantity is
-pixel-count driven, and an EC entry's size is purely resolution (5,329
-embeddings x 7,168 B = 38.2 MB at 2048x2048); an enlarged photo and a native
-crop compress to the same JPEG size at q85.
+The archived real-photo results used `hf-tar:ofsoundof/LSDIR:shard-00.tar.gz`,
+which is gated and licensed for academic research only. Every measured
+quantity is pixel-count driven, and an EC entry's size is purely resolution
+(5,329 embeddings x 7,168 B = 38.2 MB at 2048x2048), so what a source has to
+get right is the JPEG size that sets wire payload and decode time; the
+synthetic source is calibrated to that, and an enlarged photo compresses the
+same as a native crop.
 
 ## What is gated
 

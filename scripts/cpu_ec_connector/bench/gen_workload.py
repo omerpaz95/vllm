@@ -23,15 +23,19 @@ Two properties are load-bearing and neither is cosmetic:
 forces every request to carry an image: a text-only request would drop a pool
 image out of that round, so the churn would no longer be uniform.
 
-Photos are real and JPEG-encoded because both wire payload and server-side
-decode land inside the TTFT being measured. Sources:
+Images are JPEG-encoded at photo-like sizes because both wire payload and
+server-side decode land inside the TTFT being measured. Sources:
 
+    synth[:MB_per_MP]            generated fractal noise, no download; each
+                                 image's grain is calibrated so its JPEG
+                                 compresses to the given density (default
+                                 0.17 MB/MP, what a real-photo pool measured)
     dir:/path/to/photos          any directory PIL can read
     hf-tar:owner/repo[:file]     stream a .tar.gz from an HF repo, stop early
 
 Example:
 
-    python gen_workload.py --photo-source dir:/data/photos \
+    python gen_workload.py --photo-source synth \
         --out-dir /data/wl --pool-size 128 --rounds 6
 """
 
@@ -52,6 +56,10 @@ DEFAULT_MERGE_STRIDE = 28
 DEFAULT_HIDDEN_DIM = 3584
 DEFAULT_ELEMENT_SIZE = 2
 
+# JPEG bytes per megapixel of a real-photo pool (LSDIR, q85), which is what a
+# synthetic pool is calibrated to match.
+DEFAULT_SYNTH_MB_PER_MP = 0.17
+_SYNTH_TOLERANCE = 0.08
 _IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff")
 _QUESTION = "Describe this image in one short sentence."
 
@@ -168,8 +176,82 @@ def _iter_hf_tar(repo: str, filename: str | None) -> Iterator[tuple[str, object]
             yield Path(member.name).name, img
 
 
-def iter_source_images(source: str) -> Iterator[tuple[str, object]]:
+def _jpeg_bytes(img: object, quality: int) -> int:
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)  # type: ignore[attr-defined]
+    return buf.tell()
+
+
+def _render(base: object, grain: object, g: float) -> object:
+    """Combine the octave sum with `g` of per-pixel grain into an RGB image."""
+    import numpy as np
+    from PIL import Image
+
+    acc = base + g * grain
+    lo, hi = np.percentile(acc, (1, 99))
+    arr = np.clip((acc - lo) / max(hi - lo, 1e-6) * 255, 0, 255)
+    return Image.fromarray(arr.astype(np.uint8), mode="RGB")
+
+
+def _iter_synth(
+    width: int, height: int, quality: int, mb_per_mp: float, seed: int
+) -> Iterator[tuple[str, object]]:
+    """Endless fractal-noise images whose JPEGs compress like photos.
+
+    Smooth multi-octave noise gives the low-frequency structure; a per-pixel
+    grain term supplies the high-frequency content that decides the JPEG
+    size, and is bisected per image until the encoded size lands within
+    `_SYNTH_TOLERANCE` of `mb_per_mp`. Pixel count, not content, drives
+    everything else the benchmark measures.
+    """
+    import numpy as np
+    from PIL import Image
+
+    target = mb_per_mp * width * height
+    index = 0
+    while True:
+        rng = np.random.default_rng(seed + index)
+        base = np.zeros((height, width, 3), dtype=np.float32)
+        amp, size = 1.0, 4
+        while size <= 512:
+            scale = size / max(width, height)
+            low = rng.random(
+                (max(2, round(height * scale)), max(2, round(width * scale)), 3),
+                dtype=np.float32,
+            )
+            for c in range(3):
+                up = Image.fromarray(low[:, :, c], mode="F").resize(
+                    (width, height), Image.BICUBIC
+                )
+                base[:, :, c] += amp * np.asarray(up, dtype=np.float32)
+            amp *= 0.6
+            size *= 2
+        grain = rng.random((height, width, 3), dtype=np.float32)
+        lo_g, hi_g = 0.0, 3.0
+        img = _render(base, grain, hi_g)
+        for _ in range(8):
+            mid = (lo_g + hi_g) / 2
+            img = _render(base, grain, mid)
+            ratio = _jpeg_bytes(img, quality) / target
+            if abs(ratio - 1) <= _SYNTH_TOLERANCE:
+                break
+            lo_g, hi_g = (mid, hi_g) if ratio < 1 else (lo_g, mid)
+        yield f"synth{index}", img
+        index += 1
+
+
+def iter_source_images(
+    source: str, *, width: int, height: int, quality: int, seed: int
+) -> Iterator[tuple[str, object]]:
+    """Lazily yield `(name, PIL image)` from a `--photo-source` spec.
+
+    Synthetic images are generated at `width` x `height`, the largest bucket,
+    so no crop or enlargement is needed; the other sources ignore the size.
+    """
     scheme, _, rest = source.partition(":")
+    if scheme == "synth":
+        density = float(rest) if rest else DEFAULT_SYNTH_MB_PER_MP
+        return _iter_synth(width, height, quality, density, seed)
     if scheme == "dir":
         return _iter_dir(Path(rest).expanduser())
     if scheme == "hf-tar":
@@ -215,7 +297,13 @@ def build_pool(
     wanted = rng.choices(buckets, weights=[b.weight for b in buckets], k=pool_size)
 
     pool: list[PoolImage] = []
-    source_iter = iter_source_images(source)
+    source_iter = iter_source_images(
+        source,
+        width=max(b.width for b in buckets),
+        height=max(b.height for b in buckets),
+        quality=quality,
+        seed=rng.getrandbits(32),
+    )
     skipped_small = 0
     for idx, bucket in enumerate(wanted):
         img = None
@@ -490,7 +578,11 @@ def self_check(jsonl_path: Path, expected: int) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--photo-source", default="hf-tar:ofsoundof/LSDIR")
+    p.add_argument(
+        "--photo-source",
+        default="synth",
+        help="synth[:MB_per_MP] | dir:/path | hf-tar:owner/repo[:file]",
+    )
     p.add_argument("--out-dir", required=True, type=Path)
     p.add_argument("--pool-size", type=int, default=128)
     p.add_argument("--buckets", default="1288x728:0.6,896x896:0.3,448x448:0.1")
