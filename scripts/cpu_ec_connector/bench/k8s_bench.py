@@ -690,8 +690,9 @@ def ensure_workload(client: ClientPod, args: argparse.Namespace) -> None:
         )
     print(f"[k8s] generating the workload in {args.workload_dir}")
     client.target.sh(
-        f"mkdir -p {args.workload_dir} && python {SCRIPTS_MOUNT}/gen_workload.py "
-        f"--out-dir {args.workload_dir} {args.gen_workload}",
+        f"mkdir -p {args.workload_dir} && {args.python} "
+        f"{SCRIPTS_MOUNT}/gen_workload.py --out-dir {args.workload_dir} "
+        f"{args.gen_workload}",
         timeout=args.gen_timeout_s,
     )
 
