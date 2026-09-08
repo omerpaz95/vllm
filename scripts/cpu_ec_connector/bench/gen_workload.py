@@ -476,6 +476,64 @@ def build_sequence(
     return records, per_request
 
 
+def build_warmup(
+    warm_pool: list[PoolImage],
+    num_requests: int,
+    prefix_tokens: int,
+    rng: random.Random,
+) -> list[dict]:
+    """Requests over images that appear in no measured request.
+
+    The benchmark drives these before measuring, so every first-request cost
+    is paid without seeding a cache that the workload then hits.
+    """
+    records = []
+    for i in range(num_requests):
+        nonce = f"[warmup {i} n{rng.getrandbits(48):012x}] " + _nonce_text(
+            rng, prefix_tokens
+        )
+        image = warm_pool[i % len(warm_pool)]
+        records.append(
+            {
+                "content": [
+                    {"type": "text", "text": nonce},
+                    {"type": "image_url", "image_url": {"url": str(image.path)}},
+                    {"type": "text", "text": _QUESTION},
+                ]
+            }
+        )
+    return records
+
+
+def _pool_entries(pool: list[PoolImage]) -> list[dict]:
+    return [
+        {
+            "path": str(p.path),
+            "w": p.width,
+            "h": p.height,
+            "embeds": p.embeds,
+            "region_bytes": p.nbytes,
+            "jpeg_bytes": p.path.stat().st_size,
+            "upscale": p.upscale,
+        }
+        for p in pool
+    ]
+
+
+def _load_entries(entries: list[dict]) -> list[PoolImage]:
+    return [
+        PoolImage(
+            Path(e["path"]),
+            e["w"],
+            e["h"],
+            e["embeds"],
+            e["region_bytes"],
+            e.get("upscale", 1.0),
+        )
+        for e in entries
+    ]
+
+
 def _count_histogram(per_request: list[list[int]]) -> dict[str, int]:
     """How many requests carried how many images."""
     hist: dict[str, int] = {}
@@ -505,18 +563,7 @@ def build_manifest(
     return {
         "args": {k: str(v) for k, v in vars(args).items()},
         "bytes_per_embed": bytes_per_embed,
-        "pool": [
-            {
-                "path": str(p.path),
-                "w": p.width,
-                "h": p.height,
-                "embeds": p.embeds,
-                "region_bytes": p.nbytes,
-                "jpeg_bytes": p.path.stat().st_size,
-                "upscale": p.upscale,
-            }
-            for p in pool
-        ],
+        "pool": _pool_entries(pool),
         "sequence": {
             "images_per_request": args.images_per_request,
             "image_count_histogram": _count_histogram(per_request),
@@ -626,6 +673,13 @@ def main() -> int:
     )
     p.add_argument("--prefix-tokens", type=int, default=32)
     p.add_argument(
+        "--warmup-images",
+        type=int,
+        default=2,
+        help="extra images, absent from the workload, that warmup.jsonl uses",
+    )
+    p.add_argument("--warmup-requests", type=int, default=8)
+    p.add_argument(
         "--interleave-sizes",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -652,23 +706,16 @@ def main() -> int:
     manifest_path = args.out_dir / "manifest.json"
     if args.reuse_pool and manifest_path.exists():
         previous = json.loads(manifest_path.read_text())
-        pool = [
-            PoolImage(
-                Path(e["path"]),
-                e["w"],
-                e["h"],
-                e["embeds"],
-                e["region_bytes"],
-                e.get("upscale", 1.0),
-            )
-            for e in previous["pool"]
-        ]
+        if "warmup_pool" not in previous:
+            raise SystemExit("[gen] the existing manifest predates warmup images")
+        pool = _load_entries(previous["pool"])
+        warm_pool = _load_entries(previous["warmup_pool"])
         print(f"[gen] reusing existing pool of {len(pool)} photos")
     else:
         pool = build_pool(
             args.photo_source,
             buckets,
-            args.pool_size,
+            args.pool_size + args.warmup_images,
             args.out_dir,
             args.jpeg_quality,
             args.merge_stride,
@@ -677,6 +724,7 @@ def main() -> int:
             args.allow_upscale,
             int(args.min_source_mp * 1e6),
         )
+        pool, warm_pool = pool[: args.pool_size], pool[args.pool_size :]
 
     records, per_request = build_sequence(
         pool,
@@ -696,9 +744,17 @@ def main() -> int:
         for record in records:
             f.write(json.dumps(record, separators=(",", ":")) + "\n")
 
+    warmup_path = args.out_dir / "warmup.jsonl"
+    warmup = build_warmup(warm_pool, args.warmup_requests, args.prefix_tokens, rng)
+    with open(warmup_path, "w", encoding="utf-8") as f:
+        for record in warmup:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+
     manifest = build_manifest(
         pool, per_request, bytes_per_embed=bytes_per_embed, args=args
     )
+    manifest["warmup_pool"] = _pool_entries(warm_pool)
+    manifest["warmup"] = {"requests": len(warmup), "images": len(warm_pool)}
     manifest_path.write_text(json.dumps(manifest, indent=2))
 
     seq, exp = manifest["sequence"], manifest["expected"]
@@ -723,6 +779,7 @@ def main() -> int:
 
     if args.self_check:
         self_check(jsonl_path, len(records))
+        self_check(warmup_path, len(warmup))
     return 0
 
 

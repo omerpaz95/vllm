@@ -22,9 +22,10 @@ the transport held fixed; `cpu` vs `example` compares the transports. The
 connector's handles to the decode body whether or not it rewrites, so the
 CPU connector's consumer can locate the producer's entry either way.
 
-The single-instance arms use one GPU and the EPD arms two. `x_base` in the
-table therefore credits disaggregation with the extra hardware unless
-`--tensor-parallel-size 2` gives the baseline and the decode instance both.
+`x_base` compares whatever GPU sets `--gpu`, `--encoder-devices` and
+`--decode-gpu` gave each arm, so a baseline on one GPU against an EPD pair
+on two credits disaggregation with the extra hardware; give the baseline the
+same GPU list as the decode instance for a resource-matched comparison.
 
 ## Files
 
@@ -49,6 +50,13 @@ table therefore credits disaggregation with the extra hardware unless
 python gen_workload.py --out-dir /data/wl --pool-size 96 \
     --buckets 2048x2048:1.0 --num-requests 400 --reuse zipf:1.1 --self-check
 
+#    The same pool from real LSDIR photos (gated on Hugging Face, academic
+#    research licence; needs a token whose account accepted the terms, and
+#    `env -u HF_TOKEN` if a stored login should win over the environment):
+python gen_workload.py --photo-source hf-tar:ofsoundof/LSDIR:shard-00.tar.gz \
+    --allow-upscale --out-dir /data/wl --pool-size 96 \
+    --buckets 2048x2048:1.0 --num-requests 400 --reuse zipf:1.1 --self-check
+
 # 2. Always dry-run first: it prints every launch command and the load
 #    command, and has caught port collisions before they cost a run.
 python run_bench.py --workload-dir /data/wl --out-dir results --dry-run
@@ -56,6 +64,14 @@ python run_bench.py --workload-dir /data/wl --out-dir results --dry-run
 # 3. Sweep concurrency across all six arms, fresh servers per load point.
 python run_bench.py --workload-dir /data/wl --out-dir results \
     --max-concurrency 1,4,8 --num-prompts 120 --restart-per-load-point
+
+# A larger model: GPU lists set the tensor-parallel size of every instance.
+# Here the baseline and the decode instance get TP=4 and two TP=2 encoders
+# share GPUs 0-3; --serve-args / --encoder-serve-args / --decode-serve-args
+# pass anything else through to `vllm serve`.
+python run_bench.py --model Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 \
+    --gpu 0,1,2,3 --encoder-devices "0,1;2,3" --decode-gpu 4,5,6,7 \
+    --workload-dir /data/wl --out-dir results --max-concurrency 1,4,8
 
 # Inside a pod (oc): the servers and the load generator run there.
 python run_bench.py --pod my-pod --python /venv/bin/python \
@@ -117,9 +133,11 @@ offered concurrency, that point measures the queue, not the work.
   `--restart-per-load-point`, the first load point pays the saves and later
   points run against a warm region; the `saves` column shows which regime a
   point was in. Arm-to-arm comparison at one point is still fair.
-- **The warmup replays the first lines of the workload**, so those images
-  enter every cache before measurement. The manifest's `max_hit_rate` is an
-  upper bound.
+- **The warmup uses held-out images** (`warmup.jsonl`, built from
+  `--warmup-images` extra pool slots that no measured request references),
+  so first-request costs are paid without seeding any cache the measurement
+  hits. A workload directory without `warmup.jsonl` predates this and must
+  be rebuilt.
 - **Region larger vs smaller than the working set** answer different
   questions (all hits vs continuous eviction). `--ec-cpu-bytes` defaults to
   the manifest's 1.25x working set; the frag arm uses 0.5x.

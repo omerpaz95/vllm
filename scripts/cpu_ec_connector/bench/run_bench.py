@@ -298,6 +298,8 @@ class BenchServer:
                 f"--ec-transfer-config {shlex.quote(json.dumps(self.ec_config))}"
             )
         serve.extend(self.extra_args)
+        if self.args.serve_args:
+            serve.append(self.args.serve_args)
         return serve
 
     def start(self, *, instrument: bool = False) -> None:
@@ -460,7 +462,12 @@ class BenchServer:
             )
 
     def bench_serve_script(
-        self, num_prompts: int, rate: str, out: str, concurrency: int = 0
+        self,
+        num_prompts: int,
+        rate: str,
+        out: str,
+        concurrency: int = 0,
+        dataset: str = "workload.jsonl",
     ) -> str:
         cmd = [
             f"{self.args.python} -m vllm.entrypoints.cli.main bench serve",
@@ -469,7 +476,7 @@ class BenchServer:
             "--endpoint /v1/chat/completions",
             f"--model {self.args.model}",
             "--dataset-name custom_image",
-            f"--dataset-path {self.args.workload_dir}/workload.jsonl",
+            f"--dataset-path {self.args.workload_dir}/{dataset}",
             # The emitted order IS the workload; shuffling would destroy the
             # reuse distances the manifest predicts.
             "--disable-shuffle",
@@ -537,6 +544,11 @@ def _connector_config(
     }
 
 
+def _gpus(spec: str) -> list[str]:
+    """A comma-separated device list; its length is the tensor-parallel size."""
+    return [g.strip() for g in spec.split(",") if g.strip()]
+
+
 def build_system(target: Target, args: argparse.Namespace, name: str) -> System:
     arm = ARMS[name]
     if arm.topology == "single":
@@ -546,18 +558,20 @@ def build_system(target: Target, args: argparse.Namespace, name: str) -> System:
             name="single",
             port=args.port,
             gpu=args.gpu,
-            tp=args.tensor_parallel_size,
+            tp=len(_gpus(args.gpu)),
             ec_config=_connector_config(args, arm, "ec_both"),
+            extra_args=tuple(filter(None, [args.decode_serve_args])),
         )
         return System(front=server, consumer=server)
 
-    # The device list's length is the encoder count; a device repeated in it
-    # means those encoders share one GPU and must split its memory.
-    devices = [d.strip() for d in args.encoder_devices.split(",") if d.strip()]
-    if not devices:
+    # One encoder per `;`-separated group; the GPUs inside a group are that
+    # encoder's tensor-parallel set. A GPU named by several groups is shared,
+    # and those encoders split its memory.
+    groups = [_gpus(g) for g in args.encoder_devices.split(";") if _gpus(g)]
+    if not groups:
         raise SystemExit("[bench] --encoder-devices names no device")
-    shared = {dev: devices.count(dev) for dev in set(devices)}
-    encoder_ports = {args.encoder_port + i for i in range(len(devices))}
+    share = {gpu: sum(gpu in g for g in groups) for g in groups for gpu in g}
+    encoder_ports = {args.encoder_port + i for i in range(len(groups))}
     for label, port in (("decode", args.decode_port), ("proxy", args.proxy_port)):
         if port in encoder_ports:
             raise SystemExit(
@@ -569,9 +583,9 @@ def build_system(target: Target, args: argparse.Namespace, name: str) -> System:
         raise SystemExit("[bench] --decode-port and --proxy-port are the same")
 
     encoders: list[BenchServer] = []
-    for index, dev in enumerate(devices):
+    for index, group in enumerate(groups):
         util = args.encoder_gpu_memory_utilization or round(
-            args.gpu_memory_utilization / shared[dev], 3
+            args.gpu_memory_utilization / max(share[gpu] for gpu in group), 3
         )
         env: tuple[str, ...] = ()
         if arm.connector == "ECCPUConnector":
@@ -601,13 +615,16 @@ def build_system(target: Target, args: argparse.Namespace, name: str) -> System:
             extra.append("--mm-encoder-only")
         if args.encoder_enforce_eager:
             extra.append("--enforce-eager")
+        if args.encoder_serve_args:
+            extra.append(args.encoder_serve_args)
         encoders.append(
             BenchServer(
                 target=target,
                 args=args,
                 name=f"encoder{index}",
                 port=args.encoder_port + index,
-                gpu=dev,
+                gpu=",".join(group),
+                tp=len(group),
                 gpu_util=util,
                 batched_tokens=args.encoder_max_num_batched_tokens,
                 ec_config=_connector_config(args, arm, "ec_producer"),
@@ -621,12 +638,12 @@ def build_system(target: Target, args: argparse.Namespace, name: str) -> System:
         name="decode",
         port=args.decode_port,
         gpu=args.decode_gpu,
-        tp=args.tensor_parallel_size,
+        tp=len(_gpus(args.decode_gpu)),
         ec_config=_connector_config(args, arm, "ec_consumer"),
         # Without this the decode instance rejects an image_embeds part, which
         # is what a rewritten request is made of. Set in every EPD arm: a flag
         # that differs between arms is a confound rather than a switch.
-        extra_args=("--enable-mm-embeds",),
+        extra_args=tuple(filter(None, ["--enable-mm-embeds", args.decode_serve_args])),
     )
     encode_urls = ",".join(e.base_url for e in encoders)
     proxy_cmd = " ".join(
@@ -984,13 +1001,18 @@ def run_points(
             sys_.proxy.start()
             sys_.proxy.wait_for_log("Uvicorn running")
 
-        # The warmup replays the first lines of the workload, so those images
-        # enter every cache before measurement starts; the manifest's hit rate
-        # is an upper bound for that reason too.
-        print(f"[bench] {name}: warmup")
-        warm = max(4, min(16, num_prompts // 10))
+        # The warmup drives images that are in no measured request, so it pays
+        # every first-request cost (lazy kernel loading, the first NIXL
+        # session, region page faults) without seeding a cache the
+        # measurement then hits.
+        print(f"[bench] {name}: warmup ({args.warmup_prompts} requests)")
         target.sh(
-            sys_.front.bench_serve_script(warm, "inf", f"{args.work_dir}/warmup.json"),
+            sys_.front.bench_serve_script(
+                args.warmup_prompts,
+                "inf",
+                f"{args.work_dir}/warmup.json",
+                dataset="warmup.jsonl",
+            ),
             timeout=args.bench_timeout_s,
             check=False,
         )
@@ -1053,9 +1075,10 @@ def print_table(results: list[dict[str, Any]]) -> None:
 
     `saves`/`loads` are connector entries on the consumer side; `enc_inputs`
     is what the consumer still computed itself. `encode`/`dec_ttfb` are the
-    proxy's stage medians, EPD arms only. The baseline runs on one GPU while
-    EPD arms use two: x_base credits disaggregation with the extra hardware
-    unless --tensor-parallel-size 2 evens it out.
+    proxy's stage medians, EPD arms only. x_base compares whatever GPU sets
+    --gpu, --encoder-devices and --decode-gpu gave each arm, so a baseline on
+    one GPU against an EPD pair on two credits disaggregation with the extra
+    hardware.
     """
     header = (
         f"{'arm':<13} {'rate':>5} {'conc':>5} {'ttft_p50':>9} {'ttft_p99':>9} "
@@ -1198,18 +1221,26 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--max-num-seqs", type=int, default=64)
     p.add_argument(
-        "--tensor-parallel-size",
-        type=int,
-        default=1,
-        help="for the single-instance arms and the decode instance: 1 gives the "
-        "baseline one GPU, 2 matches the two an EPD pair occupies",
+        "--serve-args",
+        default="",
+        help="extra `vllm serve` arguments appended to every instance",
+    )
+    p.add_argument(
+        "--decode-serve-args",
+        default="",
+        help="extra arguments for the decode and single-instance servers",
     )
     p.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     p.add_argument("--startup-timeout-s", type=int, default=900)
     p.add_argument("--bench-timeout-s", type=int, default=3600)
     p.add_argument("--settle-s", type=float, default=5.0)
     p.add_argument("--port", type=int, default=8100, help="single-instance arms")
-    p.add_argument("--gpu", default="0", help="single-instance arms")
+    p.add_argument(
+        "--gpu",
+        default="0",
+        help="GPUs for the single-instance arms, comma-separated; the count is "
+        "the tensor-parallel size",
+    )
     p.add_argument(
         "--frag",
         action="store_true",
@@ -1226,10 +1257,15 @@ def parse_args() -> argparse.Namespace:
     epd.add_argument(
         "--encoder-devices",
         default="0",
-        help="comma-separated devices for the encoder instances; the list's "
-        "length is the encoder count, and a device repeated in it means those "
-        "encoders share one GPU and split its memory. Accepts plain indices or "
-        "MIG UUIDs",
+        help="one encoder instance per `;`-separated group, each group a "
+        "comma-separated GPU list whose length is that encoder's tensor-parallel "
+        "size: '0;0' is two encoders sharing GPU 0 (they split its memory), "
+        "'0,1;2,3' is two TP=2 encoders. Accepts indices or MIG UUIDs",
+    )
+    epd.add_argument(
+        "--encoder-serve-args",
+        default="",
+        help="extra `vllm serve` arguments for the encoder instances",
     )
     epd.add_argument(
         "--encoder-gpu-memory-utilization",
@@ -1254,7 +1290,12 @@ def parse_args() -> argparse.Namespace:
     epd.add_argument("--encoder-port", type=int, default=8101, help="+i per encoder")
     epd.add_argument("--decode-port", type=int, default=8200)
     epd.add_argument("--proxy-port", type=int, default=8000)
-    epd.add_argument("--decode-gpu", default="1")
+    epd.add_argument(
+        "--decode-gpu",
+        default="1",
+        help="GPUs for the decode instance, comma-separated; the count is the "
+        "tensor-parallel size",
+    )
     epd.add_argument("--side-channel-port", type=int, default=5577, help="+i")
     epd.add_argument("--shared-storage-path", default="", help="example connector")
     epd.add_argument(
@@ -1333,6 +1374,13 @@ def main() -> int:
     expected = manifest["expected"]
     num_prompts = args.num_prompts or manifest["sequence"]["requests"]
     args.image_refs = image_refs_in_prefix(target, args.workload_dir, num_prompts)
+    warmup = target.read_text(f"{args.workload_dir}/warmup.jsonl")
+    args.warmup_prompts = sum(1 for line in warmup.splitlines() if line.strip())
+    if not args.warmup_prompts:
+        raise SystemExit(
+            f"[bench] no warmup.jsonl in {args.workload_dir}; rebuild the workload "
+            "with the current gen_workload.py, which holds out warmup images"
+        )
     if not args.ec_cpu_bytes:
         args.ec_cpu_bytes = expected[
             "fragmentation_arm_ec_cpu_bytes" if args.frag else "suggested_ec_cpu_bytes"
