@@ -41,7 +41,9 @@ table therefore credits disaggregation with the extra hardware unless
 
 ```bash
 # 1. Workload: 96 real photos enlarged to 2048x2048, 400 requests, zipf reuse.
-python gen_workload.py --photo-source dir:/data/photos --out-dir /data/wl \
+#    dir:<path> is any directory of photos (jpg/png/webp/bmp/tif, searched
+#    recursively); hf-tar:<repo>[:<file>] streams a tar.gz from Hugging Face.
+python gen_workload.py --photo-source dir:/path/to/photos --out-dir /data/wl \
     --pool-size 96 --buckets 2048x2048:1.0 --allow-upscale \
     --num-requests 400 --reuse zipf:1.1 --self-check
 

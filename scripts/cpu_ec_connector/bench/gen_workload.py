@@ -52,7 +52,7 @@ DEFAULT_MERGE_STRIDE = 28
 DEFAULT_HIDDEN_DIM = 3584
 DEFAULT_ELEMENT_SIZE = 2
 
-_IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+_IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff")
 _QUESTION = "Describe this image in one short sentence."
 
 
@@ -95,9 +95,13 @@ def embeds_for(width: int, height: int, stride: int) -> int:
 def _iter_dir(path: Path) -> Iterator[tuple[str, object]]:
     from PIL import Image
 
+    if not path.is_dir():
+        raise SystemExit(f"[gen] --photo-source dir:{path} is not a directory")
+    found = 0
     for entry in sorted(path.rglob("*")):
         if entry.suffix.lower() not in _IMAGE_SUFFIXES:
             continue
+        found += 1
         try:
             img = Image.open(entry)
             img.load()
@@ -105,6 +109,10 @@ def _iter_dir(path: Path) -> Iterator[tuple[str, object]]:
             print(f"[gen] skipping {entry.name}: {exc}", file=sys.stderr)
             continue
         yield entry.name, img
+    if not found:
+        raise SystemExit(
+            f"[gen] no images under {path} (looked for {', '.join(_IMAGE_SUFFIXES)})"
+        )
 
 
 def _iter_hf_tar(repo: str, filename: str | None) -> Iterator[tuple[str, object]]:
@@ -224,9 +232,14 @@ def build_pool(
             skipped_small += 1
             candidate.close()
         if img is None:
+            need = (
+                f">= {min_source_px / 1e6:.1f} MP to enlarge"
+                if allow_upscale
+                else f">= {bucket.width}x{bucket.height} (or pass --allow-upscale)"
+            )
             raise SystemExit(
-                f"[gen] ran out of source photos at pool slot {idx}: need "
-                f">= {bucket.width}x{bucket.height} ({skipped_small} were too small)"
+                f"[gen] ran out of source photos at pool slot {idx} of "
+                f"{pool_size}: need {need}; {skipped_small} were rejected"
             )
         # Center-crop to the bucket's aspect, then downscale to exact size.
         scale = max(bucket.width / img.width, bucket.height / img.height)
