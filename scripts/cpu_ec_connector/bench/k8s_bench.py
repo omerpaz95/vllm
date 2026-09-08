@@ -40,6 +40,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from typing import Any
 
 import run_bench
@@ -207,22 +208,48 @@ class Oc:
             time.sleep(2.0)
 
 
-class PodTarget(Target):
-    """`oc exec` into a pod or a deployment's pod, in one namespace."""
+_CONTAINER_GONE_RE = re.compile(
+    r"container not found|unable to upgrade connection|pods? .* not found|"
+    r"is not running|Terminated|ContainerCreating"
+)
 
-    def __init__(self, namespace: str, ref: str) -> None:
+
+class PodTarget(Target):
+    """`oc exec` into a pod or a deployment's pod, in one namespace.
+
+    `diagnose`, when set, turns an exec that found no container into a
+    report from the owning server: a container that died mid-run is being
+    restarted by its Deployment, and the reason lives in the previous
+    container's log and last state, not in the exec error.
+    """
+
+    def __init__(
+        self, namespace: str, ref: str, diagnose: Callable[[], str] | None = None
+    ) -> None:
         super().__init__(ref)
         self.namespace = namespace
+        self.diagnose = diagnose
 
     def _argv(self, script: str) -> list[str]:
         assert self.pod is not None
-        argv = ["bash", "-lc", script]
+        argv = ["bash", "-c", script]
         return ["oc", "exec", "-n", self.namespace, self.pod, "--", *argv]
+
+    def sh(
+        self, script: str, *, timeout: int = 600, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            return super().sh(script, timeout=timeout, check=check)
+        except RuntimeError as exc:
+            if self.diagnose is not None and _CONTAINER_GONE_RE.search(str(exc)):
+                raise ServerMismatchError(self.diagnose()) from exc
+            raise
 
 
 def pod_status(pod: dict[str, Any]) -> dict[str, Any]:
     status = pod.get("status", {})
     containers = status.get("containerStatuses") or [{}]
+    last = (containers[0].get("lastState") or {}).get("terminated") or {}
     return {
         "pod": pod["metadata"]["name"],
         "node": pod["spec"].get("nodeName", ""),
@@ -230,6 +257,11 @@ def pod_status(pod: dict[str, Any]) -> dict[str, Any]:
         "phase": status.get("phase", ""),
         "restarts": containers[0].get("restartCount", 0),
         "image_id": containers[0].get("imageID", ""),
+        # Why the previous container died, when it did: OOMKilled, or Error
+        # with the exit code.
+        "last_exit": {
+            k: last.get(k) for k in ("reason", "exitCode", "finishedAt") if last
+        },
     }
 
 
@@ -326,6 +358,7 @@ class PodServer(BenchServer):
         super().__post_init__()
         self.log_path = POD_LOG
         self.target = PodTarget(self.args.namespace, f"deployment/{self.resource}")
+        self.target.diagnose = self.diagnose
         self.oc: Oc | None = None
         self.arm = ""
         self.placement: dict[str, Any] = {}
@@ -469,11 +502,37 @@ class PodServer(BenchServer):
         to be deleted, and a failed gate is diagnosed from it."""
         log_dir = self.args.out_dir / "logs" / self.args.run_id
         log_dir.mkdir(parents=True, exist_ok=True)
-        path = log_dir / f"{self.arm or 'arm'}-{self.name}-{self.starts}.log"
+        stem = log_dir / f"{self.arm or 'arm'}-{self.name}-{self.starts}"
         result = self._oc().run(
             "logs", f"deployment/{self.resource}", check=False, timeout=600
         )
-        path.write_text(result.stdout)
+        stem.with_suffix(".log").write_text(result.stdout)
+        if self.status().get("restarts"):
+            # The Deployment already replaced the container that died; its
+            # log, the one with the crash, is only reachable as --previous.
+            previous = self._oc().run(
+                "logs",
+                "--previous",
+                f"deployment/{self.resource}",
+                check=False,
+                timeout=600,
+            )
+            stem.with_suffix(".previous.log").write_text(previous.stdout)
+
+    def diagnose(self) -> str:
+        """Explain an exec that found no container, and keep the evidence."""
+        status = self.status()
+        self.save_log()
+        exit_info = status.get("last_exit") or {}
+        return (
+            f"{self.resource}: its container went away mid-run (phase="
+            f"{status.get('phase')}, restarts={status.get('restarts')}, previous "
+            f"container exit: {exit_info or 'unknown'}). The crashed container's "
+            f"log is saved as {self.args.out_dir}/logs/{self.args.run_id}/"
+            f"{self.arm or 'arm'}-{self.name}-{self.starts}.previous.log; "
+            "OOMKilled means the pod memory (--pod-memory) or /dev/shm "
+            "(--shm-size) was too small"
+        )
 
     def stop(self) -> None:
         oc = self._oc()
