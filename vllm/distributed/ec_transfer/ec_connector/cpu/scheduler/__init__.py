@@ -524,6 +524,9 @@ class ECCPUScheduler:
         self._is_producer = False
         self._is_consumer = False
 
+        # The file first: everything below may be slow, and the process is
+        # killed a few seconds into shutdown if it has not exited.
+        self._region.unlink()
         if self._nixl_enabled:
             self._teardown_nixl()
 

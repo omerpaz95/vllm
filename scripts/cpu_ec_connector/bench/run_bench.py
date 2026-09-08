@@ -84,6 +84,22 @@ _GPU_PROCESSOR_MARKER = "Running the multi-modal processor on cuda"
 # Either line proves the log belongs to a server that got as far as serving;
 # the exact wording is version-dependent, uvicorn's is stable.
 _STARTUP_MARKERS = ("Application startup complete", "Starting vLLM server on")
+_REGION_REMOVED_MARKER = "Removed EC mmap file"
+REGION_GLOB = "/dev/shm/vllm_ec_*.mmap"
+# Removes region files that no process maps. A region outlives its server
+# when the shutdown that unlinks it is cut short; each is GiBs of tmpfs, and
+# once /dev/shm is full the next region's populate fails with EFAULT. Only
+# unmapped files go, so a live server on a shared host is never touched.
+_SWEEP_REGIONS = """
+removed=0; bytes=0
+for f in {glob}; do
+    [ -e "$f" ] || continue
+    grep -qsF "$f" /proc/[0-9]*/maps && continue
+    sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+    rm -f "$f" && removed=$((removed + 1)) && bytes=$((bytes + sz))
+done
+echo "$removed $bytes"
+"""
 
 
 @dataclass(frozen=True)
@@ -305,12 +321,42 @@ class BenchServer:
             serve.append(self.args.serve_args)
         return serve
 
+    def sweep_regions(self, when: str) -> None:
+        out = self.target.sh(
+            _SWEEP_REGIONS.replace("{glob}", REGION_GLOB), check=False
+        ).stdout.split()
+        if len(out) == 2 and out[0] != "0":
+            print(
+                f"[bench] WARNING ({when}): removed {out[0]} leaked EC region "
+                f"file(s) holding {int(out[1]) / 1024**3:.1f} GiB that no process "
+                "mapped",
+                file=sys.stderr,
+            )
+
+    def check_region_space(self) -> None:
+        """Fail before a launch that would fill /dev/shm."""
+        if (self.ec_config or {}).get("ec_connector") != "ECCPUConnector":
+            return
+        need = self.args.ec_cpu_bytes
+        out = self.target.sh(
+            "df --output=avail -B1 /dev/shm | tail -1", check=False
+        ).stdout.strip()
+        free = int(out) if out.isdigit() else 0
+        if out.isdigit() and free < need:
+            raise SystemExit(
+                f"[bench] /dev/shm has {free / 1024**3:.1f} GiB free; {self.name} "
+                f"needs {need / 1024**3:.1f} GiB for its EC region. Check "
+                f"`ls -la /dev/shm` for region files of servers that are gone"
+            )
+
     def start(self, *, instrument: bool = False) -> None:
         self.target.sh(
             f"rm -f {self.log_path} {self.args.frag_file} {self.pgid_file}",
             check=False,
         )
         self.stop()
+        self.sweep_regions(f"before {self.name}")
+        self.check_region_space()
         print(f"[bench] launching {self.name}")
         self.target.sh_detached(self.launch_script(instrument=instrument))
         # Without a recorded pid, stop() falls back to a pattern match alone;
@@ -388,6 +434,15 @@ class BenchServer:
         rm -f {self.pid_file} {self.pgid_file}
         """
         result = self.target.sh(script, check=False, timeout=_STOP_TIMEOUT_S + 60)
+        log = self.target.read_text(self.log_path)
+        if _EC_REGION_MARKER in log and _REGION_REMOVED_MARKER not in log:
+            print(
+                f"[bench] WARNING: {self.name} created an EC region but never "
+                "logged its removal; the connector's shutdown did not reach the "
+                "unlink (killed by the worker shutdown timeout?)",
+                file=sys.stderr,
+            )
+        self.sweep_regions(f"after {self.name}")
         if "escalated" in result.stdout:
             detail = (
                 f"; the EC region's /dev/shm file for {self.engine_id} may have leaked"
