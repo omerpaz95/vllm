@@ -55,6 +55,7 @@ import shlex
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -549,10 +550,16 @@ def _gpus(spec: str) -> list[str]:
     return [g.strip() for g in spec.split(",") if g.strip()]
 
 
-def build_system(target: Target, args: argparse.Namespace, name: str) -> System:
+def build_system(
+    target: Target,
+    args: argparse.Namespace,
+    name: str,
+    server_cls: type[BenchServer] = BenchServer,
+) -> System:
+    """Every server one arm needs; `server_cls` decides where they run."""
     arm = ARMS[name]
     if arm.topology == "single":
-        server = BenchServer(
+        server = server_cls(
             target=target,
             args=args,
             name="single",
@@ -592,7 +599,7 @@ def build_system(target: Target, args: argparse.Namespace, name: str) -> System:
             # Each producer binds its own side channel and announces it through
             # ec_transfer_params; the consumer needs no side-channel setting.
             env = (
-                "VLLM_EC_SIDE_CHANNEL_HOST=127.0.0.1",
+                f"VLLM_EC_SIDE_CHANNEL_HOST={args.side_channel_host}",
                 f"VLLM_EC_SIDE_CHANNEL_PORT={args.side_channel_port + index}",
             )
         # The encoder needs a token budget several images deep or it can never
@@ -618,7 +625,7 @@ def build_system(target: Target, args: argparse.Namespace, name: str) -> System:
         if args.encoder_serve_args:
             extra.append(args.encoder_serve_args)
         encoders.append(
-            BenchServer(
+            server_cls(
                 target=target,
                 args=args,
                 name=f"encoder{index}",
@@ -632,7 +639,7 @@ def build_system(target: Target, args: argparse.Namespace, name: str) -> System:
                 extra_args=tuple(extra),
             )
         )
-    decode = BenchServer(
+    decode = server_cls(
         target=target,
         args=args,
         name="decode",
@@ -648,15 +655,15 @@ def build_system(target: Target, args: argparse.Namespace, name: str) -> System:
     encode_urls = ",".join(e.base_url for e in encoders)
     proxy_cmd = " ".join(
         [
-            f"{args.python} {args.vllm_repo}/{PROXY}",
-            f"--host 127.0.0.1 --port {args.proxy_port}",
+            f"{args.python} {args.proxy_script}",
+            f"--host {args.proxy_host} --port {args.proxy_port}",
             f"--encode-servers-urls {encode_urls}",
             "--prefill-servers-urls disable",
             f"--decode-servers-urls {decode.base_url}",
         ]
         + ([] if arm.rewrite else ["--no-rewrite"])
     )
-    proxy = BenchServer(
+    proxy = server_cls(
         target=target,
         args=args,
         name="proxy",
@@ -674,14 +681,15 @@ def build_system(target: Target, args: argparse.Namespace, name: str) -> System:
 # Samples vllm:num_requests_{running,waiting} from every instance's /metrics.
 # Queue depth is what distinguishes "the system is working" from "the system
 # is a queue with a benchmark attached", which is what invalidated the first
-# rate=inf measurements. Emits "epoch,name,metric,value".
+# rate=inf measurements. Takes "name=base_url" pairs and emits
+# "epoch,name,metric,value".
 _QUEUE_SAMPLER = r"""
 while true; do
     NOW=$(date +%s.%N)
     for pair in "$@"; do
         NAME=${pair%%=*}
-        PORT=${pair##*=}
-        curl -s --max-time 2 "http://127.0.0.1:${PORT}/metrics" 2>/dev/null \
+        URL=${pair#*=}
+        curl -s --max-time 2 "${URL}/metrics" 2>/dev/null \
             | grep -E '^vllm:num_requests_(running|waiting)[ {]' \
             | awk -v t="$NOW" -v n="$NAME" \
                 '{split($1, f, "{"); print t "," n "," f[1] "," $NF}' \
@@ -693,7 +701,7 @@ done
 
 
 def start_queue_sampler(target: Target, args: argparse.Namespace, sys_: System):
-    pairs = " ".join(f"{s.name}={s.port}" for s in sys_.vllm_servers)
+    pairs = " ".join(f"{s.name}={s.base_url}" for s in sys_.vllm_servers)
     csv = args.queue_csv
     target.sh(f"rm -f {csv}", check=False)
     target.sh_detached(
@@ -905,11 +913,16 @@ def measure_point(
     rate: str,
     conc: int,
 ) -> dict[str, Any]:
-    """One load point: drive the workload once and account for it."""
+    """One load point: drive the workload once and account for it.
+
+    `target` is where the load generator runs; each server's log is read
+    through that server's own target, which differs when the servers are
+    pods.
+    """
     when = f"rate={rate} c={conc}"
     for server in sys_.vllm_servers:
         server.reset_caches()
-    marks = {s.name: target.file_size(s.log_path) for s in sys_.servers}
+    marks = {s.name: s.target.file_size(s.log_path) for s in sys_.servers}
     out_path = f"{args.work_dir}/bench_{name}_{rate}_c{conc}.json"
     print(f"[bench] {name}: {when} ({conc or 'unbounded'}), {num_prompts} prompts")
     t_start = time.time()
@@ -921,8 +934,8 @@ def measure_point(
     # Completion reports land after the last response.
     time.sleep(args.settle_s)
     slices = {
-        s.name: target.read_bytes(
-            s.log_path, marks[s.name], target.file_size(s.log_path)
+        s.name: s.target.read_bytes(
+            s.log_path, marks[s.name], s.target.file_size(s.log_path)
         )
         for s in sys_.servers
     }
@@ -982,9 +995,10 @@ def run_points(
     name: str,
     num_prompts: int,
     points: list[tuple[str, int]],
+    build: Callable[[Target, argparse.Namespace, str], System] = build_system,
 ) -> list[dict[str, Any]]:
     """Start the arm's system once, measure `points` on it, tear it down."""
-    sys_ = build_system(target, args, name)
+    sys_ = build(target, args, name)
     if ARMS[name].topology == "epd":
         # A config must not inherit encodings the previous one saved: those
         # would be free hits it never paid for.
@@ -1035,7 +1049,11 @@ def run_points(
 
 
 def run_arm(
-    target: Target, args: argparse.Namespace, name: str, num_prompts: int
+    target: Target,
+    args: argparse.Namespace,
+    name: str,
+    num_prompts: int,
+    build: Callable[[Target, argparse.Namespace, str], System] = build_system,
 ) -> list[dict[str, Any]]:
     """Measure one arm across every load point.
 
@@ -1048,9 +1066,9 @@ def run_arm(
     if args.restart_per_load_point:
         results = []
         for point in args.load_points:
-            results.extend(run_points(target, args, name, num_prompts, [point]))
+            results.extend(run_points(target, args, name, num_prompts, [point], build))
         return results
-    return run_points(target, args, name, num_prompts, args.load_points)
+    return run_points(target, args, name, num_prompts, args.load_points, build)
 
 
 # --------------------------------------------------------------------------
@@ -1165,28 +1183,10 @@ def print_frag(results: list[dict[str, Any]]) -> None:
 # --------------------------------------------------------------------------
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--pod", default="", help="run the servers inside this pod (oc)")
-    p.add_argument(
-        "--python",
-        default="",
-        help="interpreter on the target; defaults to this one locally, or "
-        "`python` inside a pod",
-    )
-    p.add_argument(
-        "--vllm-repo",
-        default=str(BENCH_DIR.parents[2]),
-        help="checkout on the target, for the EPD proxy script",
-    )
-    p.add_argument(
-        "--work-dir",
-        default="/tmp/ec_bench",
-        help="scratch directory on the target: logs, pid files, bench outputs",
-    )
-    p.add_argument("--hf-home", default="", help="HF_HOME for the servers")
+def add_common_options(p: argparse.ArgumentParser) -> None:
+    """Options that describe the arms, the servers and the load points, which
+    hold wherever the servers run. Placement options belong to the driver."""
     p.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
-    p.add_argument("--workload-dir", required=True, help="from gen_workload.py")
     p.add_argument("--out-dir", type=Path, default=Path("bench_results"))
     p.add_argument(
         "--arms",
@@ -1235,44 +1235,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bench-timeout-s", type=int, default=3600)
     p.add_argument("--settle-s", type=float, default=5.0)
     p.add_argument("--port", type=int, default=8100, help="single-instance arms")
-    p.add_argument(
-        "--gpu",
-        default="0",
-        help="GPUs for the single-instance arms, comma-separated; the count is "
-        "the tensor-parallel size",
-    )
-    p.add_argument(
-        "--frag",
-        action="store_true",
-        help="offload arm only, region under the working set, descriptor "
-        "counting on: measures whether entries stay contiguous as it churns",
-    )
-    p.add_argument("--frag-window-s", type=float, default=30.0)
-    p.add_argument(
-        "--patch-dir",
-        default=str(BENCH_DIR / "patches"),
-        help="directory holding the --frag sitecustomize.py, on the target",
-    )
     epd = p.add_argument_group("EPD arms")
-    epd.add_argument(
-        "--encoder-devices",
-        default="0",
-        help="one encoder instance per `;`-separated group, each group a "
-        "comma-separated GPU list whose length is that encoder's tensor-parallel "
-        "size: '0;0' is two encoders sharing GPU 0 (they split its memory), "
-        "'0,1;2,3' is two TP=2 encoders. Accepts indices or MIG UUIDs",
-    )
     epd.add_argument(
         "--encoder-serve-args",
         default="",
         help="extra `vllm serve` arguments for the encoder instances",
-    )
-    epd.add_argument(
-        "--encoder-gpu-memory-utilization",
-        type=float,
-        default=0.0,
-        help="per-encoder memory share; 0 divides --gpu-memory-utilization by "
-        "the number of encoders sharing that device",
     )
     epd.add_argument(
         "--mm-encoder-only",
@@ -1290,12 +1257,6 @@ def parse_args() -> argparse.Namespace:
     epd.add_argument("--encoder-port", type=int, default=8101, help="+i per encoder")
     epd.add_argument("--decode-port", type=int, default=8200)
     epd.add_argument("--proxy-port", type=int, default=8000)
-    epd.add_argument(
-        "--decode-gpu",
-        default="1",
-        help="GPUs for the decode instance, comma-separated; the count is the "
-        "tensor-parallel size",
-    )
     epd.add_argument("--side-channel-port", type=int, default=5577, help="+i")
     epd.add_argument("--shared-storage-path", default="", help="example connector")
     epd.add_argument(
@@ -1328,9 +1289,84 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--run-id", default=time.strftime("%Y%m%d-%H%M%S"))
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--dry-run", action="store_true")
-    args = p.parse_args()
 
-    args.python = args.python or ("python" if args.pod else sys.executable)
+
+def add_single_node_options(p: argparse.ArgumentParser) -> None:
+    """Where the servers run and which GPUs they get, for one host."""
+    p.add_argument("--pod", default="", help="run the servers inside this pod (oc)")
+    p.add_argument(
+        "--python",
+        default="",
+        help="interpreter on the target; defaults to this one locally, or "
+        "`python` inside a pod",
+    )
+    p.add_argument(
+        "--vllm-repo",
+        default=str(BENCH_DIR.parents[2]),
+        help="checkout on the target, for the EPD proxy script",
+    )
+    p.add_argument(
+        "--work-dir",
+        default="/tmp/ec_bench",
+        help="scratch directory on the target: logs, pid files, bench outputs",
+    )
+    p.add_argument("--hf-home", default="", help="HF_HOME for the servers")
+    p.add_argument("--workload-dir", required=True, help="from gen_workload.py")
+    p.add_argument(
+        "--gpu",
+        default="0",
+        help="GPUs for the single-instance arms, comma-separated; the count is "
+        "the tensor-parallel size",
+    )
+    p.add_argument(
+        "--frag",
+        action="store_true",
+        help="offload arm only, region under the working set, descriptor "
+        "counting on: measures whether entries stay contiguous as it churns",
+    )
+    p.add_argument("--frag-window-s", type=float, default=30.0)
+    p.add_argument(
+        "--patch-dir",
+        default=str(BENCH_DIR / "patches"),
+        help="directory holding the --frag sitecustomize.py, on the target",
+    )
+    epd = p.add_argument_group("EPD placement")
+    epd.add_argument(
+        "--encoder-devices",
+        default="0",
+        help="one encoder instance per `;`-separated group, each group a "
+        "comma-separated GPU list whose length is that encoder's tensor-parallel "
+        "size: '0;0' is two encoders sharing GPU 0 (they split its memory), "
+        "'0,1;2,3' is two TP=2 encoders. Accepts indices or MIG UUIDs",
+    )
+    epd.add_argument(
+        "--encoder-gpu-memory-utilization",
+        type=float,
+        default=0.0,
+        help="per-encoder memory share; 0 divides --gpu-memory-utilization by "
+        "the number of encoders sharing that device",
+    )
+    epd.add_argument(
+        "--decode-gpu",
+        default="1",
+        help="GPUs for the decode instance, comma-separated; the count is the "
+        "tensor-parallel size",
+    )
+    epd.add_argument(
+        "--proxy-host",
+        default="127.0.0.1",
+        help="address the EPD proxy binds; the load generator dials it",
+    )
+    epd.add_argument(
+        "--side-channel-host",
+        default="127.0.0.1",
+        help="address each producer binds its side channel to and announces "
+        "to the consumer",
+    )
+
+
+def finalize_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Derive the load points and scratch paths; validate the arm list."""
     args.shared_storage_path = args.shared_storage_path or f"{args.work_dir}/shared"
     args.queue_csv = f"{args.work_dir}/queue.csv"
     args.frag_file = f"{args.work_dir}/frag.jsonl"
@@ -1344,6 +1380,16 @@ def parse_args() -> argparse.Namespace:
     if unknown:
         raise SystemExit(f"[bench] unknown arm(s): {sorted(unknown)}")
     return args
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    add_common_options(p)
+    add_single_node_options(p)
+    args = p.parse_args()
+    args.python = args.python or ("python" if args.pod else sys.executable)
+    args.proxy_script = f"{args.vllm_repo}/{PROXY}"
+    return finalize_args(args)
 
 
 def load_manifest(target: Target, args: argparse.Namespace) -> dict[str, Any]:
@@ -1366,10 +1412,14 @@ def load_manifest(target: Target, args: argparse.Namespace) -> dict[str, Any]:
     return manifest
 
 
-def main() -> int:
-    sys.stdout.reconfigure(line_buffering=True)
-    args = parse_args()
-    target = Target(args.pod or None)
+def prepare_workload(
+    target: Target, args: argparse.Namespace
+) -> tuple[dict[str, Any], int]:
+    """Read the workload's manifest and settle what the run takes from it.
+
+    Returns the manifest's `expected` block and the request count; sets
+    `image_refs`, `warmup_prompts` and a manifest-derived `ec_cpu_bytes`.
+    """
     manifest = load_manifest(target, args)
     expected = manifest["expected"]
     num_prompts = args.num_prompts or manifest["sequence"]["requests"]
@@ -1391,6 +1441,14 @@ def main() -> int:
         f"ec_cpu_bytes {args.ec_cpu_bytes / 1024**3:.2f} GiB, max hit rate "
         f"{expected['max_hit_rate'] * 100:.1f}%"
     )
+    return expected, num_prompts
+
+
+def main() -> int:
+    sys.stdout.reconfigure(line_buffering=True)
+    args = parse_args()
+    target = Target(args.pod or None)
+    expected, num_prompts = prepare_workload(target, args)
 
     if args.dry_run:
         rate0, conc0 = args.load_points[0]

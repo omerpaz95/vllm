@@ -1,0 +1,41 @@
+# One vLLM server (or the EPD proxy) as a Deployment fronted by a Service.
+# k8s_bench.py fills in names, labels, image, command, env, ports, resources,
+# volumes and affinity per server; only the static shape lives here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: RENDERED
+spec:
+  replicas: 1
+  # A benchmark server is replaced, never rolled: two copies of one instance
+  # would both hold the GPU.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {}
+  template:
+    metadata:
+      labels: {}
+    spec:
+      # Long enough for an orderly vLLM exit (CUDA teardown, EC region unlink).
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsUser: 0
+      containers:
+      - name: vllm
+        image: RENDERED
+        imagePullPolicy: Always
+        command: ["bash", "-c", "RENDERED"]
+        ports: []
+        env: []
+        resources: {}
+        volumeMounts: []
+      volumes: []
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: RENDERED
+spec:
+  selector: {}
+  ports: []

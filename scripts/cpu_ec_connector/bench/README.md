@@ -31,8 +31,11 @@ same GPU list as the decode instance for a resource-matched comparison.
 
 | file | role |
 |---|---|
-| `gen_workload.py` | builds the image pool, the `custom_image` JSONL and `manifest.json` |
+| `gen_workload.py` | builds the image pool, the `custom_image` JSONL, `warmup.jsonl` and `manifest.json` |
+| `hf_workload.py` | the same directory from a Hugging Face dataset (DocVQA, MuirBench, VisionArena-Chat, any image column) |
+| `plot_results.py` | charts (PNG + SVG) and a self-contained `report.html` from one or more `bench.json` |
 | `run_bench.py` | server lifecycle, load driving, log accounting, gates, table |
+| `k8s_bench.py` + `k8s/` | the same arms on OpenShift with encoder and decode on different nodes; see [`k8s/README.md`](k8s/README.md). `test_k8s_bench.py` checks the rendered manifests |
 | `ec_log_stats.py` | log parsers: EC transfers (both connectors), encoder inputs, proxy `STAGE` lines, rewrite counts |
 | `phase0_hit_check.py` | correctness gate for one `ec_both` instance: a repeat pass must reload, not recompute |
 | `micro_swap_blocks.py` | descriptor-layout microbenchmark of the region's batched copies |
@@ -91,6 +94,56 @@ quantity is pixel-count driven, and an EC entry's size is purely resolution
 get right is the JPEG size that sets wire payload and decode time; the
 synthetic source is calibrated to that, and an enlarged photo compresses the
 same as a native crop.
+
+## Real datasets
+
+`vllm bench serve` supports a handful of Hugging Face datasets natively, but
+none of them repeats an image across requests or carries more than one
+image per request, and MuirBench is not among them. `hf_workload.py`
+converts a dataset into this directory layout instead, deduplicating images
+by pixel hash so shared images become reuse, and the manifest then reports
+the reuse the dataset actually has.
+
+| dataset | reuse (refs per distinct image) | why |
+|---|---|---|
+| `lmms-lab/DocVQA` (config `DocVQA`, validation) | ~4.2x, scanned pages of ~10k embeddings | the primary choice: high-resolution images asked about repeatedly is the pattern the connector exists for |
+| `lmms-lab/DocVQA` (config `InfographicVQA`) | ~5.6x, images that hit `max_pixels` | fewer, much larger entries |
+| `MUIRBENCH/MUIRBENCH` (test) | ~1.6x, only within counterpart pairs | 4.3 images per request: the fan-out arm, where one request can occupy several encoders. Do not expect it to move the offload numbers |
+| `lmarena-ai/VisionArena-Chat` | ~1x as vLLM uses it, 2-3x with `--expand-turns` | real user images and multi-turn conversations |
+
+```bash
+uv pip install datasets
+python hf_workload.py --dataset lmms-lab/DocVQA --subset DocVQA \
+    --split validation --out-dir /data/wl-docvqa --max-samples 1200
+python hf_workload.py --out-dir /data/wl-muir --max-samples 600   # MuirBench
+python run_bench.py --workload-dir /data/wl-docvqa --out-dir results \
+    --arms baseline,offload,cpu-grid --max-concurrency 1,4,8
+```
+
+The real downloads were not exercised where this was written (no access to
+huggingface.co), so the MuirBench column names are auto-detected with
+`--image-column`/`--question-column` as the override.
+
+## Charts and report
+
+```bash
+uv pip install matplotlib
+python plot_results.py --out-dir report results/rep1/bench.json results/rep2/bench.json
+python plot_results.py --out-dir report_demo --demo   # synthetic fixture, no hardware
+```
+
+Several files are treated as replications: lines show the mean with min-max
+bands. `report.html` embeds every chart, an executive summary computed from
+the data, the full table and a validity section (completion, queue depth,
+rewrite coverage, the encoder-compute gate).
+
+## Multi-node
+
+`k8s_bench.py` runs the same arms on OpenShift with the encoder(s) and the
+decode instance forced onto different nodes, the CPU connector crossing
+nodes over NIXL and the example connector over a ReadWriteMany PVC. Model,
+image, GPU counts per role and storage class are flags. See
+[`k8s/README.md`](k8s/README.md); nothing there has run on a cluster yet.
 
 ## What is gated
 
