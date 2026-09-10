@@ -865,6 +865,41 @@ def _stage_keys(bench: Bench) -> list[str]:
     return keys or sorted(present - {"decode_total"})
 
 
+def _tiny_stages(
+    bench: Bench, keys: Sequence[str], arms: Sequence[str], points: Sequence[Point]
+) -> str:
+    """Stages drawn to scale but too thin to see, stated in words.
+
+    The proxy's rewrite is a JSON edit that takes well under a millisecond
+    against stacks of hundreds; without this line its slice reads as a
+    missing stage rather than a measurement.
+    """
+
+    def mean(arm: str, point: Point, key: str) -> float:
+        stat = bench.stat(arm, point, stage(key))
+        return stat.mean if stat else 0.0
+
+    stack = max(
+        (sum(mean(a, p, k) for k in keys) for a in arms for p in points), default=0.0
+    )
+    notes = []
+    for key in keys:
+        per_arm = {
+            a: max((mean(a, p, key) for p in points if bench.rows(a, p)), default=0.0)
+            for a in arms
+        }
+        biggest = max(per_arm.values(), default=0.0)
+        if 0 < biggest < 0.01 * stack:
+            listed = ", ".join(
+                f"{_short_arm(a)} {v:.2f} ms" for a, v in per_arm.items() if v > 0
+            )
+            notes.append(
+                f"{key.replace('_', ' ')} is drawn to scale but too thin to see "
+                f"(peak medians: {listed})."
+            )
+    return " ".join(notes)
+
+
 def epd_arms(bench: Bench) -> list[str]:
     return [
         arm
@@ -957,13 +992,15 @@ def chart_stages(bench: Bench, styles, point: Point, out_dir: Path) -> Chart | N
         "Where the EPD request spends its time",
         "Proxy-reported medians per stage; decode_ttfb is what the client waits for.",
     )
-    source_note(fig, rep_note(bench))
+    tiny = _tiny_stages(bench, keys, arms, [point])
+    source_note(fig, f"{rep_note(bench)} {tiny}".strip())
     svg, png = _save(fig, out_dir, "04_stages")
     return Chart(
         "04_stages",
         "EPD stage breakdown",
         f"Stage medians the EPD proxy logs, at {_point_label(point)}. The grid "
-        "rewrite trades a little encoder time for a shorter decode time-to-first-byte.",
+        "rewrite trades a little encoder time for a shorter decode "
+        f"time-to-first-byte. {tiny}".strip(),
         svg,
         png,
     )
@@ -1024,13 +1061,14 @@ def chart_stages_by_load(bench: Bench, styles, out_dir: Path) -> Chart | None:
         "Stage breakdown across the load sweep",
         "One panel per load point; the same stacked stages, on a shared scale.",
     )
-    source_note(fig, rep_note(bench))
+    tiny = _tiny_stages(bench, keys, arms, points)
+    source_note(fig, f"{rep_note(bench)} {tiny}".strip())
     svg, png = _save(fig, out_dir, "05_stages_by_load")
     return Chart(
         "05_stages_by_load",
         "EPD stage breakdown per load point",
         "Small multiples of the stage stack, so a stage that only grows under "
-        "load is visible as such.",
+        f"load is visible as such. {tiny}".strip(),
         svg,
         png,
     )
