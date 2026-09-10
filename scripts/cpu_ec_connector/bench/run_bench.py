@@ -1127,8 +1127,27 @@ def run_points(
             stop_queue_sampler(target, args)
         return results
     finally:
-        for server in reversed(sys_.servers):
+        stop_all(sys_.servers)
+
+
+def stop_all(servers: list[BenchServer]) -> None:
+    """Stop every server even when one refuses to go, then re-raise.
+
+    A teardown that stops at the first failure leaves the rest holding
+    GPUs into the next run, which then shares nodes with them.
+    """
+    failures: list[BaseException] = []
+    for server in reversed(servers):
+        try:
             server.stop()
+        except Exception as exc:
+            failures.append(exc)
+            print(
+                f"[bench] WARNING: stopping {server.name} failed: {exc}",
+                file=sys.stderr,
+            )
+    if failures:
+        raise failures[0]
 
 
 def run_arm(

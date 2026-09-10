@@ -544,19 +544,41 @@ class PodServer(BenchServer):
             stem.with_suffix(".previous.log").write_text(previous.stdout)
 
     def diagnose(self) -> str:
-        """Explain an exec that found no container, and keep the evidence."""
+        """Explain an exec that found no container, and keep the evidence.
+
+        Two shapes: the container restarted in place (restarts > 0; the
+        crash is in the previous container's log and last exit state), or
+        the pod itself was replaced (a new pod, often Pending, with zero
+        restarts: eviction, preemption or a node going away, which only the
+        namespace events record).
+        """
         status = self.status()
         self.save_log()
-        exit_info = status.get("last_exit") or {}
-        return (
-            f"{self.resource}: its container went away mid-run (phase="
-            f"{status.get('phase')}, restarts={status.get('restarts')}, previous "
-            f"container exit: {exit_info or 'unknown'}). The crashed container's "
-            f"log is saved as {self.args.out_dir}/logs/{self.args.run_id}/"
-            f"{self.arm or 'arm'}-{self.name}-{self.starts}.previous.log; "
-            "OOMKilled means the pod memory (--pod-memory) or /dev/shm "
-            "(--shm-size) was too small"
+        log_dir = self.args.out_dir / "logs" / self.args.run_id
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"{self.arm or 'arm'}-{self.name}-{self.starts}"
+        events = (
+            self._oc()
+            .run("get", "events", "--sort-by=.lastTimestamp", check=False, timeout=120)
+            .stdout
         )
+        mine = [line for line in events.splitlines() if self.resource in line]
+        (log_dir / f"{stem}.events.txt").write_text("\n".join(mine))
+        if status.get("restarts"):
+            exit_info = status.get("last_exit") or {}
+            why = (
+                f"its container restarted in place (previous exit: {exit_info}); "
+                f"the crash is in {log_dir}/{stem}.previous.log. OOMKilled means "
+                "--pod-memory or --shm-size was too small"
+            )
+        else:
+            why = (
+                f"its pod was replaced (new pod phase={status.get('phase')}, "
+                "0 restarts): evicted, preempted or its node went away. The "
+                f"events are in {log_dir}/{stem}.events.txt; the last ones: "
+                + " | ".join(line[:160] for line in mine[-4:])
+            )
+        return f"{self.resource}: {why}"
 
     def stop(self) -> None:
         oc = self._oc()
