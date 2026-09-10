@@ -199,8 +199,29 @@ class Oc:
         )
 
     def wait_gone(self, sel: str, timeout_s: int = _STOP_TIMEOUT_S) -> None:
+        """Wait for the pods to go, force-deleting ones that linger.
+
+        A pod still pulling its image or stuck in ContainerCreating can take
+        far longer than the grace period to terminate; after half the budget
+        it is removed without one, which cannot leak anything a running
+        server would (there is no server yet).
+        """
         deadline = time.monotonic() + timeout_s
+        forced = False
         while self.pods(sel):
+            if not forced and time.monotonic() > deadline - timeout_s / 2:
+                self.run(
+                    "delete",
+                    "pod",
+                    "-l",
+                    sel,
+                    "--grace-period=0",
+                    "--force",
+                    "--ignore-not-found",
+                    check=False,
+                    timeout=120,
+                )
+                forced = True
             if time.monotonic() > deadline:
                 raise RuntimeError(
                     f"pods matching {sel} still exist after {timeout_s}s"
@@ -451,6 +472,9 @@ class PodServer(BenchServer):
             doc["metadata"]["namespace"] = self.args.namespace
             doc["metadata"]["labels"] = labels(self.args, self.name)
         dep["spec"]["selector"]["matchLabels"] = labels(self.args, self.name)
+        # The Deployment's own deadline (600s by default) would call a slow
+        # image pull a failed rollout long before --startup-timeout-s.
+        dep["spec"]["progressDeadlineSeconds"] = self.args.startup_timeout_s
         template = dep["spec"]["template"]
         template["metadata"]["labels"] = pod_labels
         spec = template["spec"]
@@ -803,6 +827,80 @@ def preflight(oc: Oc, client: ClientPod, args: argparse.Namespace) -> None:
             )
 
 
+def prepull_image(oc: Oc, args: argparse.Namespace) -> None:
+    """Pull the image onto every node a GPU pod could land on, up front.
+
+    Anti-affinity spreads each arm over nodes the previous arm did not use,
+    and a node that has never run the image pulls 20+ GB inside the rollout
+    budget while the others start in seconds. A throwaway DaemonSet pulls in
+    parallel on all of them once; its pods do nothing and hold no GPU.
+    """
+    name = f"ec-bench-prepull-{args.run_id}"
+    selector = dict(args.node_selector) or dict(
+        kv.split("=", 1) for kv in args.prepull_node_selector.split(",") if kv
+    )
+    spec: dict[str, Any] = {
+        "nodeSelector": selector,
+        "containers": [
+            {
+                "name": "prepull",
+                "image": args.image,
+                "imagePullPolicy": "Always",
+                "command": ["sleep", "infinity"],
+                "resources": {"requests": {"cpu": "50m", "memory": "64Mi"}},
+            }
+        ],
+    }
+    affinity = node_affinity(args)
+    if affinity:
+        spec["affinity"] = affinity
+    pod_labels = {"app": APP_LABEL, "run-id": args.run_id, "role": "prepull"}
+    oc.apply(
+        [
+            {
+                "apiVersion": "apps/v1",
+                "kind": "DaemonSet",
+                "metadata": {
+                    "name": name,
+                    "namespace": args.namespace,
+                    "labels": pod_labels,
+                },
+                "spec": {
+                    "selector": {"matchLabels": pod_labels},
+                    "template": {"metadata": {"labels": pod_labels}, "spec": spec},
+                },
+            }
+        ]
+    )
+    deadline = time.monotonic() + args.startup_timeout_s
+    try:
+        while True:
+            out = oc.run("get", "daemonset", name, "-o", "json").stdout
+            status = json.loads(out).get("status", {})
+            want = status.get("desiredNumberScheduled", 0)
+            ready = status.get("numberReady", 0)
+            if want == 0 and time.monotonic() > deadline - args.startup_timeout_s + 30:
+                print(
+                    f"[k8s] WARNING: no node matches the pre-pull selector "
+                    f"{selector}; pods will pull the image on first start",
+                    file=sys.stderr,
+                )
+                return
+            if want and ready >= want:
+                print(f"[k8s] image present on {ready} node(s)")
+                return
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"image pre-pull reached {ready} of {want} nodes within "
+                    f"{args.startup_timeout_s}s; a node may be pulling at a "
+                    "crawl or out of disk (oc describe daemonset "
+                    f"{name})"
+                )
+            time.sleep(5.0)
+    finally:
+        oc.run("delete", "daemonset", name, "--ignore-not-found", check=False)
+
+
 def ensure_pvc(oc: Oc, args: argparse.Namespace) -> None:
     if oc.exists("pvc", args.pvc_name):
         print(f"[k8s] using existing PVC {args.pvc_name}")
@@ -903,6 +1001,19 @@ def parse_args() -> argparse.Namespace:
         help="runAsUser 0 (needs the anyuid SCC); off relies on fsGroup for the PVC",
     )
     k.add_argument("--skip-preflight", action="store_true")
+    k.add_argument(
+        "--prepull",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="pull the image onto every eligible node before the first arm, "
+        "with a throwaway DaemonSet, so no rollout waits on a 20 GB pull",
+    )
+    k.add_argument(
+        "--prepull-node-selector",
+        default="nvidia.com/gpu.present=true",
+        help="nodes the pre-pull targets when --node-selector is not given "
+        "(the NVIDIA GPU operator's label for GPU nodes)",
+    )
     k.add_argument(
         "--workload-dir",
         default=f"{PVC_MOUNT}/wl",
@@ -1046,6 +1157,8 @@ def main() -> int:
             raise SystemExit(f"[k8s] not logged in: {who.stderr.strip()[:200]}")
     ensure_pvc(oc, args)
     oc.apply([render_scripts_configmap(args)])
+    if args.prepull:
+        prepull_image(oc, args)
     client.start()
     if not args.skip_preflight:
         preflight(oc, client, args)
