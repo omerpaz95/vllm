@@ -355,23 +355,38 @@ def build_requests(
     prefix_tokens: int,
     limit: int,
     skip_hashes: set[str] | None = None,
+    max_images: int = 0,
+    max_embeds: int = 0,
+    oversized: list[int] | None = None,
 ) -> tuple[list[dict], list[list[int]]]:
     """Return `(jsonl_records, per_request_image_indices)`.
 
     A row whose images are all rejected or all held back is dropped: a
-    text-only request would count as a request that could never reuse.
+    text-only request would count as a request that could never reuse. A
+    row over `max_images` or `max_embeds` is dropped too, and counted in
+    `oversized`: such a request outgrows the context window on every arm
+    alike, and one failure stops the benchmark's completion gate.
     """
     records: list[dict] = []
     per_request: list[list[int]] = []
     for sample in samples:
         if limit and len(records) >= limit:
             break
+        if max_images and len(sample.images) > max_images:
+            if oversized is not None:
+                oversized.append(len(sample.images))
+            continue
         chosen = [
             index
             for index in (pool.add(img, skip_hashes) for img in sample.images)
             if index is not None
         ]
         if not chosen:
+            continue
+        embeds = sum(pool.images[i].embeds for i in chosen)
+        if max_embeds and embeds > max_embeds:
+            if oversized is not None:
+                oversized.append(embeds)
             continue
         for text in sample.texts:
             if limit and len(records) >= limit:
@@ -460,13 +475,22 @@ def convert(records: list[dict], args: argparse.Namespace) -> int:
         raise SystemExit("[hf] no row carried both an image and a question")
 
     pool = Pool(args.out_dir / "pool", args, bytes_per_embed)
+    oversized: list[int] = []
     workload, per_request = build_requests(
         samples,
         pool,
         rng,
         prefix_tokens=args.prefix_tokens,
         limit=args.num_requests,
+        max_images=args.max_images_per_request,
+        max_embeds=args.max_embeds_per_request,
+        oversized=oversized,
     )
+    if oversized:
+        print(
+            f"[hf] dropped {len(oversized)} rows over --max-images-per-request/"
+            f"--max-embeds-per-request (largest: {max(oversized)})"
+        )
     if not workload:
         raise SystemExit("[hf] every row was dropped; nothing to replay")
     write_jsonl(args.out_dir / "workload.jsonl", workload)
@@ -575,6 +599,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--merge-stride", type=int, default=DEFAULT_MERGE_STRIDE)
     p.add_argument("--min-pixels", type=int, default=DEFAULT_MIN_PIXELS)
     p.add_argument("--max-pixels", type=int, default=DEFAULT_MAX_PIXELS)
+    p.add_argument(
+        "--max-images-per-request",
+        type=int,
+        default=0,
+        help="drop rows with more images than this; 0 = no cap",
+    )
+    p.add_argument(
+        "--max-embeds-per-request",
+        type=int,
+        default=0,
+        help="drop rows whose images together exceed this many embeddings, so "
+        "every request fits the decode instance's --max-model-len (32768 by "
+        "default: 28000 leaves room for the text); 0 = no cap",
+    )
     p.add_argument("--self-check", action="store_true")
     args = p.parse_args(argv)
     if args.split is None:

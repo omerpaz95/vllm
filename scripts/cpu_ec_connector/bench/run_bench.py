@@ -85,6 +85,8 @@ _GPU_PROCESSOR_MARKER = "Running the multi-modal processor on cuda"
 # the exact wording is version-dependent, uvicorn's is stable.
 _STARTUP_MARKERS = ("Application startup complete", "Starting vLLM server on")
 _REGION_REMOVED_MARKER = "Removed EC mmap file"
+# Room for the nonce, the question and the answer beside a request's images.
+_PROMPT_TEXT_TOKENS = 512
 REGION_GLOB = "/dev/shm/vllm_ec_*.mmap"
 # Removes region files that no process maps. A region outlives its server
 # when the shutdown that unlinks it is cut short; each is GiBs of tmpfs, and
@@ -1000,10 +1002,19 @@ def measure_point(
     client = json.loads(raw) if raw.strip() else {}
     done = client.get("completed", 0)
     if done < num_prompts:
+        # The load generator records why each request failed; the first few
+        # distinct reasons usually name the limit that was hit.
+        errors = [e for e in client.get("errors") or [] if e]
+        distinct = list(dict.fromkeys(str(e)[:300] for e in errors))[:3]
         raise ServerMismatchError(
             f"{name} ({when}): only {done} of {num_prompts} requests completed, so "
             f"the latencies describe the few that survived; see "
-            f"{sys_.consumer.log_path}"
+            f"{sys_.consumer.log_path}. "
+            + (
+                f"{len(errors)} failed; reasons: {distinct}"
+                if errors
+                else "the client recorded no per-request errors"
+            )
         )
     consumer = summarize(slices[sys_.consumer.name])
     check_loads(name, when, consumer)
@@ -1492,6 +1503,16 @@ def prepare_workload(
         args.ec_cpu_bytes = expected[
             "fragmentation_arm_ec_cpu_bytes" if args.frag else "suggested_ec_cpu_bytes"
         ]
+    # A request whose images alone outgrow the context window is rejected
+    # by every arm alike, and the completion gate then stops the whole run.
+    biggest = expected.get("max_embeds_per_request", 0)
+    if biggest + _PROMPT_TEXT_TOKENS > args.max_model_len:
+        raise SystemExit(
+            f"[bench] the largest request carries {biggest} image embeddings, "
+            f"which cannot fit --max-model-len {args.max_model_len}; raise it, "
+            "or rebuild the workload with a cap (hf_workload.py "
+            "--max-embeds-per-request, gen_workload.py --images-per-request)"
+        )
     print(
         f"[bench] workload {num_prompts} requests ({args.image_refs} image refs), "
         f"working set {expected['working_set_bytes'] / 1024**3:.2f} GiB, "

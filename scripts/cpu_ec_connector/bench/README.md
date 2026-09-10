@@ -115,7 +115,8 @@ the reuse the dataset actually has.
 uv pip install datasets
 python hf_workload.py --dataset lmms-lab/DocVQA --subset DocVQA \
     --split validation --out-dir /data/wl-docvqa --max-samples 1200
-python hf_workload.py --out-dir /data/wl-muir --max-samples 600   # MuirBench
+python hf_workload.py --out-dir /data/wl-muir --max-samples 600 \
+    --max-embeds-per-request 28000   # MuirBench; see the cap note below
 python run_bench.py --workload-dir /data/wl-docvqa --out-dir results \
     --arms baseline,offload,cpu-grid --max-concurrency 1,4,8
 ```
@@ -137,8 +138,15 @@ python k8s_bench.py --namespace my-ns --out-dir results/docvqa \
 python k8s_bench.py --namespace my-ns --out-dir results/muir \
     --arms baseline,cpu-grid --num-encoders 4 --max-concurrency 1,4,8 \
     --workload-dir /bench/wl-muir \
-    --hf-workload "--dataset MUIRBENCH/MUIRBENCH --split test --max-samples 600"
+    --hf-workload "--dataset MUIRBENCH/MUIRBENCH --split test --max-samples 600 --max-embeds-per-request 28000"
 ```
+
+A multi-image request whose images together outgrow the decode instance's
+`--max-model-len` (32768 by default) is rejected by every arm alike, and one
+such request fails the completion gate for the whole point. MuirBench has a
+few: `--max-embeds-per-request 28000` drops them at conversion (the
+converter reports how many), and the bench refuses to start when the
+manifest's largest request cannot fit the context window.
 
 The real downloads were not exercised where this was written (no access to
 huggingface.co), so the MuirBench column names are auto-detected with
