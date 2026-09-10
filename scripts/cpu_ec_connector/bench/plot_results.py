@@ -865,6 +865,12 @@ def _stage_keys(bench: Bench) -> list[str]:
     return keys or sorted(present - {"decode_total"})
 
 
+def _join_notes(*parts: str) -> str:
+    """Sentences for one source line, each ending in a full stop."""
+    kept = [p.strip() for p in parts if p and p.strip()]
+    return " ".join(p if p.endswith(".") else p + "." for p in kept)
+
+
 def _tiny_stages(
     bench: Bench, keys: Sequence[str], arms: Sequence[str], points: Sequence[Point]
 ) -> str:
@@ -993,7 +999,7 @@ def chart_stages(bench: Bench, styles, point: Point, out_dir: Path) -> Chart | N
         "Proxy-reported medians per stage; decode_ttfb is what the client waits for.",
     )
     tiny = _tiny_stages(bench, keys, arms, [point])
-    source_note(fig, f"{rep_note(bench)} {tiny}".strip())
+    source_note(fig, _join_notes(rep_note(bench), tiny))
     svg, png = _save(fig, out_dir, "04_stages")
     return Chart(
         "04_stages",
@@ -1062,7 +1068,7 @@ def chart_stages_by_load(bench: Bench, styles, out_dir: Path) -> Chart | None:
         "One panel per load point; the same stacked stages, on a shared scale.",
     )
     tiny = _tiny_stages(bench, keys, arms, points)
-    source_note(fig, f"{rep_note(bench)} {tiny}".strip())
+    source_note(fig, _join_notes(rep_note(bench), tiny))
     svg, png = _save(fig, out_dir, "05_stages_by_load")
     return Chart(
         "05_stages_by_load",
