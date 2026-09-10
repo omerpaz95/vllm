@@ -68,7 +68,7 @@ _SHM_HEADROOM_BYTES = 8 * GIB
 _POD_MEMORY_HEADROOM_BYTES = 32 * GIB
 _CONFIGMAP_LIMIT_BYTES = 1024 * 1024
 # What runs inside the pods; the drivers stay on the laptop.
-_POD_SCRIPTS = ("gen_workload.py", "ec_log_stats.py", "run_bench.py")
+_POD_SCRIPTS = ("gen_workload.py", "hf_workload.py", "ec_log_stats.py", "run_bench.py")
 _HEALTH_POLL_S = 5.0
 _STOP_TIMEOUT_S = 300
 _RUN_ID_RE = re.compile(r"^[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$")
@@ -742,16 +742,24 @@ def ensure_workload(client: ClientPod, args: argparse.Namespace) -> None:
     manifest = f"{args.workload_dir}/manifest.json"
     if client.target.exists(manifest):
         return
-    if not args.gen_workload:
+    if not (args.gen_workload or args.hf_workload):
         raise SystemExit(
             f"[k8s] no manifest.json in {args.workload_dir} on the PVC; pass "
-            '--gen-workload "<gen_workload.py args>" to build it in-cluster'
+            '--gen-workload "<gen_workload.py args>" or --hf-workload '
+            '"<hf_workload.py args>" to build it in-cluster'
         )
-    print(f"[k8s] generating the workload in {args.workload_dir}")
+    if args.hf_workload:
+        # The image ships vLLM's benchmark code but not the `datasets`
+        # package it imports lazily; the client pod has network access.
+        print(f"[k8s] converting a Hugging Face dataset into {args.workload_dir}")
+        script, extra = "hf_workload.py", args.hf_workload
+        client.target.sh(f"{args.python} -m pip install --quiet datasets", timeout=600)
+    else:
+        print(f"[k8s] generating the workload in {args.workload_dir}")
+        script, extra = "gen_workload.py", args.gen_workload
     client.target.sh(
-        f"mkdir -p {args.workload_dir} && {args.python} "
-        f"{SCRIPTS_MOUNT}/gen_workload.py --out-dir {args.workload_dir} "
-        f"{args.gen_workload}",
+        f"mkdir -p {args.workload_dir} && {args.python} {SCRIPTS_MOUNT}/{script} "
+        f"--out-dir {args.workload_dir} {extra}",
         timeout=args.gen_timeout_s,
     )
 
@@ -905,6 +913,14 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="gen_workload.py arguments, to build --workload-dir in-cluster if "
         "it has no manifest",
+    )
+    k.add_argument(
+        "--hf-workload",
+        default="",
+        help="hf_workload.py arguments, to convert a Hugging Face dataset into "
+        "--workload-dir in-cluster if it is missing (installs `datasets` in the "
+        'client pod), e.g. "--dataset lmms-lab/DocVQA --subset DocVQA '
+        '--split validation --max-samples 1200"',
     )
     k.add_argument("--gen-timeout-s", type=int, default=7200)
     k.add_argument("--keep", action="store_true", help="leave the client pod up")

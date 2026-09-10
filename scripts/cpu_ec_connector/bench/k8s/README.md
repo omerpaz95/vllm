@@ -55,6 +55,14 @@ python k8s_bench.py --namespace my-ns --out-dir results \
     --num-prompts 120 --restart-per-load-point \
     --gen-workload "--pool-size 96 --buckets 2048x2048:1.0 --num-requests 400 --reuse zipf:1.1"
 
+# 2b. A real dataset instead of the synthetic pool: converted once inside
+#     the client pod (installs `datasets` there), kept on the PVC under
+#     --workload-dir. DocVQA for reuse, MuirBench for multi-image fan-out.
+python k8s_bench.py --namespace my-ns --out-dir results/docvqa \
+    --arms baseline,cpu-data,cpu-grid --max-concurrency 1,4,8 \
+    --workload-dir /bench/wl-docvqa \
+    --hf-workload "--dataset lmms-lab/DocVQA --subset DocVQA --split validation --max-samples 1200"
+
 # 3. Example connector arms over the shared filesystem.
 python k8s_bench.py --namespace my-ns --out-dir results \
     --arms baseline,example-data,example-grid --max-concurrency 1,4,8

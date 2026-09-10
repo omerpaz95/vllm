@@ -120,9 +120,31 @@ python run_bench.py --workload-dir /data/wl-docvqa --out-dir results \
     --arms baseline,offload,cpu-grid --max-concurrency 1,4,8
 ```
 
+MuirBench is the fan-out workload: give it several encoders, for example
+`--encoder-devices "0;0;0;0"` (four `--mm-encoder-only` encoders sharing
+GPU 0), so a 4-image request can occupy them all. `--num-prompts` replays
+only the first lines of the file, so the reuse a run sees is the reuse
+within that prefix; for the DocVQA story run the whole file at least once.
+
+On the multi-node harness the conversion runs inside the client pod and
+lands on the PVC, so every later run reuses it:
+
+```bash
+python k8s_bench.py --namespace my-ns --out-dir results/docvqa \
+    --arms baseline,cpu-data,cpu-grid --max-concurrency 1,4,8 \
+    --workload-dir /bench/wl-docvqa \
+    --hf-workload "--dataset lmms-lab/DocVQA --subset DocVQA --split validation --max-samples 1200"
+python k8s_bench.py --namespace my-ns --out-dir results/muir \
+    --arms baseline,cpu-grid --num-encoders 4 --max-concurrency 1,4,8 \
+    --workload-dir /bench/wl-muir \
+    --hf-workload "--dataset MUIRBENCH/MUIRBENCH --split test --max-samples 600"
+```
+
 The real downloads were not exercised where this was written (no access to
 huggingface.co), so the MuirBench column names are auto-detected with
-`--image-column`/`--question-column` as the override.
+`--image-column`/`--question-column` as the override. The manifest the
+converter writes reports the reuse the dataset actually has; check its
+`max_hit_rate` before reading anything else.
 
 ## Charts and report
 
