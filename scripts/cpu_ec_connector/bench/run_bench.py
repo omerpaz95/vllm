@@ -897,8 +897,23 @@ def check_loads(name: str, when: str, consumer: dict[str, Any]) -> None:
 
 def check_fanout(name: str, when: str, per_encoder: dict[str, int]) -> None:
     """If the proxy's round-robin left an encoder idle, fewer encoders were
-    measured than configured, with the rest burning memory for nothing."""
+    measured than configured, with the rest burning memory for nothing.
+
+    A point where every encoder was idle is a different situation: with the
+    servers kept across load points, a producer finds every image already
+    published after the first pass and never runs the vision tower again.
+    That point measures the all-hit path, and the `saves` column says so;
+    only an uneven split is a fan-out failure.
+    """
     idle = [enc for enc, done in per_encoder.items() if not done]
+    if len(per_encoder) > 1 and len(idle) == len(per_encoder):
+        print(
+            f"[bench] {name} ({when}): no encoder computed anything; every image "
+            "was already cached from an earlier point (warm connector state). "
+            "Use --restart-per-load-point for a cold start at every point.",
+            file=sys.stderr,
+        )
+        return
     if len(per_encoder) > 1 and idle:
         raise ServerMismatchError(
             f"{name} ({when}): {idle} computed no encoder inputs, so the fan-out "
