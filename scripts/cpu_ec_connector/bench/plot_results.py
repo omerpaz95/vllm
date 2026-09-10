@@ -686,7 +686,7 @@ def chart_throughput(bench: Bench, axis: LoadAxis, styles, out_dir: Path) -> Cha
             ys,
             color=style.color,
             marker=style.marker,
-            label=arm,
+            label=display(arm),
             dashes=style.dashes or (),
             markeredgecolor=SURFACE,
             zorder=3,
@@ -700,7 +700,7 @@ def chart_throughput(bench: Bench, axis: LoadAxis, styles, out_dir: Path) -> Cha
             linewidth=0,
             zorder=1,
         )
-        ends.append((xs[-1], ys[-1], arm))
+        ends.append((xs[-1], ys[-1], display(arm)))
     style_axes(ax)
     axis.apply(ax)
     ax.set_ylabel("Output throughput (generated tokens/s)")
@@ -749,14 +749,14 @@ def chart_speedup(
             yerr=np.array([s.err for _, s in stats]).T,
             color=style.color,
             marker=style.marker,
-            label=arm,
+            label=display(arm),
             dashes=style.dashes or (),
             markeredgecolor=SURFACE,
             elinewidth=1.0,
             capsize=3,
             zorder=3,
         )
-        firsts.append((xs[-1], ys[-1], arm))
+        firsts.append((xs[-1], ys[-1], display(arm)))
     ax.axhline(1.0, color=AXIS, linewidth=1.4, zorder=2)
     ax.annotate(
         f"1.0 = {base}",
@@ -808,7 +808,7 @@ def chart_ttft(bench: Bench, axis: LoadAxis, styles, out_dir: Path) -> Chart:
                 [s.mean for _, s in pairs],
                 color=style.color,
                 marker=style.marker,
-                label=arm,
+                label=display(arm),
                 dashes=style.dashes or (),
                 markeredgecolor=SURFACE,
                 zorder=3,
@@ -981,7 +981,7 @@ def chart_stages(bench: Bench, styles, point: Point, out_dir: Path) -> Chart | N
             [s.err if s else (0.0, 0.0) for s in stats],
             width,
             styles[arm].color,
-            arm,
+            display(arm),
         )
     style_axes(ax2)
     ax2.set_xticks(positions)
@@ -1080,8 +1080,31 @@ def chart_stages_by_load(bench: Bench, styles, out_dir: Path) -> Chart | None:
     )
 
 
+DISPLAY_NAMES: dict[str, str] = {
+    "baseline": "Baseline",
+    "offload": "CPU Offload",
+    "cpu-data": "NIXL E/PD (pixels)",
+    "cpu-grid": "NIXL E/PD",
+    "example-data": "ExampleConnector E/PD (pixels)",
+    "example-grid": "ExampleConnector E/PD",
+}
+
+
+def display(arm: str) -> str:
+    """The name an arm carries in every legend, tick, table and sentence.
+
+    Unknown arms keep their raw name; a `multinode-` prefix becomes a suffix
+    on the known name. `--label arm=Name` on the command line overrides.
+    """
+    if arm in DISPLAY_NAMES:
+        return DISPLAY_NAMES[arm]
+    if arm.startswith("multinode-") and arm[len("multinode-") :] in DISPLAY_NAMES:
+        return f"{DISPLAY_NAMES[arm[len('multinode-') :]]}, multi-node"
+    return arm
+
+
 def _short_arm(arm: str) -> str:
-    return arm.replace("example", "ex").replace("multinode", "mn")
+    return display(arm)
 
 
 def chart_mechanism(bench: Bench, styles, point: Point, out_dir: Path) -> Chart:
@@ -1240,7 +1263,7 @@ def chart_bandwidth(
                 yerr=np.array([s.err for _, s in pairs]).T,
                 color=style.color,
                 marker=style.marker,
-                label=arm,
+                label=display(arm),
                 dashes=style.dashes or (),
                 markeredgecolor=SURFACE,
                 elinewidth=1.0,
@@ -1307,7 +1330,7 @@ def chart_queues(bench: Bench, axis: LoadAxis, styles, out_dir: Path) -> Chart |
                 [s.mean for _, s in pairs],
                 color=style.color,
                 marker=style.marker,
-                label=arm,
+                label=display(arm),
                 dashes=style.dashes or (),
                 markeredgecolor=SURFACE,
                 zorder=3,
@@ -1607,14 +1630,15 @@ def build_report(
         _tile(
             "Best throughput gain",
             f"{summary.best_speedup:.2f}x" if summary.best_arm else "-",
-            f"{summary.best_arm} at {_point_label(summary.best_point)}"
+            f"{display(summary.best_arm)} at {_point_label(summary.best_point)}"
             if summary.best_arm
             else "no baseline arm in the data",
         ),
         _tile(
             "Best TTFT reduction",
             f"-{summary.ttft_drop * 100:.0f}%" if summary.ttft_arm else "-",
-            f"median TTFT, {summary.ttft_arm} at {_point_label(summary.ttft_point)}"
+            f"median TTFT, {display(summary.ttft_arm)} at "
+            f"{_point_label(summary.ttft_point)}"
             if summary.ttft_arm
             else "no baseline arm in the data",
         ),
@@ -1664,7 +1688,7 @@ def build_report(
         ratio = row["ratio"]
         body.append(
             [
-                f"{swatch}{escape(row['arm'])}",
+                f"{swatch}{escape(display(row['arm']))}",
                 escape(str(row["rate"])),
                 "unbounded" if row["conc"] == 0 else str(row["conc"]),
                 str(row["reps"]),
@@ -1685,7 +1709,7 @@ def build_report(
     gate_body = [
         [
             f'<span class="swatch" style="background:{styles[g["arm"]].color}"></span>'
-            f"{escape(g['arm'])}",
+            f"{escape(display(g['arm']))}",
             _point_label(g["point"]),
             _fmt(g["loads"], 0),
             f"{_fmt(g['computed'], 0)} vs {_fmt(g['baseline'], 0)}",
@@ -1717,7 +1741,7 @@ def build_report(
             [
                 f'<span class="swatch" '
                 f'style="background:{styles[row["arm"]].color}"></span>'
-                f"{escape(row['arm'])}",
+                f"{escape(display(row['arm']))}",
                 _point_label((row["rate"], conc)),
                 _fmt(done, 0),
                 _fmt(qmax, 0),
@@ -2040,9 +2064,22 @@ def parse_args() -> argparse.Namespace:
         help="concurrency for the stage and mechanism bar charts (default: the "
         "point with the largest speedup)",
     )
+    p.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        metavar="ARM=NAME",
+        help="display name for an arm in every chart and table, e.g. "
+        "cpu-grid='NIXL E/PD'; repeatable, overrides the built-in names",
+    )
     args = p.parse_args()
     if not args.files and not args.demo:
         p.error("give at least one bench.json, or --demo")
+    for pair in args.label:
+        arm, sep, name = pair.partition("=")
+        if not sep or not name:
+            p.error(f"--label {pair!r} is not ARM=NAME")
+        DISPLAY_NAMES[arm.strip()] = name.strip()
     return args
 
 
