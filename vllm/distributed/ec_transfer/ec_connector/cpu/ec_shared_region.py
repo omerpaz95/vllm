@@ -36,6 +36,25 @@ def _fallback_populate_write(mmap_obj: mmap.mmap, offset: int, length: int) -> N
     arr[offset : offset + length : mmap.PAGESIZE] |= 0
 
 
+def _tmpfs_report(directory: str, needed: int) -> str:
+    """Free space in `directory` against `needed`, and what else sits there."""
+    st = os.statvfs(directory)
+    free = st.f_bavail * st.f_frsize
+    others = [
+        os.path.join(directory, name)
+        for name in os.listdir(directory)
+        if name.startswith("vllm_ec_") and name.endswith(".mmap")
+    ]
+    held = sum(os.path.getsize(p) for p in others if os.path.exists(p))
+    gib = float(1 << 30)
+    return (
+        f"{directory} has {free / gib:.2f} GiB free and the EC region needs "
+        f"{needed / gib:.2f} GiB; {len(others)} other vllm_ec_*.mmap file(s) hold "
+        f"{held / gib:.2f} GiB there. Remove any that belong to no running vLLM "
+        "instance (a region file outlives a server whose shutdown was cut short)."
+    )
+
+
 def _get_populate_write_fn(
     mmap_obj: mmap.mmap,
 ) -> Callable[[mmap.mmap, int, int], None]:
@@ -129,7 +148,20 @@ class ECSharedRegion:
 
         if self._is_creator:
             populate_write_fn = _get_populate_write_fn(self._mmap_obj)
-            populate_write_fn(self._mmap_obj, 0, total_size_bytes)
+            try:
+                populate_write_fn(self._mmap_obj, 0, total_size_bytes)
+            except OSError as exc:
+                # tmpfs reports a region it cannot back as EFAULT/ENOMEM from
+                # the populate, long after the file was created: take the
+                # file with us or it becomes one more leaked region.
+                report = _tmpfs_report(
+                    os.path.dirname(self._mmap_path), total_size_bytes
+                )
+                self.cleanup()
+                raise RuntimeError(
+                    f"Could not back the EC region {self._mmap_path} "
+                    f"({exc.strerror}). {report}"
+                ) from exc
 
         # (num_blocks, block_size_bytes) int8 tensor over the mmap buffer.
         self.blocks: torch.Tensor = torch.frombuffer(
@@ -161,18 +193,27 @@ class ECSharedRegion:
             logger.debug("cudaHostRegister %.2f MB", self._blocks_nbytes / 1e6)
             self._is_pinned = True
 
+    def unlink(self) -> None:
+        """Remove the backing file, if this process created it.
+
+        Safe while the region is still mapped: the pages live until the last
+        mapping goes. Called first at shutdown, ahead of the slow releases
+        (NIXL deregistration, cudaHostUnregister of gigabytes), so a teardown
+        cut short by the worker shutdown timeout cannot leak the file.
+        """
+        if not self._is_creator:
+            return
+        try:
+            os.unlink(self._mmap_path)
+            logger.info("Removed EC mmap file %s", self._mmap_path)
+        except Exception:
+            logger.warning("Failed to unlink path %s", self._mmap_path, exc_info=True)
+        self._is_creator = False
+
     def cleanup(self) -> None:
         """Tear down the region. Lifecycle method; no concurrent access."""
         logger.info("Starting ECSharedRegion cleanup...")
-        if self._is_creator:
-            try:
-                os.unlink(self._mmap_path)
-                logger.info("Removed EC mmap file %s", self._mmap_path)
-            except Exception:
-                logger.warning(
-                    "Failed to unlink path %s", self._mmap_path, exc_info=True
-                )
-            self._is_creator = False
+        self.unlink()
         if self._is_pinned:
             result = torch.cuda.cudart().cudaHostUnregister(self._blocks_ptr)
             if result.value != 0:
