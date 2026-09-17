@@ -54,6 +54,12 @@ same GPU list as the decode instance for a resource-matched comparison.
 python gen_workload.py --out-dir /data/wl --pool-size 96 \
     --buckets 2048x2048:1.0 --num-requests 400 --reuse zipf:1.1 --self-check
 
+#    Or fix the share of repeated images outright: exactly 30% of the image
+#    references repeat an earlier image. The pool is sized to match, so
+#    --pool-size is not needed (see "Reuse and region size").
+python gen_workload.py --out-dir /data/wl-30 \
+    --buckets 2048x2048:1.0 --num-requests 400 --reuse exact:0.3 --self-check
+
 #    The same pool from real LSDIR photos (gated on Hugging Face, academic
 #    research licence; needs a token whose account accepted the terms, and
 #    `env -u HF_TOKEN` if a stored login should win over the environment):
@@ -193,6 +199,47 @@ timings would then measure something other than the arm's name:
 - after the run, every connector arm's consumer computed fewer encoder inputs
   than the baseline at the same load point
 
+## Reuse and region size
+
+The two knobs that decide what the connector can do for a run.
+
+**Reuse** is the share of image references that repeat an image an earlier
+request already used. Only a repeat can be served from the connector; a
+first appearance is always encoded. `gen_workload.py` builds it one of two
+ways:
+
+- `--reuse exact:F` sets it directly: exactly the fraction `F` of all image
+  references are repeats (`exact:0.3` means 30%). First appearances are
+  spread evenly through the run, so the share is the same early and late,
+  and each repeat picks one of the images seen so far, all equally likely.
+  The pool is sized to the number of distinct images this needs, so
+  `--pool-size` is ignored. Repeats are counted over image references, not
+  requests: `--mm-fraction` still decides how many requests carry no image
+  at all.
+- `--reuse zipf:A`, `uniform` or `none` draw each request's image from a
+  pool of `--pool-size` images, and the reuse is whatever comes out. With
+  `uniform` every pool image is equally likely, so the share of repeats is
+  fixed by how many draws there are per image: 400 requests over 96 images
+  repeat a lot (about 76%), over 400 images much less (about 40%). `zipf:A`
+  makes a few images far more popular than the rest, the way real traffic
+  has a handful of images that everyone sends; a larger `A` concentrates
+  more of the requests on fewer images, so more repeats. `none` walks the
+  pool in order and only repeats once the requests outnumber the pool.
+
+Either way the manifest's `expected.max_hit_rate` is the figure that came
+out, and `run_bench.py` prints it at startup. It is a ceiling: the
+connector serves a repeat only if its entry is still in the region.
+
+**Region size** is `--ec-cpu-bytes` on `run_bench.py` and `k8s_bench.py`,
+the `ec_cpu_bytes` the CPU connector is given. It takes bytes, a size
+(`8GiB`, `512MiB`, `2GB`) or a multiple of the workload's working set
+(`0.5x`), the working set being the bytes every distinct image's embeddings
+occupy at once. The default is `1.25x`, so nothing is ever evicted and the
+measured hit rate can reach the manifest's ceiling. Below `1x` the region
+evicts in first-in-first-out order and the measured hit rate falls under
+the ceiling; that is a different question, worth its own run. The startup
+line prints both figures side by side.
+
 ## Configuration that matters
 
 | setting | why |
@@ -224,7 +271,8 @@ offered concurrency, that point measures the queue, not the work.
   be rebuilt.
 - **Region larger vs smaller than the working set** answer different
   questions (all hits vs continuous eviction). `--ec-cpu-bytes` defaults to
-  the manifest's 1.25x working set; the frag arm uses 0.5x.
+  1.25x the working set (`--ec-cpu-bytes 0.5x` or `8GiB` to change it); the
+  frag arm uses 0.5x.
 - **A multi-image request must fit the consumer's encoder cache**, or it is
   chunked across steps. The manifest's `max_embeds_per_request` is the floor.
 - **Log-text parsing depends on unpromised strings.** Every parser is paired

@@ -60,6 +60,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import regex as re
 from ec_log_stats import (
     decay_report,
     deferred_fail_count,
@@ -1316,7 +1317,13 @@ def add_common_options(p: argparse.ArgumentParser) -> None:
         help="fresh servers for every load point, so the EC region starts "
         "empty each time and every point pays its saves",
     )
-    p.add_argument("--ec-cpu-bytes", type=int, default=0, help="0 = from manifest")
+    p.add_argument(
+        "--ec-cpu-bytes",
+        default="",
+        help="the CPU connector's region: bytes, a size (8GiB, 512MiB, 2GB) or "
+        "a multiple of the workload's working set (0.5x). Default 1.25x, so "
+        "nothing is evicted; --frag uses 0.5x",
+    )
     p.add_argument("--max-model-len", type=int, default=32768)
     p.add_argument("--max-num-batched-tokens", type=int, default=8192)
     p.add_argument(
@@ -1472,9 +1479,45 @@ def add_single_node_options(p: argparse.ArgumentParser) -> None:
     )
 
 
+_SIZE_UNITS = {
+    "": 1,
+    "b": 1,
+    "kb": 1000,
+    "mb": 1000**2,
+    "gb": 1000**3,
+    "tb": 1000**4,
+    "k": 1024,
+    "kib": 1024,
+    "m": 1024**2,
+    "mib": 1024**2,
+    "g": 1024**3,
+    "gib": 1024**3,
+    "t": 1024**4,
+    "tib": 1024**4,
+}
+
+
+def parse_region_size(text: str) -> tuple[int, float]:
+    """`--ec-cpu-bytes` as `(bytes, multiple of the working set)`; the form
+    not given is 0, and an empty value is (0, 0), which means the default."""
+    if not text:
+        return 0, 0.0
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([A-Za-z]*)\s*", text)
+    if not m or (m.group(2).lower() not in _SIZE_UNITS and m.group(2) != "x"):
+        raise SystemExit(
+            f"[bench] --ec-cpu-bytes {text!r}: give bytes, a size such as 8GiB or "
+            "512MB, or a multiple of the working set such as 0.5x"
+        )
+    value, unit = float(m.group(1)), m.group(2).lower()
+    if unit == "x":
+        return 0, value
+    return int(value * _SIZE_UNITS[unit]), 0.0
+
+
 def finalize_args(args: argparse.Namespace) -> argparse.Namespace:
     """Derive the load points and scratch paths; validate the arm list."""
     args.shared_storage_path = args.shared_storage_path or f"{args.work_dir}/shared"
+    args.ec_cpu_bytes, args.ec_region_mult = parse_region_size(args.ec_cpu_bytes)
     args.queue_csv = f"{args.work_dir}/queue.csv"
     args.frag_file = f"{args.work_dir}/frag.jsonl"
     rates = [r.strip() for r in args.request_rates.split(",") if r.strip()]
@@ -1538,10 +1581,10 @@ def prepare_workload(
             f"[bench] no warmup.jsonl in {args.workload_dir}; rebuild the workload "
             "with the current gen_workload.py, which holds out warmup images"
         )
+    working_set = expected["working_set_bytes"]
     if not args.ec_cpu_bytes:
-        args.ec_cpu_bytes = expected[
-            "fragmentation_arm_ec_cpu_bytes" if args.frag else "suggested_ec_cpu_bytes"
-        ]
+        mult = args.ec_region_mult or (0.5 if args.frag else 1.25)
+        args.ec_cpu_bytes = int(working_set * mult)
     # A request whose images alone outgrow the context window is rejected
     # by every arm alike, and the completion gate then stops the whole run.
     biggest = expected.get("max_embeds_per_request", 0)
@@ -1554,9 +1597,10 @@ def prepare_workload(
         )
     print(
         f"[bench] workload {num_prompts} requests ({args.image_refs} image refs), "
-        f"working set {expected['working_set_bytes'] / 1024**3:.2f} GiB, "
-        f"ec_cpu_bytes {args.ec_cpu_bytes / 1024**3:.2f} GiB, max hit rate "
-        f"{expected['max_hit_rate'] * 100:.1f}%"
+        f"working set {working_set / 1024**3:.2f} GiB, "
+        f"ec_cpu_bytes {args.ec_cpu_bytes / 1024**3:.2f} GiB "
+        f"({args.ec_cpu_bytes / max(working_set, 1):.2f}x the working set), "
+        f"max hit rate {expected['max_hit_rate'] * 100:.1f}%"
     )
     return expected, num_prompts
 

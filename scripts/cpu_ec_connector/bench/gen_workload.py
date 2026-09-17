@@ -398,6 +398,57 @@ def _interleaved(pool_indices: list[int], pool: list[PoolImage]) -> list[int]:
     return out
 
 
+def request_widths(
+    num_requests: int,
+    mm_fraction: float,
+    multi_image_fraction: float,
+    images_per_request: int,
+    rng: random.Random,
+) -> list[int]:
+    """How many images each request carries; 0 is a text-only request."""
+    widths: list[int] = []
+    for _ in range(num_requests):
+        if rng.random() >= mm_fraction:
+            widths.append(0)
+        elif images_per_request > 1 and rng.random() < multi_image_fraction:
+            widths.append(images_per_request)
+        else:
+            widths.append(1)
+    return widths
+
+
+def exact_reuse_picks(
+    widths: list[int], fraction: float, rng: random.Random
+) -> list[list[int]]:
+    """Image indices per request such that exactly `fraction` of all image
+    references repeat an image an earlier request already used.
+
+    First appearances are spread evenly over the reference stream, so the
+    share of repeats is the same early and late in the run. A repeat picks
+    any image seen so far with equal probability, never one already in the
+    same request. Indices are dense from 0: the pool needs `max + 1` images.
+    """
+    total = sum(widths)
+    distinct = max(1, round(total * (1.0 - fraction)))
+    new_at = {int(k * total / distinct) for k in range(distinct)}
+    picks: list[list[int]] = []
+    seen = 0
+    ref = 0
+    for width in widths:
+        chosen: list[int] = []
+        for _ in range(width):
+            if ref not in new_at and seen > len(chosen):
+                idx = rng.randrange(seen)
+                while idx in chosen:
+                    idx = rng.randrange(seen)
+            else:
+                idx, seen = seen, seen + 1
+            chosen.append(idx)
+            ref += 1
+        picks.append(chosen)
+    return picks
+
+
 def build_sequence(
     pool: list[PoolImage],
     *,
@@ -410,14 +461,21 @@ def build_sequence(
     prefix_tokens: int,
     interleave_sizes: bool,
     rng: random.Random,
+    picks: list[list[int]] | None = None,
 ) -> tuple[list[dict], list[list[int]]]:
     """Return `(jsonl_records, per_request_image_indices)`.
 
-    `rounds > 0` replays the whole pool once per round -- deterministic churn
-    for the fragmentation arm. Otherwise `num_requests` are drawn according to
-    `--reuse`, which is the shape a serving workload actually has.
+    `picks` (from `exact_reuse_picks`) fixes every request's images up front,
+    text-only ones as `[]`. Otherwise `rounds > 0` replays the whole pool once
+    per round -- deterministic churn for the fragmentation arm -- and
+    `num_requests` are otherwise drawn according to `--reuse`, which is the
+    shape a serving workload actually has.
     """
-    if rounds > 0:
+    preset = picks is not None
+    if preset:
+        assert picks is not None
+        mm_fraction = 1.0
+    elif rounds > 0:
         # Every request carries its image: this mode exists to churn the region
         # a fixed number of times, and a text-only request would silently drop
         # a pool image out of the round.
@@ -451,7 +509,7 @@ def build_sequence(
         nonce = f"[req {i} n{rng.getrandbits(48):012x}] " + _nonce_text(
             rng, prefix_tokens
         )
-        if rng.random() >= mm_fraction:
+        if not chosen or rng.random() >= mm_fraction:
             records.append({"content": [{"type": "text", "text": nonce}]})
             per_request.append([])
             continue
@@ -460,7 +518,7 @@ def build_sequence(
         # request can occupy at once. A width-N request cannot use an (N+1)th
         # encoder, which is what makes a scaling curve flatten at N.
         width = min(images_per_request, len(pool))
-        if width > 1 and rng.random() < multi_image_fraction:
+        if not preset and width > 1 and rng.random() < multi_image_fraction:
             while len(chosen) < width:
                 candidate = rng.randrange(len(pool))
                 if candidate not in chosen:
@@ -654,7 +712,14 @@ def main() -> int:
         "0 means sample --num-requests according to --reuse",
     )
     p.add_argument("--num-requests", type=int, default=400)
-    p.add_argument("--reuse", default="zipf:1.1", help="zipf:A | uniform | none")
+    p.add_argument(
+        "--reuse",
+        default="zipf:1.1",
+        help="zipf:A | uniform | none | exact:F. exact:F makes exactly the "
+        "fraction F of all image references repeat an earlier image and sizes "
+        "the pool itself; the others draw from --pool-size images and the "
+        "manifest reports the reuse that came out",
+    )
     p.add_argument("--mm-fraction", type=float, default=0.8)
     p.add_argument(
         "--multi-image-fraction",
@@ -703,6 +768,29 @@ def main() -> int:
     bytes_per_embed = args.hidden_dim * args.element_size
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
+    picks: list[list[int]] | None = None
+    if args.reuse.startswith("exact"):
+        if args.rounds:
+            raise SystemExit("[gen] --rounds replays the pool; not with --reuse exact")
+        fraction = float(args.reuse.partition(":")[2] or 0.0)
+        if not 0.0 <= fraction < 1.0:
+            raise SystemExit("[gen] --reuse exact:F takes 0 <= F < 1")
+        widths = request_widths(
+            args.num_requests,
+            args.mm_fraction,
+            args.multi_image_fraction,
+            args.images_per_request,
+            random.Random(args.seed + 1),
+        )
+        picks = exact_reuse_picks(widths, fraction, random.Random(args.seed + 2))
+        needed = max((i for chosen in picks for i in chosen), default=0) + 1
+        if not args.reuse_pool and needed != args.pool_size:
+            print(
+                f"[gen] --reuse exact:{fraction:g}: {needed} distinct images are "
+                f"needed, so --pool-size {args.pool_size} becomes {needed}"
+            )
+        args.pool_size = needed
+
     manifest_path = args.out_dir / "manifest.json"
     if args.reuse_pool and manifest_path.exists():
         previous = json.loads(manifest_path.read_text())
@@ -711,6 +799,11 @@ def main() -> int:
         pool = _load_entries(previous["pool"])
         warm_pool = _load_entries(previous["warmup_pool"])
         print(f"[gen] reusing existing pool of {len(pool)} photos")
+        if len(pool) < args.pool_size:
+            raise SystemExit(
+                f"[gen] the existing pool has {len(pool)} images; this sequence "
+                f"needs {args.pool_size}. Drop --reuse-pool to rebuild it"
+            )
     else:
         pool = build_pool(
             args.photo_source,
@@ -737,6 +830,7 @@ def main() -> int:
         prefix_tokens=args.prefix_tokens,
         interleave_sizes=args.interleave_sizes,
         rng=rng,
+        picks=picks,
     )
 
     jsonl_path = args.out_dir / "workload.jsonl"
