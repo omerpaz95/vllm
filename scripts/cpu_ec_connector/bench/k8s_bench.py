@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import regex as re
 import shutil
 import subprocess
 import sys
@@ -44,6 +43,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+import regex as re
 import run_bench
 import yaml
 from run_bench import (

@@ -14,11 +14,12 @@ the next's.
 
 from __future__ import annotations
 
-import regex as re
 import statistics
 from collections.abc import Iterator
 from datetime import datetime
 from typing import NamedTuple
+
+import regex as re
 
 # vLLM's formatter: "LEVEL %m-%d %H:%M:%S [file:lineno] message" (vllm/logger.py).
 # Year is absent, so timestamps are only ever used as deltas within one log.
