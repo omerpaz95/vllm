@@ -48,7 +48,8 @@ same GPU list as the decode instance for a resource-matched comparison.
 # 1. Workload: 96 images at 2048x2048, 400 requests, zipf reuse. The default
 #    --photo-source is `synth`: generated fractal noise, no download, each
 #    image's JPEG calibrated to 0.17 MB/MP (what a real-photo pool measured
-#    at q85), about 4 s per image. `dir:<path>` uses a directory of photos
+#    at q85), about 2.5 s of CPU per image, rendered on --jobs cores at
+#    once (default: all of them, up to 16). `dir:<path>` uses a directory of photos
 #    (searched recursively; add --allow-upscale for sources smaller than the
 #    bucket) and `hf-tar:<repo>[:<file>]` streams a tar.gz from Hugging Face.
 python gen_workload.py --out-dir /data/wl --pool-size 96 \
@@ -215,7 +216,11 @@ ways:
   The pool is sized to the number of distinct images this needs, so
   `--pool-size` is ignored. Repeats are counted over image references, not
   requests: `--mm-fraction` still decides how many requests carry no image
-  at all.
+  at all. The figure is exact to one image unless the widest request needs
+  more distinct images than the share allows, which the generator warns
+  about. Generating many distinct images takes time: 400 requests at
+  `exact:0.25` need about 350 images, a few minutes on a many-core box and
+  about 15 minutes on four cores; the generator prints progress.
 - `--reuse zipf:A`, `uniform` or `none` draw each request's image from a
   pool of `--pool-size` images, and the reuse is whatever comes out. With
   `uniform` every pool image is equally likely, so the share of repeats is

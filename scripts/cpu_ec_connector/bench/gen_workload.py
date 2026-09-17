@@ -42,10 +42,13 @@ Example:
 from __future__ import annotations
 
 import argparse
+import collections
 import io
 import json
+import os
 import random
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import NamedTuple
@@ -188,60 +191,92 @@ def _render(base: object, grain: object, g: float) -> object:
     from PIL import Image
 
     acc = base + g * grain
-    lo, hi = np.percentile(acc, (1, 99))
+    # 1/256 of the pixels pin the percentiles just as well and sort in 2 ms.
+    lo, hi = np.percentile(acc[::16, ::16], (1, 99))
     arr = np.clip((acc - lo) / max(hi - lo, 1e-6) * 255, 0, 255)
     return Image.fromarray(arr.astype(np.uint8), mode="RGB")
 
 
-def _iter_synth(
-    width: int, height: int, quality: int, mb_per_mp: float, seed: int
-) -> Iterator[tuple[str, object]]:
-    """Endless fractal-noise images whose JPEGs compress like photos.
+def _synth_image(
+    width: int, height: int, quality: int, mb_per_mp: float, seed: int, index: int
+) -> bytes:
+    """One fractal-noise image, as raw RGB bytes, that compresses like a photo.
 
     Smooth multi-octave noise gives the low-frequency structure; a per-pixel
     grain term supplies the high-frequency content that decides the JPEG
-    size, and is bisected per image until the encoded size lands within
+    size, and is bisected until the encoded size lands within
     `_SYNTH_TOLERANCE` of `mb_per_mp`. Pixel count, not content, drives
-    everything else the benchmark measures.
+    everything else the benchmark measures. Seeded by `index`, so the image
+    is the same whichever process renders it.
     """
     import numpy as np
     from PIL import Image
 
     target = mb_per_mp * width * height
-    index = 0
-    while True:
-        rng = np.random.default_rng(seed + index)
-        base = np.zeros((height, width, 3), dtype=np.float32)
-        amp, size = 1.0, 4
-        while size <= 512:
-            scale = size / max(width, height)
-            low = rng.random(
-                (max(2, round(height * scale)), max(2, round(width * scale)), 3),
-                dtype=np.float32,
+    rng = np.random.default_rng(seed + index)
+    base = np.zeros((height, width, 3), dtype=np.float32)
+    amp, size = 1.0, 4
+    while size <= 512:
+        scale = size / max(width, height)
+        low = rng.random(
+            (max(2, round(height * scale)), max(2, round(width * scale)), 3),
+            dtype=np.float32,
+        )
+        for c in range(3):
+            up = Image.fromarray(low[:, :, c], mode="F").resize(
+                (width, height), Image.BICUBIC
             )
-            for c in range(3):
-                up = Image.fromarray(low[:, :, c], mode="F").resize(
-                    (width, height), Image.BICUBIC
+            base[:, :, c] += amp * np.asarray(up, dtype=np.float32)
+        amp *= 0.6
+        size *= 2
+    grain = rng.random((height, width, 3), dtype=np.float32)
+    lo_g, hi_g = 0.0, 3.0
+    img = _render(base, grain, hi_g)
+    for _ in range(8):
+        mid = (lo_g + hi_g) / 2
+        img = _render(base, grain, mid)
+        ratio = _jpeg_bytes(img, quality) / target
+        if abs(ratio - 1) <= _SYNTH_TOLERANCE:
+            break
+        lo_g, hi_g = (mid, hi_g) if ratio < 1 else (lo_g, mid)
+    return img.tobytes()  # type: ignore[attr-defined]
+
+
+def _iter_synth(
+    width: int, height: int, quality: int, mb_per_mp: float, seed: int, jobs: int
+) -> Iterator[tuple[str, object]]:
+    """Endless synthetic images in index order, rendered `jobs` at a time."""
+    from PIL import Image
+
+    def image(raw: bytes) -> object:
+        return Image.frombytes("RGB", (width, height), raw)
+
+    spec = (width, height, quality, mb_per_mp, seed)
+    if jobs <= 1:
+        index = 0
+        while True:
+            yield f"synth{index}", image(_synth_image(*spec, index))
+            index += 1
+    from concurrent.futures import ProcessPoolExecutor
+
+    pool = ProcessPoolExecutor(jobs)
+    pending: collections.deque = collections.deque()
+    next_index = 0
+    try:
+        while True:
+            while len(pending) < 2 * jobs:
+                pending.append(
+                    (next_index, pool.submit(_synth_image, *spec, next_index))
                 )
-                base[:, :, c] += amp * np.asarray(up, dtype=np.float32)
-            amp *= 0.6
-            size *= 2
-        grain = rng.random((height, width, 3), dtype=np.float32)
-        lo_g, hi_g = 0.0, 3.0
-        img = _render(base, grain, hi_g)
-        for _ in range(8):
-            mid = (lo_g + hi_g) / 2
-            img = _render(base, grain, mid)
-            ratio = _jpeg_bytes(img, quality) / target
-            if abs(ratio - 1) <= _SYNTH_TOLERANCE:
-                break
-            lo_g, hi_g = (mid, hi_g) if ratio < 1 else (lo_g, mid)
-        yield f"synth{index}", img
-        index += 1
+                next_index += 1
+            index, future = pending.popleft()
+            yield f"synth{index}", image(future.result())
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def iter_source_images(
-    source: str, *, width: int, height: int, quality: int, seed: int
+    source: str, *, width: int, height: int, quality: int, seed: int, jobs: int = 1
 ) -> Iterator[tuple[str, object]]:
     """Lazily yield `(name, PIL image)` from a `--photo-source` spec.
 
@@ -251,7 +286,7 @@ def iter_source_images(
     scheme, _, rest = source.partition(":")
     if scheme == "synth":
         density = float(rest) if rest else DEFAULT_SYNTH_MB_PER_MP
-        return _iter_synth(width, height, quality, density, seed)
+        return _iter_synth(width, height, quality, density, seed, jobs)
     if scheme == "dir":
         return _iter_dir(Path(rest).expanduser())
     if scheme == "hf-tar":
@@ -276,6 +311,7 @@ def build_pool(
     rng: random.Random,
     allow_upscale: bool = False,
     min_source_px: int = 0,
+    jobs: int = 1,
 ) -> list[PoolImage]:
     """Crop and resize real photos into a fixed pool, one file per pool slot.
 
@@ -303,8 +339,10 @@ def build_pool(
         height=max(b.height for b in buckets),
         quality=quality,
         seed=rng.getrandbits(32),
+        jobs=jobs,
     )
     skipped_small = 0
+    t_start = t_report = time.monotonic()
     for idx, bucket in enumerate(wanted):
         img = None
         for _, candidate in source_iter:
@@ -351,6 +389,15 @@ def build_pool(
                 round(max(scale, 1.0), 3),
             )
         )
+        now = time.monotonic()
+        if now - t_report >= 10.0 or idx + 1 == pool_size:
+            per_image = (now - t_start) / (idx + 1)
+            print(
+                f"[gen] pool {idx + 1}/{pool_size}, {per_image:.1f} s/image, "
+                f"about {per_image * (pool_size - idx - 1):.0f} s left",
+                file=sys.stderr,
+            )
+            t_report = now
     upscales = [p.upscale for p in pool]
     total_mb = sum(p.path.stat().st_size for p in pool) / 1e6
     megapixels = sum(p.width * p.height for p in pool) / 1e6
@@ -423,26 +470,36 @@ def exact_reuse_picks(
     """Image indices per request such that exactly `fraction` of all image
     references repeat an image an earlier request already used.
 
-    First appearances are spread evenly over the reference stream, so the
-    share of repeats is the same early and late in the run. A repeat picks
-    any image seen so far with equal probability, never one already in the
-    same request. Indices are dense from 0: the pool needs `max + 1` images.
+    First appearances are planned at even intervals over the reference
+    stream, so the share of repeats is the same early and late in the run. A
+    repeat picks any image seen so far with equal probability, never one
+    already in the same request. A request's images must be distinct, so the
+    widest request bounds the number of distinct images from below, and a
+    request early in the stream that has not yet seen enough images takes a
+    new one ahead of plan and gives up the next planned first appearance in
+    exchange; the total stays exact, only the spread bends at the start.
+    Indices are dense from 0: the pool needs `max + 1` images.
     """
     total = sum(widths)
-    distinct = max(1, round(total * (1.0 - fraction)))
-    new_at = {int(k * total / distinct) for k in range(distinct)}
+    distinct = max(1, max(widths, default=0), round(total * (1.0 - fraction)))
+    planned = collections.deque(int(k * total / distinct) for k in range(distinct))
     picks: list[list[int]] = []
     seen = 0
     ref = 0
     for width in widths:
         chosen: list[int] = []
         for _ in range(width):
-            if ref not in new_at and seen > len(chosen):
+            due = bool(planned) and planned[0] == ref
+            if due:
+                planned.popleft()
+            if seen > len(chosen) and (not due or seen >= distinct):
                 idx = rng.randrange(seen)
                 while idx in chosen:
                     idx = rng.randrange(seen)
             else:
                 idx, seen = seen, seen + 1
+                if not due and planned:
+                    planned.popleft()
             chosen.append(idx)
             ref += 1
         picks.append(chosen)
@@ -756,6 +813,13 @@ def main() -> int:
     p.add_argument("--merge-stride", type=int, default=DEFAULT_MERGE_STRIDE)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument(
+        "--jobs",
+        type=int,
+        default=min(os.cpu_count() or 1, 16),
+        help="processes rendering synthetic images in parallel; each holds "
+        "about 300 MB at 2048x2048",
+    )
+    p.add_argument(
         "--reuse-pool",
         action="store_true",
         help="keep an existing pool/ directory instead of rebuilding",
@@ -768,11 +832,21 @@ def main() -> int:
     bytes_per_embed = args.hidden_dim * args.element_size
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.warmup_images < 1 or args.warmup_requests < 1:
+        raise SystemExit(
+            "[gen] run_bench.py warms up on held-out images; --warmup-images and "
+            "--warmup-requests must both be at least 1"
+        )
     picks: list[list[int]] | None = None
-    if args.reuse.startswith("exact"):
+    if args.reuse.partition(":")[0] == "exact":
         if args.rounds:
             raise SystemExit("[gen] --rounds replays the pool; not with --reuse exact")
-        fraction = float(args.reuse.partition(":")[2] or 0.0)
+        try:
+            fraction = float(args.reuse.partition(":")[2])
+        except ValueError:
+            raise SystemExit(
+                "[gen] --reuse exact needs the share of repeats, e.g. exact:0.3"
+            ) from None
         if not 0.0 <= fraction < 1.0:
             raise SystemExit("[gen] --reuse exact:F takes 0 <= F < 1")
         widths = request_widths(
@@ -782,9 +856,23 @@ def main() -> int:
             args.images_per_request,
             random.Random(args.seed + 1),
         )
+        refs = sum(widths)
+        if not refs:
+            raise SystemExit(
+                "[gen] no request carries an image (--mm-fraction, --num-requests), "
+                "so there is no reuse to set"
+            )
         picks = exact_reuse_picks(widths, fraction, random.Random(args.seed + 2))
-        needed = max((i for chosen in picks for i in chosen), default=0) + 1
-        if not args.reuse_pool and needed != args.pool_size:
+        needed = max(i for chosen in picks for i in chosen) + 1
+        realized = (refs - needed) / refs
+        if abs(realized - fraction) * refs > 1.0:
+            print(
+                f"[gen] WARNING: exact:{fraction:g} is out of reach: the widest "
+                f"request carries {max(widths)} distinct images, so the share of "
+                f"repeats comes out at {realized:.3f}",
+                file=sys.stderr,
+            )
+        if needed != args.pool_size:
             print(
                 f"[gen] --reuse exact:{fraction:g}: {needed} distinct images are "
                 f"needed, so --pool-size {args.pool_size} becomes {needed}"
@@ -799,11 +887,13 @@ def main() -> int:
         pool = _load_entries(previous["pool"])
         warm_pool = _load_entries(previous["warmup_pool"])
         print(f"[gen] reusing existing pool of {len(pool)} photos")
-        if len(pool) < args.pool_size:
-            raise SystemExit(
-                f"[gen] the existing pool has {len(pool)} images; this sequence "
-                f"needs {args.pool_size}. Drop --reuse-pool to rebuild it"
-            )
+        if picks is not None:
+            if len(pool) < args.pool_size:
+                raise SystemExit(
+                    f"[gen] the existing pool has {len(pool)} images; this "
+                    f"sequence needs {args.pool_size}. Drop --reuse-pool to rebuild"
+                )
+            pool = pool[: args.pool_size]
     else:
         pool = build_pool(
             args.photo_source,
@@ -816,8 +906,12 @@ def main() -> int:
             rng,
             args.allow_upscale,
             int(args.min_source_mp * 1e6),
+            jobs=args.jobs,
         )
         pool, warm_pool = pool[: args.pool_size], pool[args.pool_size :]
+    if picks is not None and args.interleave_sizes:
+        # First appearances follow pool order, so alternate the size buckets.
+        pool = [pool[i] for i in _interleaved(list(range(len(pool))), pool)]
 
     records, per_request = build_sequence(
         pool,
