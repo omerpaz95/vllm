@@ -14,7 +14,7 @@ the next's.
 
 from __future__ import annotations
 
-import re
+import regex as re
 import statistics
 from collections.abc import Iterator
 from datetime import datetime
@@ -156,6 +156,18 @@ def rewritten_items(text: str) -> int:
     what says whether the configuration actually covered the workload.
     """
     return sum(int(n) for n in _REWROTE_RE.findall(text))
+
+
+# Logged by sitecustomize.py's ECExampleConnector patch when a remote
+# encoding never lands within its defer budget. One line per failure, so
+# counting lines (not the cumulative tally each carries) gives the count for
+# this slice.
+_DEFERRED_FAIL_RE = re.compile(r"deferred-fail tally=\d+")
+
+
+def deferred_fail_count(text: str) -> int:
+    """How many requests the ECExampleConnector patch gave up waiting on."""
+    return len(_DEFERRED_FAIL_RE.findall(text))
 
 
 def stage_summary(text: str) -> dict:

@@ -1,11 +1,13 @@
-# EC connector benchmark on OpenShift (multi-node)
+# EC connector benchmark on Kubernetes (multi-node)
 
 `k8s_bench.py` runs the arms of [`run_bench.py`](../README.md) with the
 encoder(s) and the decode instance on **different nodes**. It reuses
 `run_bench.py` for everything that is not placement: the server flags, the
 load generator, the log accounting, the gates and the table. The driver runs
-on your laptop with `oc`; the servers are Deployments, the load generator is
-a GPU-less pod on the same image.
+on your laptop with `oc` or plain `kubectl`, against whichever cluster the
+current context points at (auto-detected; `--kube-bin` to pick one); the
+servers are Deployments, the load generator is a GPU-less pod on the same
+image.
 
 | arm | what crosses the node boundary |
 |---|---|
@@ -15,12 +17,14 @@ a GPU-less pod on the same image.
 
 ## Prerequisites
 
-- `oc` logged in (`oc whoami`) with `pods/exec` in the namespace.
+- `oc` or `kubectl` on PATH, logged in (`oc whoami` / `kubectl auth whoami`)
+  and pointed at the target cluster, with `pods/exec` in the namespace.
 - A secret holding `HF_TOKEN` (default name `llm-d-hf-token`, key
   `HF_TOKEN`; `--hf-secret`/`--hf-secret-key` to change).
-- A ReadWriteMany-capable storage class. Default
-  `ibm-spectrum-scale-fileset`; `nfs-client-pokprod` is the other RWX option
-  on that cluster (`--storage-class`). The PVC (`--pvc-name`, default
+- A ReadWriteMany-capable storage class, since encoder and decode pods on
+  different nodes share the PVC. `--storage-class` is empty by default,
+  which uses the cluster's default StorageClass — override it if that
+  default is not RWX-capable. The PVC (`--pvc-name`, default
   `ec-bench-data`, `--pvc-size` 500Gi) is created once and reused: it holds
   the HF cache, the workload, per-run scratch and the example connector's
   storage, mounted at `/bench` in every pod.
@@ -31,19 +35,28 @@ a GPU-less pod on the same image.
   preflight checks `import nixl` in the client pod. Prefer pinning a digest
   over `nightly`, so both nodes run the same build (the placement block
   records each pod's `imageID`).
-- `runAsUser: 0` is set (the `anyuid` SCC); `--no-run-as-root` drops it and
-  relies on the namespace's fsGroup for the PVC.
+- `runAsUser: 0` is set (on OpenShift, needs the `anyuid` SCC);
+  `--no-run-as-root` drops it and relies on the namespace's fsGroup for the
+  PVC.
 - Pod-to-pod traffic on the side-channel port (5577+i), the vLLM ports and
   UCX's dynamic ports must be allowed by any NetworkPolicy.
 
 ## Running
+
+`--gen-workload` and `--hf-workload` each take *one* shell argument: the
+entire argument string for `gen_workload.py`/`hf_workload.py`, quoted, flags
+and all (e.g. `--hf-workload "--dataset MUIRBENCH/MUIRBENCH --max-samples 600"`).
+`--dataset`, `--max-samples`, etc. are not `k8s_bench.py` flags themselves —
+passing them unquoted either lets the shell split them into separate
+`k8s_bench.py` arguments (`unrecognized arguments`) or makes argparse refuse
+a value that looks like another flag (`expected one argument`).
 
 ```bash
 cd scripts/cpu_ec_connector/bench
 
 # 1. Always dry-run first: renders every manifest under
 #    <out-dir>/manifests/<run-id>/ and prints every container command and
-#    the load command. Needs no cluster and no oc.
+#    the load command. Needs no cluster and no oc/kubectl.
 python k8s_bench.py --namespace my-ns --dry-run \
     --arms baseline,cpu-grid --out-dir results
 
@@ -82,7 +95,7 @@ both `nvidia.com/gpu` and `--tensor-parallel-size`.
 While an arm runs:
 
 ```bash
-oc get pod -n my-ns -l app=vllm-ec-bench -o wide
+kubectl get pod -n my-ns -l app=vllm-ec-bench -o wide   # or oc get pod ...
 ```
 
 After the run, `results/bench.json` carries a `placement` block per arm with
@@ -119,8 +132,8 @@ python k8s_bench.py --namespace my-ns --cleanup --delete-pvc   # also the PVC
   and `STAGE` lines the accounting reads belong to this checkout's proxy.
   `--proxy-from-image` runs the image's copy instead.
 - **Logs stay in the pod.** The container command is
-  `exec python -m vllm... > >(tee /tmp/server.log) 2>&1`, so `oc exec`
-  reads the same file `run_bench` would on one host; `oc logs` shows the
+  `exec python -m vllm... > >(tee /tmp/server.log) 2>&1`, so `exec`
+  reads the same file `run_bench` would on one host; `logs` shows the
   same text.
 - **PVC layout.** `/bench/hf` (HF_HOME), `/bench/wl` (workload),
   `/bench/runs/<run-id>/` (client outputs, `queue.csv`, `shared/` for the
@@ -136,9 +149,9 @@ first cluster run must confirm:
   on the official image (platform detection without a GPU).
 - `import nixl` in the chosen image, and UCX picking a transport that
   crosses nodes with `UCX_TLS=tcp,sm` (or the RDMA override).
-- `oc exec deployment/<name>` and `oc rollout status` behave as assumed,
-  and the pod's own Service name resolves from inside it (`reset_caches`
-  and the health probe use it).
+- `exec deployment/<name>` and `rollout status` behave as assumed on both
+  `oc` and `kubectl`, and the pod's own Service name resolves from inside
+  it (`reset_caches` and the health probe use it).
 - `$(POD_IP)` expands in the container env (POD_IP is listed first).
 - `/dev/shm` default (1.25x the EC region + 8 GiB) and the memory request
   (shm + 32 GiB) fit the nodes; `--shm-size`/`--pod-memory` override.

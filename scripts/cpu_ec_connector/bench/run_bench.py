@@ -62,6 +62,7 @@ from typing import Any
 
 from ec_log_stats import (
     decay_report,
+    deferred_fail_count,
     rewritten_items,
     stage_summary,
     summarize,
@@ -1050,6 +1051,10 @@ def measure_point(
         "encoders": len(sys_.encoders),
         "per_encoder_inputs": per_encoder,
         "queue": queue_stats(target.read_text(args.queue_csv), t_start, t_end),
+        # Requests the ECExampleConnector patch (sitecustomize.py) gave up
+        # waiting on: 0 for arms other than example-grid/example-data, and
+        # for any run without the patch loaded.
+        "deferred_fails": deferred_fail_count(slices[sys_.consumer.name]),
     }
     if sys_.proxy is not None:
         rewrote = rewritten_items(slices["proxy"])

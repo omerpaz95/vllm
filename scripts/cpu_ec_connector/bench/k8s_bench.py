@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Multi-node EC connector benchmark on OpenShift.
+"""Multi-node EC connector benchmark on Kubernetes.
 
 The arms, server flags, load driving, log accounting and gates are
 `run_bench.py`'s; this driver only changes where the servers run. Each server
 becomes a Deployment and a Service, with the encoder(s) and the decode
 instance kept on different nodes by pod anti-affinity, and the load generator
 becomes a GPU-less pod on the same image. Everything runs from a laptop with
-`oc`:
+`oc` or plain `kubectl` (auto-detected, or pick one with --kube-bin), against
+whichever cluster the current context points at:
 
     ECCPUConnector over NIXL   cpu-data, cpu-grid    pod-to-pod side channel
     ECExampleConnector         example-data, -grid   ReadWriteMany PVC
@@ -17,7 +18,7 @@ becomes a GPU-less pod on the same image. Everything runs from a laptop with
 One PVC, mounted at the same path in every pod, carries the HF cache (so the
 model is downloaded once), the workload, each run's scratch and the example
 connector's storage. Server logs stay in each pod: the container command
-tees its output to a file that `oc exec` reads, so the byte-offset log
+tees its output to a file that `exec` reads, so the byte-offset log
 accounting `run_bench` does works unchanged.
 
 Typical use:
@@ -35,7 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
+import regex as re
 import shutil
 import subprocess
 import sys
@@ -68,7 +69,13 @@ _SHM_HEADROOM_BYTES = 8 * GIB
 _POD_MEMORY_HEADROOM_BYTES = 32 * GIB
 _CONFIGMAP_LIMIT_BYTES = 1024 * 1024
 # What runs inside the pods; the drivers stay on the laptop.
-_POD_SCRIPTS = ("gen_workload.py", "hf_workload.py", "ec_log_stats.py", "run_bench.py")
+_POD_SCRIPTS = (
+    "gen_workload.py",
+    "hf_workload.py",
+    "ec_log_stats.py",
+    "run_bench.py",
+    "sitecustomize.py",
+)
 _HEALTH_POLL_S = 5.0
 _STOP_TIMEOUT_S = 300
 _RUN_ID_RE = re.compile(r"^[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$")
@@ -115,18 +122,38 @@ def env_pairs(pairs: tuple[str, ...]) -> list[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------
-# oc
+# kubectl / oc
 # --------------------------------------------------------------------------
 
 
-class Oc:
-    """The few oc verbs this driver needs, namespace-scoped."""
+def resolve_kube_bin(explicit: str, *, required: bool = True) -> str:
+    """Pick the CLI to drive the cluster: `oc` on OpenShift, `kubectl`
+    everywhere else. An explicit --kube-bin wins; otherwise `oc` is
+    preferred when present since it is also valid kubectl, but plain
+    Kubernetes clusters only have `kubectl` on PATH.
 
-    def __init__(self, namespace: str) -> None:
-        if not shutil.which("oc"):
-            raise SystemExit(
-                "[k8s] `oc` is not on PATH; only --dry-run works without it"
-            )
+    `required=False` (only for --dry-run, which never runs the binary)
+    returns a placeholder instead of raising when neither is on PATH.
+    """
+    if explicit:
+        if not shutil.which(explicit):
+            raise SystemExit(f"[k8s] `{explicit}` is not on PATH")
+        return explicit
+    for candidate in ("oc", "kubectl"):
+        if shutil.which(candidate):
+            return candidate
+    if not required:
+        return "kubectl"
+    raise SystemExit(
+        "[k8s] neither `oc` nor `kubectl` is on PATH; only --dry-run works without one"
+    )
+
+
+class Oc:
+    """The few kubectl/oc verbs this driver needs, namespace-scoped."""
+
+    def __init__(self, namespace: str, kube_bin: str = "") -> None:
+        self.bin = resolve_kube_bin(kube_bin)
         self.namespace = namespace
 
     def run(
@@ -136,15 +163,29 @@ class Oc:
         check: bool = True,
         timeout: int = 600,
     ) -> subprocess.CompletedProcess[str]:
-        cmd = ["oc", "-n", self.namespace, *argv]
+        cmd = [self.bin, "-n", self.namespace, *argv]
         result = subprocess.run(
             cmd, input=stdin, capture_output=True, text=True, timeout=timeout
         )
         if check and result.returncode != 0:
             raise RuntimeError(
-                f"oc failed ({result.returncode}): {' '.join(cmd)}\n"
+                f"{self.bin} failed ({result.returncode}): {' '.join(cmd)}\n"
                 f"stdout: {result.stdout[-2000:]}\nstderr: {result.stderr[-2000:]}"
             )
+        return result
+
+    def whoami(self) -> subprocess.CompletedProcess[str]:
+        """Identify the current user, however this CLI supports it.
+
+        `oc whoami` is universal on OpenShift. Plain `kubectl` only grew an
+        equivalent (`kubectl auth whoami`, via SelfSubjectReview) recently,
+        so this falls back to the current context name on older clients.
+        """
+        if self.bin == "oc":
+            return self.run("whoami", check=False)
+        result = self.run("auth", "whoami", check=False)
+        if result.returncode != 0:
+            result = self.run("config", "current-context", check=False)
         return result
 
     def apply(self, docs: list[dict[str, Any]]) -> None:
@@ -236,7 +277,8 @@ _CONTAINER_GONE_RE = re.compile(
 
 
 class PodTarget(Target):
-    """`oc exec` into a pod or a deployment's pod, in one namespace.
+    """`exec` into a pod or a deployment's pod, in one namespace, via
+    whichever of `oc`/`kubectl` this run resolved to.
 
     `diagnose`, when set, turns an exec that found no container into a
     report from the owning server: a container that died mid-run is being
@@ -245,16 +287,24 @@ class PodTarget(Target):
     """
 
     def __init__(
-        self, namespace: str, ref: str, diagnose: Callable[[], str] | None = None
+        self,
+        namespace: str,
+        ref: str,
+        diagnose: Callable[[], str] | None = None,
+        kube_bin: str = "",
     ) -> None:
         super().__init__(ref)
         self.namespace = namespace
         self.diagnose = diagnose
+        # Not re-resolved here: this is constructed unconditionally,
+        # including for --dry-run, which never actually execs. Real runs
+        # pass an already-resolved `args.kube_bin`.
+        self.kube_bin = kube_bin or "kubectl"
 
     def _argv(self, script: str) -> list[str]:
         assert self.pod is not None
         argv = ["bash", "-c", script]
-        return ["oc", "exec", "-n", self.namespace, self.pod, "--", *argv]
+        return [self.kube_bin, "exec", "-n", self.namespace, self.pod, "--", *argv]
 
     def sh(
         self, script: str, *, timeout: int = 600, check: bool = True
@@ -349,6 +399,9 @@ def common_env(args: argparse.Namespace) -> list[dict[str, Any]]:
         env_var("VLLM_USE_V2_MODEL_RUNNER", "1"),
         env_var("VLLM_LOGGING_LEVEL", "DEBUG"),
         env_var("VLLM_SERVER_DEV_MODE", "1"),
+        # Auto-loaded by Python at interpreter startup; carries the
+        # sitecustomize.py monkeypatch from the scripts ConfigMap.
+        env_var("PYTHONPATH", SCRIPTS_MOUNT),
         env_var("HF_HOME", args.hf_home),
         {
             "name": "HF_TOKEN",
@@ -368,7 +421,7 @@ class PodServer(BenchServer):
 
     The container runs the command `run_bench` builds, teeing its output to
     `POD_LOG`, so `verify()`, `reset_caches()` and the log accounting reach
-    it through `oc exec` unchanged. `start()` applies the rendered manifests
+    it through `exec` unchanged. `start()` applies the rendered manifests
     and `stop()` deletes them by label. The producer's side channel binds the
     pod IP (`VLLM_EC_SIDE_CHANNEL_HOST=$(POD_IP)`, from the downward API): a
     ZMQ ROUTER has to bind an address the pod owns, which a Service name is
@@ -378,7 +431,11 @@ class PodServer(BenchServer):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.log_path = POD_LOG
-        self.target = PodTarget(self.args.namespace, f"deployment/{self.resource}")
+        self.target = PodTarget(
+            self.args.namespace,
+            f"deployment/{self.resource}",
+            kube_bin=self.args.kube_bin,
+        )
         self.target.diagnose = self.diagnose
         self.oc: Oc | None = None
         self.arm = ""
@@ -406,11 +463,29 @@ class PodServer(BenchServer):
         return 0
 
     def launch_script(self, *, instrument: bool = False) -> str:
-        """The container command. `exec` keeps the server as PID 1 so the
-        pod's SIGTERM reaches it; the process substitution keeps the log in
-        a file the byte-offset reads can seek."""
+        """The container command. The process substitution keeps the log in
+        a file the byte-offset reads can seek.
+
+        The server runs as a background child rather than the shell's own
+        `exec`, so a trap can log whatever signal arrives before forwarding
+        it -- otherwise a SIGTERM this benchmark never sent (no probe fires
+        it, no rollout restarts the pod, the kernel logs nothing) leaves no
+        trace at all: the container just exits 0, `Completed`, as if it
+        chose to."""
         serve = [self.command] if self.command else self._serve_args()
-        return f"exec {' '.join(serve)} > >(tee {POD_LOG}) 2>&1"
+
+        def trap_on(sig: str) -> str:
+            log_line = (
+                f'echo "[sig] received {sig} at $(date -u +%FT%T.%3NZ), '
+                f'forwarding to pid $child" | tee -a {POD_LOG}'
+            )
+            return f"trap '{log_line}; kill -{sig} \"$child\" 2>/dev/null' {sig}"
+
+        return (
+            f"{trap_on('TERM')}; {trap_on('INT')}; "
+            f"{' '.join(serve)} > >(tee {POD_LOG}) 2>&1 & "
+            f'child=$!; wait "$child"'
+        )
 
     def _container(self) -> dict[str, Any]:
         ports = [{"name": "http", "containerPort": self.port}]
@@ -419,7 +494,10 @@ class PodServer(BenchServer):
                 {"name": "side-channel", "containerPort": self.side_channel_port}
             )
         env = common_env(self.args) + env_pairs(self.extra_env)
-        mounts = [{"name": "bench", "mountPath": PVC_MOUNT}]
+        mounts = [
+            {"name": "bench", "mountPath": PVC_MOUNT},
+            {"name": "scripts", "mountPath": SCRIPTS_MOUNT},
+        ]
         if self.is_vllm:
             shm = shm_bytes(self.args, self)
             memory = self.args.pod_memory or gib(shm + _POD_MEMORY_HEADROOM_BYTES)
@@ -434,7 +512,6 @@ class PodServer(BenchServer):
             mounts.append({"name": "dshm", "mountPath": "/dev/shm"})
         else:
             resources = {"requests": {"cpu": "4", "memory": "8Gi"}}
-            mounts.append({"name": "scripts", "mountPath": SCRIPTS_MOUNT})
         return {
             "image": self.args.image,
             "command": ["bash", "-c", self.launch_script()],
@@ -445,7 +522,10 @@ class PodServer(BenchServer):
         }
 
     def _volumes(self) -> list[dict[str, Any]]:
-        volumes: list[dict[str, Any]] = [pvc_volume(self.args)]
+        volumes: list[dict[str, Any]] = [
+            pvc_volume(self.args),
+            scripts_volume(self.args),
+        ]
         if self.is_vllm:
             volumes.append(
                 {
@@ -456,8 +536,6 @@ class PodServer(BenchServer):
                     },
                 }
             )
-        else:
-            volumes.append(scripts_volume(self.args))
         return volumes
 
     def render(self) -> list[dict[str, Any]]:
@@ -498,7 +576,7 @@ class PodServer(BenchServer):
 
     def _oc(self) -> Oc:
         if self.oc is None:
-            self.oc = Oc(self.args.namespace)
+            self.oc = Oc(self.args.namespace, self.args.kube_bin)
         return self.oc
 
     def start(self, *, instrument: bool = False) -> None:
@@ -609,7 +687,8 @@ class PodServer(BenchServer):
             time.sleep(_HEALTH_POLL_S)
         raise RuntimeError(
             f"{self.resource} not healthy within {self.args.startup_timeout_s}s; "
-            f"see `oc logs -n {self.args.namespace} deployment/{self.resource}`"
+            f"see `{self.args.kube_bin or 'kubectl'} logs -n {self.args.namespace} "
+            f"deployment/{self.resource}`"
         )
 
 
@@ -620,7 +699,9 @@ class ClientPod:
         self.args = args
         self.oc = oc
         self.resource = f"ec-bench-{args.run_id}-client"
-        self.target = PodTarget(args.namespace, f"pod/{self.resource}")
+        self.target = PodTarget(
+            args.namespace, f"pod/{self.resource}", kube_bin=args.kube_bin
+        )
 
     @property
     def selector(self) -> str:
@@ -715,7 +796,8 @@ def render_pvc(args: argparse.Namespace) -> dict[str, Any]:
             "labels": {"app": APP_LABEL, "role": "pvc"},
         }
     )
-    pvc["spec"]["storageClassName"] = args.storage_class
+    if args.storage_class:
+        pvc["spec"]["storageClassName"] = args.storage_class
     pvc["spec"]["resources"]["requests"]["storage"] = args.pvc_size
     return pvc
 
@@ -811,7 +893,7 @@ def ensure_workload(client: ClientPod, args: argparse.Namespace) -> None:
 
 
 def preflight(oc: Oc, client: ClientPod, args: argparse.Namespace) -> None:
-    who = oc.run("whoami", check=False)
+    who = oc.whoami()
     if who.returncode != 0:
         raise SystemExit(f"[k8s] not logged in: {who.stderr.strip()[:200]}")
     print(f"[k8s] authenticated as {who.stdout.strip()} in {args.namespace}")
@@ -915,7 +997,7 @@ def prepull_image(oc: Oc, args: argparse.Namespace) -> None:
                 raise RuntimeError(
                     f"image pre-pull reached {ready} of {want} nodes within "
                     f"{args.startup_timeout_s}s; a node may be pulling at a "
-                    "crawl or out of disk (oc describe daemonset "
+                    f"crawl or out of disk ({args.kube_bin} describe daemonset "
                     f"{name})"
                 )
             time.sleep(5.0)
@@ -927,12 +1009,13 @@ def ensure_pvc(oc: Oc, args: argparse.Namespace) -> None:
     if oc.exists("pvc", args.pvc_name):
         print(f"[k8s] using existing PVC {args.pvc_name}")
         return
-    print(f"[k8s] creating PVC {args.pvc_name} ({args.storage_class}, {args.pvc_size})")
+    sc = args.storage_class or "cluster default"
+    print(f"[k8s] creating PVC {args.pvc_name} ({sc}, {args.pvc_size})")
     oc.apply([render_pvc(args)])
 
 
 def cleanup(args: argparse.Namespace) -> int:
-    oc = Oc(args.namespace)
+    oc = Oc(args.namespace, args.kube_bin)
     sel = selector(args) if args.cleanup_run_id else f"app={APP_LABEL}"
     print(f"[k8s] deleting deployment,service,pod,configmap with {sel}")
     oc.delete("deployment,service,pod,configmap", sel)
@@ -951,6 +1034,12 @@ def parse_args() -> argparse.Namespace:
     run_bench.add_common_options(p)
     k = p.add_argument_group("cluster")
     k.add_argument("--namespace", required=True)
+    k.add_argument(
+        "--kube-bin",
+        default="",
+        help="CLI to drive the cluster; default auto-detects `oc` then "
+        "`kubectl` on PATH",
+    )
     k.add_argument("--image", default="vllm/vllm-openai:nightly")
     k.add_argument(
         "--hf-secret", default="llm-d-hf-token", help="secret holding HF_TOKEN"
@@ -975,7 +1064,13 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="0 = --gpu-memory-utilization; each encoder pod owns its GPUs",
     )
-    k.add_argument("--storage-class", default="ibm-spectrum-scale-fileset")
+    k.add_argument(
+        "--storage-class",
+        default="",
+        help="StorageClass for the shared PVC; must support ReadWriteMany. "
+        "Empty (default) lets the cluster's default StorageClass decide, "
+        "which only works if that default is RWX-capable",
+    )
     k.add_argument("--pvc-size", default="500Gi")
     k.add_argument("--pvc-name", default="ec-bench-data", help="reused if present")
     k.add_argument(
@@ -1020,7 +1115,8 @@ def parse_args() -> argparse.Namespace:
         "--run-as-root",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="runAsUser 0 (needs the anyuid SCC); off relies on fsGroup for the PVC",
+        help="runAsUser 0 (on OpenShift, needs the anyuid SCC); off relies on "
+        "fsGroup for the PVC",
     )
     k.add_argument("--skip-preflight", action="store_true")
     k.add_argument(
@@ -1165,16 +1261,17 @@ def dry_run(args: argparse.Namespace, client: ClientPod) -> int:
 def main() -> int:
     sys.stdout.reconfigure(line_buffering=True)
     args = parse_args()
+    args.kube_bin = resolve_kube_bin(args.kube_bin, required=not args.dry_run)
     if args.cleanup:
         return cleanup(args)
-    oc = None if args.dry_run else Oc(args.namespace)
+    oc = None if args.dry_run else Oc(args.namespace, args.kube_bin)
     client = ClientPod(args, oc)
     if args.dry_run:
         return dry_run(args, client)
     assert oc is not None
 
     if not args.skip_preflight:
-        who = oc.run("whoami", check=False)
+        who = oc.whoami()
         if who.returncode != 0:
             raise SystemExit(f"[k8s] not logged in: {who.stderr.strip()[:200]}")
     ensure_pvc(oc, args)
