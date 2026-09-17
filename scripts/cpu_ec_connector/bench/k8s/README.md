@@ -19,6 +19,8 @@ image.
 
 - `oc` or `kubectl` on PATH, logged in (`oc whoami` / `kubectl auth whoami`)
   and pointed at the target cluster, with `pods/exec` in the namespace.
+- On the laptop, `uv pip install pyyaml regex`: the driver's only
+  non-stdlib imports.
 - A secret holding `HF_TOKEN` (default name `llm-d-hf-token`, key
   `HF_TOKEN`; `--hf-secret`/`--hf-secret-key` to change).
 - A ReadWriteMany-capable storage class, since encoder and decode pods on
@@ -46,10 +48,14 @@ image.
 `--gen-workload` and `--hf-workload` each take *one* shell argument: the
 entire argument string for `gen_workload.py`/`hf_workload.py`, quoted, flags
 and all (e.g. `--hf-workload "--dataset MUIRBENCH/MUIRBENCH --max-samples 600"`).
-`--dataset`, `--max-samples`, etc. are not `k8s_bench.py` flags themselves —
-passing them unquoted either lets the shell split them into separate
-`k8s_bench.py` arguments (`unrecognized arguments`) or makes argparse refuse
-a value that looks like another flag (`expected one argument`).
+`--dataset`, `--max-samples`, etc. are not `k8s_bench.py` flags themselves:
+unquoted, the shell splits them into separate `k8s_bench.py` arguments
+(`unrecognized arguments`) or argparse refuses a value that looks like
+another flag (`expected one argument`). A bare dataset name
+(`--hf-workload MUIRBENCH/MUIRBENCH`) is accepted as `--dataset` with the
+converter's defaults; any other bare value is rejected before anything is
+created. They only run when `--workload-dir` has no `manifest.json` yet, so
+a new cap or sample count wants a new directory.
 
 ```bash
 cd scripts/cpu_ec_connector/bench
@@ -135,6 +141,11 @@ python k8s_bench.py --namespace my-ns --cleanup --delete-pvc   # also the PVC
   `exec python -m vllm... > >(tee /tmp/server.log) 2>&1`, so `exec`
   reads the same file `run_bench` would on one host; `logs` shows the
   same text.
+- **Optional `sitecustomize.py`.** A file of that name beside
+  `k8s_bench.py` is added to the scripts ConfigMap and, through
+  `PYTHONPATH=/bench-scripts`, auto-imported by every interpreter in every
+  pod (servers, proxy, load generator). It is not in the tree; the harness
+  runs identically without it.
 - **PVC layout.** `/bench/hf` (HF_HOME), `/bench/wl` (workload),
   `/bench/runs/<run-id>/` (client outputs, `queue.csv`, `shared/` for the
   example connector).

@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 import textwrap
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -40,6 +39,7 @@ from typing import Any
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+import regex as re
 from matplotlib.ticker import FuncFormatter, LogLocator, NullLocator
 
 matplotlib.use("Agg")

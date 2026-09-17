@@ -40,6 +40,7 @@ same GPU list as the decode instance for a resource-matched comparison.
 | `phase0_hit_check.py` | correctness gate for one `ec_both` instance: a repeat pass must reload, not recompute |
 | `micro_swap_blocks.py` | descriptor-layout microbenchmark of the region's batched copies |
 | `patches/sitecustomize.py` | descriptor-count instrumentation for `--frag`; wraps `_coalesce_runs` without touching the connector. Not yet exercised. |
+| `sitecustomize.py` (optional, not in the tree) | if present, `k8s_bench.py` ships it to every pod and every interpreter there auto-imports it: a connector monkeypatch without an image rebuild. `deferred_fails` in `bench.json` counts its `deferred-fail tally=` lines |
 
 ## Running
 
@@ -157,7 +158,7 @@ converter writes reports the reuse the dataset actually has; check its
 ## Charts and report
 
 ```bash
-uv pip install matplotlib
+uv pip install matplotlib regex
 python plot_results.py --out-dir report results/rep1/bench.json results/rep2/bench.json
 python plot_results.py --out-dir report_demo --demo   # synthetic fixture, no hardware
 ```

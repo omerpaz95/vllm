@@ -300,7 +300,10 @@ def test_server_flags_mirror_run_bench():
     assert "--enable-mm-embeds" in decode
     assert '"ec_role": "ec_consumer"' in decode
     assert "--mm-encoder-only" not in decode
-    assert decode.startswith("exec python -m vllm.entrypoints.cli.main serve ")
+    assert " -m vllm.entrypoints.cli.main serve " in decode
+    # bash stays PID 1 to log a stray SIGTERM, and must outlive the child.
+    assert decode.startswith("trap '")
+    assert 'do wait "$child"; status=$?; done; exit "$status"' in decode
 
 
 def test_scripts_configmap_and_proxy_from_image():
@@ -311,7 +314,11 @@ def test_scripts_configmap_and_proxy_from_image():
         assert name in cm["data"]
     assert "disagg_epd_proxy.py" in cm["data"]
     assert "def " in cm["data"]["disagg_epd_proxy.py"]
+    extra = set(cm["data"]) - set(k8s_bench._POD_SCRIPTS) - {"disagg_epd_proxy.py"}
+    assert extra <= set(k8s_bench._OPTIONAL_POD_SCRIPTS), extra
     proxy = rendered(args, "cpu-grid")["proxy"]
+    env = {e["name"]: e.get("value") for e in container(proxy)["env"]}
+    assert env["PYTHONPATH"] == "/bench-scripts"
     mounts = {m["name"]: m["mountPath"] for m in container(proxy)["volumeMounts"]}
     assert mounts["scripts"] == "/bench-scripts"
     from_image = parse("--proxy-from-image")

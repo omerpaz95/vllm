@@ -69,13 +69,12 @@ _SHM_HEADROOM_BYTES = 8 * GIB
 _POD_MEMORY_HEADROOM_BYTES = 32 * GIB
 _CONFIGMAP_LIMIT_BYTES = 1024 * 1024
 # What runs inside the pods; the drivers stay on the laptop.
-_POD_SCRIPTS = (
-    "gen_workload.py",
-    "hf_workload.py",
-    "ec_log_stats.py",
-    "run_bench.py",
-    "sitecustomize.py",
-)
+_POD_SCRIPTS = ("gen_workload.py", "hf_workload.py", "ec_log_stats.py", "run_bench.py")
+# Shipped only when present beside this file. PYTHONPATH points every
+# interpreter in every pod at the scripts mount, so a `sitecustomize.py` there
+# is auto-imported at startup: the way a connector monkeypatch reaches the
+# servers without rebuilding the image.
+_OPTIONAL_POD_SCRIPTS = ("sitecustomize.py",)
 _HEALTH_POLL_S = 5.0
 _STOP_TIMEOUT_S = 300
 _RUN_ID_RE = re.compile(r"^[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$")
@@ -183,7 +182,9 @@ class Oc:
         """
         if self.bin == "oc":
             return self.run("whoami", check=False)
-        result = self.run("auth", "whoami", check=False)
+        result = self.run(
+            "auth", "whoami", "-o", "jsonpath={.status.userInfo.username}", check=False
+        )
         if result.returncode != 0:
             result = self.run("config", "current-context", check=False)
         return result
@@ -399,8 +400,8 @@ def common_env(args: argparse.Namespace) -> list[dict[str, Any]]:
         env_var("VLLM_USE_V2_MODEL_RUNNER", "1"),
         env_var("VLLM_LOGGING_LEVEL", "DEBUG"),
         env_var("VLLM_SERVER_DEV_MODE", "1"),
-        # Auto-loaded by Python at interpreter startup; carries the
-        # sitecustomize.py monkeypatch from the scripts ConfigMap.
+        # Every interpreter auto-imports a sitecustomize.py from here when the
+        # ConfigMap ships one (_OPTIONAL_POD_SCRIPTS).
         env_var("PYTHONPATH", SCRIPTS_MOUNT),
         env_var("HF_HOME", args.hf_home),
         {
@@ -471,7 +472,9 @@ class PodServer(BenchServer):
         it -- otherwise a SIGTERM this benchmark never sent (no probe fires
         it, no rollout restarts the pod, the kernel logs nothing) leaves no
         trace at all: the container just exits 0, `Completed`, as if it
-        chose to."""
+        chose to. `wait` returns the moment the trap runs, so the script
+        keeps waiting until the child is really gone: bash is PID 1 here,
+        and its exit would SIGKILL a server still shutting down."""
         serve = [self.command] if self.command else self._serve_args()
 
         def trap_on(sig: str) -> str:
@@ -484,7 +487,9 @@ class PodServer(BenchServer):
         return (
             f"{trap_on('TERM')}; {trap_on('INT')}; "
             f"{' '.join(serve)} > >(tee {POD_LOG}) 2>&1 & "
-            f'child=$!; wait "$child"'
+            'child=$!; wait "$child"; status=$?; '
+            'while kill -0 "$child" 2>/dev/null; do wait "$child"; status=$?; done; '
+            'exit "$status"'
         )
 
     def _container(self) -> dict[str, Any]:
@@ -767,6 +772,10 @@ def render_scripts_configmap(args: argparse.Namespace) -> dict[str, Any]:
     built from another commit may log differently.
     """
     files = {name: (BENCH_DIR / name).read_text() for name in _POD_SCRIPTS}
+    for name in _OPTIONAL_POD_SCRIPTS:
+        if (BENCH_DIR / name).exists():
+            print(f"[k8s] shipping {name} to every pod (auto-imported via PYTHONPATH)")
+            files[name] = (BENCH_DIR / name).read_text()
     files["disagg_epd_proxy.py"] = (BENCH_DIR.parents[2] / PROXY).read_text()
     total = sum(len(v.encode()) for v in files.values())
     if total > _CONFIGMAP_LIMIT_BYTES:
@@ -869,7 +878,9 @@ def print_placement(placement: dict[str, list[dict[str, Any]]]) -> None:
 def ensure_workload(client: ClientPod, args: argparse.Namespace) -> None:
     manifest = f"{args.workload_dir}/manifest.json"
     if client.target.exists(manifest):
+        print(f"[k8s] using the workload at {args.workload_dir}")
         return
+    print(f"[k8s] no manifest.json in {args.workload_dir} on the PVC")
     if not (args.gen_workload or args.hf_workload):
         raise SystemExit(
             f"[k8s] no manifest.json in {args.workload_dir} on the PVC; pass "
@@ -907,8 +918,8 @@ def preflight(oc: Oc, client: ClientPod, args: argparse.Namespace) -> None:
     if stale:
         names = ", ".join(p["metadata"]["name"] for p in stale)
         print(
-            f"[k8s] WARNING: leftover bench pods hold GPUs: {names}; sweep with "
-            "--cleanup",
+            f"[k8s] WARNING: leftover pods from earlier runs: {names}; any "
+            "server among them still holds its GPUs. Sweep with --cleanup",
             file=sys.stderr,
         )
     probe = client.target.sh(f"{args.python} -c 'import vllm' && echo ok", check=False)
@@ -1258,9 +1269,31 @@ def dry_run(args: argparse.Namespace, client: ClientPod) -> int:
     return 0
 
 
+def workload_script_args(flag: str, value: str) -> str:
+    """One quoted string of converter flags, or `--dataset NAME` for a bare
+    Hugging Face dataset name; anything else bare is the flags passed
+    unquoted, which the shell already split off."""
+    value = value.strip()
+    if not value or value.startswith("-"):
+        return value
+    if flag == "--hf-workload" and " " not in value:
+        return f"--dataset {value}"
+    example = (
+        "--dataset lmms-lab/DocVQA --subset DocVQA --split validation"
+        if flag == "--hf-workload"
+        else "--pool-size 96 --num-requests 400"
+    )
+    raise SystemExit(
+        f"[k8s] {flag} takes one quoted string of script arguments, e.g. "
+        f'{flag} "{example}"; got {value!r}'
+    )
+
+
 def main() -> int:
     sys.stdout.reconfigure(line_buffering=True)
     args = parse_args()
+    args.hf_workload = workload_script_args("--hf-workload", args.hf_workload)
+    args.gen_workload = workload_script_args("--gen-workload", args.gen_workload)
     args.kube_bin = resolve_kube_bin(args.kube_bin, required=not args.dry_run)
     if args.cleanup:
         return cleanup(args)
