@@ -85,6 +85,17 @@ _EC_REGION_MARKER = "Created EC mmap file"
 _GPU_PROCESSOR_MARKER = "Running the multi-modal processor on cuda"
 # Either line proves the log belongs to a server that got as far as serving;
 # the exact wording is version-dependent, uvicorn's is stable.
+_LOG_TAIL_LINES = 40
+# Per-request fields `--save-detailed` adds that the accounting never reads;
+# kept out of bench.json, which holds one client block per load point.
+_CLIENT_DETAIL_DROP = (
+    "input_lens",
+    "output_lens",
+    "start_times",
+    "generated_texts",
+    "ttfts",
+    "itls",
+)
 _STARTUP_MARKERS = ("Application startup complete", "Starting vLLM server on")
 _REGION_REMOVED_MARKER = "Removed EC mmap file"
 # Room for the nonce, the question and the answer beside a request's images.
@@ -459,18 +470,59 @@ class BenchServer:
                 file=sys.stderr,
             )
 
+    def log_tail(self, lines: int = _LOG_TAIL_LINES) -> str:
+        out = self.target.sh(
+            f"tail -n {lines} {shlex.quote(self.log_path)} 2>/dev/null || true",
+            check=False,
+        ).stdout.rstrip()
+        return f"\n--- last {lines} lines of {self.log_path} ---\n{out}" if out else ""
+
+    def is_alive(self) -> bool:
+        """Whether the launched process tree still has a live member.
+
+        Zombies do not count: a reaped-late <defunct> child would otherwise
+        read as a server still starting up.
+        """
+        script = f"""
+        pgid=$(cat {self.pgid_file} 2>/dev/null || true)
+        pid=$(cat {self.pid_file} 2>/dev/null || true)
+        if [ -n "$pgid" ]; then
+            ps -eo pgid=,stat= | awk -v g="$pgid" \
+                '$1 == g && $2 !~ /^Z/ {{ n++ }} END {{ print n + 0 }}'
+        elif [ -n "$pid" ]; then
+            ps -o stat= -p "$pid" 2>/dev/null | grep -cv '^ *Z' || echo 0
+        else
+            echo 1
+        fi
+        """
+        out = self.target.sh(script, check=False).stdout.strip()
+        return not out.isdigit() or int(out) > 0
+
     def wait_healthy(self) -> None:
-        deadline = time.monotonic() + self.args.startup_timeout_s
+        """Poll /health until the server answers, it dies, or time runs out.
+
+        Liveness is polled alongside /health so a server that exits during
+        startup -- an unsupported model, a bad flag, CUDA OOM -- reports its own
+        error at once instead of after the full startup timeout.
+        """
+        started = time.monotonic()
+        deadline = started + self.args.startup_timeout_s
         probe = (
             f"curl -s -o /dev/null -w '%{{http_code}}' {self.base_url}/health || true"
         )
         while time.monotonic() < deadline:
             if self.target.sh(probe, check=False).stdout.strip() == "200":
                 return
+            if not self.is_alive():
+                raise RuntimeError(
+                    f"{self.name} exited after {time.monotonic() - started:.0f}s "
+                    f"without answering /health{self.log_tail()}"
+                )
             time.sleep(_HEALTH_POLL_S)
         raise RuntimeError(
-            f"{self.name} not healthy within {self.args.startup_timeout_s}s "
-            f"(see {self.log_path})"
+            f"{self.name} still loading after {self.args.startup_timeout_s}s and "
+            f"never answered /health; a large model may just need longer "
+            f"(--startup-timeout-s){self.log_tail()}"
         )
 
     def wait_for_log(self, marker: str, timeout_s: int = 120) -> None:
@@ -550,6 +602,9 @@ class BenchServer:
             "--metric-percentiles 50,95,99",
             f"--seed {self.args.seed}",
             "--save-result",
+            # Without this the per-request `errors` are stripped from the saved
+            # result, leaving a short completion count with no reason attached.
+            "--save-detailed",
             f"--result-filename {out}",
         ]
         if concurrency:
@@ -881,6 +936,23 @@ def check_rewrite(
     return coverage
 
 
+def log_error_lines(log_slice: str, keep: int = 5) -> str:
+    """The server's own complaints from one load point, for a failure message.
+
+    The client sees a status code; the reason a request was rejected or aborted
+    is on the server side, in the log written while that point ran.
+    """
+    lines = [
+        line.strip()
+        for line in log_slice.splitlines()
+        if "ERROR" in line or "Traceback" in line or "aborted" in line.lower()
+    ]
+    if not lines:
+        return ""
+    distinct = list(dict.fromkeys(line[:300] for line in lines))[:keep]
+    return "\n--- server log for this point ---\n" + "\n".join(distinct)
+
+
 def check_loads(name: str, when: str, consumer: dict[str, Any]) -> None:
     """A connector arm that transferred nothing looks, in the timings, exactly
     like the no-connector arm; assert the direction both ways."""
@@ -1017,21 +1089,32 @@ def measure_point(
     }
     raw = target.read_text(out_path)
     client = json.loads(raw) if raw.strip() else {}
+    for field_ in _CLIENT_DETAIL_DROP:
+        client.pop(field_, None)
     done = client.get("completed", 0)
     if done < num_prompts:
         # The load generator records why each request failed; the first few
-        # distinct reasons usually name the limit that was hit.
-        errors = [e for e in client.get("errors") or [] if e]
+        # distinct reasons usually name the limit that was hit. A non-200
+        # response with no reason phrase leaves an empty string, so the count
+        # the client reports is stated separately from the reasons it kept.
+        errors = [e for e in client.get("errors") or [] if str(e).strip()]
         distinct = list(dict.fromkeys(str(e)[:300] for e in errors))[:3]
+        failed = client.get("failed")
+        detail = (
+            f"reasons: {distinct}"
+            if distinct
+            else (
+                "the client reported no reason for them (a non-200 response with an "
+                "empty reason phrase); grep the server log for ERROR around the end "
+                "of this point"
+            )
+        )
         raise ServerMismatchError(
             f"{name} ({when}): only {done} of {num_prompts} requests completed, so "
             f"the latencies describe the few that survived; see "
             f"{sys_.consumer.log_path}. "
-            + (
-                f"{len(errors)} failed; reasons: {distinct}"
-                if errors
-                else "the client recorded no per-request errors"
-            )
+            f"client counted {failed if failed is not None else num_prompts - done}"
+            f" failed; {detail}" + log_error_lines(slices[sys_.consumer.name])
         )
     consumer = summarize(slices[sys_.consumer.name])
     check_loads(name, when, consumer)
