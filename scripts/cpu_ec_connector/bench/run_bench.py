@@ -265,24 +265,24 @@ class BenchServer:
         """Build the launch command.
 
         The `cd` matters: from the repository root, `import vllm` resolves the
-        source directory as a namespace package. DEBUG matters: the
-        connector's transfer accounting is on debug lines. The V2 model runner
-        is required by the CPU connector, so every arm runs it.
+        source directory as a namespace package. `patch_dir` is on PYTHONPATH
+        for its `sitecustomize`, which logs the connector's transfer accounting
+        at INFO -- the harness parses those lines, and the servers run at INFO
+        so the rest of vLLM's debug output stays off the hot path. The V2 model
+        runner is required by the CPU connector, so every arm runs it.
         """
         env = [
             "VLLM_USE_V2_MODEL_RUNNER=1",
-            "VLLM_LOGGING_LEVEL=DEBUG",
+            "VLLM_LOGGING_LEVEL=INFO",
             "VLLM_SERVER_DEV_MODE=1",
+            f"PYTHONPATH={self.args.patch_dir}",
         ]
         if self.gpu:
             env.insert(0, f"CUDA_VISIBLE_DEVICES={self.gpu}")
         if self.args.hf_home:
             env.append(f"HF_HOME={self.args.hf_home}")
         if instrument:
-            env += [
-                f"PYTHONPATH={self.args.patch_dir}",
-                f"EC_BENCH_FRAG_FILE={self.args.frag_file}",
-            ]
+            env.append(f"EC_BENCH_FRAG_FILE={self.args.frag_file}")
         env += list(self.extra_env)
         serve = [self.command] if self.command else self._serve_args()
         # setsid puts the process in a new session so its children -- for a vLLM
@@ -1525,7 +1525,7 @@ def add_single_node_options(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--patch-dir",
         default=str(BENCH_DIR / "patches"),
-        help="directory holding the --frag sitecustomize.py, on the target",
+        help="directory holding the servers' sitecustomize.py, on the target",
     )
     epd = p.add_argument_group("EPD placement")
     epd.add_argument(

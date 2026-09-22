@@ -1,6 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Descriptor-count instrumentation for the EC offload benchmark.
+"""Server-side patches for the EC offload benchmark.
+
+Two independent pieces. The first, always applied, logs the connector's
+transfer accounting at INFO so the servers can run at INFO: the harness parses
+those lines out of the server log, and vLLM's remaining debug output costs
+throughput and buries them in roughly a million lines per server.
+
+The second is descriptor-count instrumentation, applied only when
+`EC_BENCH_FRAG_FILE` is set.
 
 Wraps `_coalesce_runs` -- the function that decides how many descriptors an
 entry's blocks collapse into -- and records `blocks in` against `descriptors
@@ -29,12 +37,37 @@ separate run.
 
 import atexit
 import json
+import logging
 import os
 import sys
 import time
 
 _OUT_PATH = os.environ.get("EC_BENCH_FRAG_FILE")
 _FLUSH_INTERVAL_S = float(os.environ.get("EC_BENCH_FRAG_FLUSH_S", "10"))
+
+# Every logger carrying a line `ec_log_stats` parses at DEBUG: the per-transfer
+# accounting on the CPU connector's worker, and the hit lines on the example
+# connector.
+_ACCOUNTING_LOGGERS = (
+    "vllm.distributed.ec_transfer.ec_connector.cpu.worker",
+    "vllm.distributed.ec_transfer.ec_connector.example_connector",
+)
+
+
+def _accounting_to_info() -> None:
+    """Send these loggers' debug records through `info` instead.
+
+    `logging.getLogger` returns the same object `vllm.logger.init_logger` hands
+    the connector, so the order this lands in relative to importing vllm does
+    not matter. The level word is the only thing that changes in the output, and
+    the harness's own patterns match any level.
+    """
+    for name in _ACCOUNTING_LOGGERS:
+        logger = logging.getLogger(name)
+        logger.debug = logger.info
+
+
+_accounting_to_info()
 
 
 def _install(out_path):
