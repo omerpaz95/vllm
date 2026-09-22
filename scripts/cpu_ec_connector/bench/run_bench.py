@@ -23,9 +23,9 @@ EPD proxy is the `data` mode: since the proxy started carrying the connector's
 handles regardless of rewriting, no proxy modification is needed.
 
 Load comes from `vllm bench serve` over the `custom_image` dataset, so the
-latencies are the ones a client sees. Alongside them the connector's own DEBUG
-accounting is read from the server logs, and every arm is gated on having done
-what its name says: a connector arm must have loaded entries, a rewrite arm
+latencies are the ones a client sees. Alongside them the connector's own
+transfer accounting is read from the server logs, and every arm is gated on
+having done what its name says: a connector arm must have loaded entries, a rewrite arm
 must have rewritten most of the workload, a fan-out must have reached every
 encoder, and every request must have completed. A run that fails a gate is
 not a measurement, and this raises instead of printing a delta.
@@ -98,6 +98,10 @@ _CLIENT_DETAIL_DROP = (
 )
 _STARTUP_MARKERS = ("Application startup complete", "Starting vLLM server on")
 _REGION_REMOVED_MARKER = "Removed EC mmap file"
+# Printed by patches/sitecustomize.py once it has raised the connector's
+# accounting to INFO. Its absence means PYTHONPATH never reached the server, so
+# the lines every connector arm is gated on would silently be missing.
+_ACCOUNTING_MARKER = "[ec-bench] EC accounting logged at INFO"
 # Room for the nonce, the question and the answer beside a request's images.
 _PROMPT_TEXT_TOKENS = 512
 REGION_GLOB = "/dev/shm/vllm_ec_*.mmap"
@@ -275,8 +279,14 @@ class BenchServer:
             "VLLM_USE_V2_MODEL_RUNNER=1",
             "VLLM_LOGGING_LEVEL=INFO",
             "VLLM_SERVER_DEV_MODE=1",
-            f"PYTHONPATH={self.args.patch_dir}",
         ]
+        if self.args.patch_dir:
+            # Prepended rather than assigned: an empty entry would put the
+            # launch directory on sys.path, and a caller's own PYTHONPATH is
+            # not this harness's to drop.
+            env.append(
+                f"PYTHONPATH={self.args.patch_dir}" + "${PYTHONPATH:+:$PYTHONPATH}"
+            )
         if self.gpu:
             env.insert(0, f"CUDA_VISIBLE_DEVICES={self.gpu}")
         if self.args.hf_home:
@@ -554,6 +564,13 @@ class BenchServer:
             raise ServerMismatchError(
                 f"{self.name}: no '{_EC_REGION_MARKER}' for {self.engine_id}; "
                 "the CPU connector is not active, or a region was reused"
+            )
+        if self.args.patch_dir and _ACCOUNTING_MARKER not in log:
+            raise ServerMismatchError(
+                f"{self.name}: no '{_ACCOUNTING_MARKER}' in {self.log_path}; "
+                f"the sitecustomize in --patch-dir {self.args.patch_dir} did not "
+                "load, so the connector's accounting is still at DEBUG and this "
+                "server logs none of it"
             )
         if not connector and _EC_REGION_MARKER in log:
             raise ServerMismatchError(
@@ -1525,7 +1542,8 @@ def add_single_node_options(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--patch-dir",
         default=str(BENCH_DIR / "patches"),
-        help="directory holding the servers' sitecustomize.py, on the target",
+        help="directory holding patches/sitecustomize.py, on the target; empty "
+        "leaves it off PYTHONPATH and the accounting at DEBUG",
     )
     epd = p.add_argument_group("EPD placement")
     epd.add_argument(

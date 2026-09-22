@@ -26,13 +26,14 @@ the benchmark scripts one level up: Python puts a script's own directory on
 `sys.path`, and any `sitecustomize` found there loads automatically. Put
 *this* directory on PYTHONPATH only for the server process.
 
-Unset `EC_BENCH_FRAG_FILE` and this module does nothing, so a leaked
-PYTHONPATH is harmless.
+A leaked PYTHONPATH therefore raises two loggers' accounting to INFO in
+whatever interpreter picks this up. Descriptor counting stays off until
+`EC_BENCH_FRAG_FILE` is set.
 
-Enabling this adds a Python frame and a dict update per call -- about 1 us
-against a ~40 us descriptor build. Small, but do not report latencies from a
-patched process: run the timed arms unpatched and diagnose fragmentation in a
-separate run.
+Descriptor counting adds a Python frame and a dict update per call -- about
+1 us against a ~40 us descriptor build. Small, but do not report latencies
+from a process running it: run the timed arms with `EC_BENCH_FRAG_FILE` unset
+and diagnose fragmentation in a separate run.
 """
 
 import atexit
@@ -45,6 +46,7 @@ import time
 _OUT_PATH = os.environ.get("EC_BENCH_FRAG_FILE")
 _FLUSH_INTERVAL_S = float(os.environ.get("EC_BENCH_FRAG_FLUSH_S", "10"))
 
+_ACCOUNTING_MARKER = "[ec-bench] EC accounting logged at INFO"
 # Every logger carrying a line `ec_log_stats` parses at DEBUG: the per-transfer
 # accounting on the CPU connector's worker, and the hit lines on the example
 # connector.
@@ -58,13 +60,23 @@ def _accounting_to_info() -> None:
     """Send these loggers' debug records through `info` instead.
 
     `logging.getLogger` returns the same object `vllm.logger.init_logger` hands
-    the connector, so the order this lands in relative to importing vllm does
-    not matter. The level word is the only thing that changes in the output, and
-    the harness's own patterns match any level.
+    the connector, so this holds whether or not vllm has been imported yet --
+    under vLLM's own logging config, which leaves `disable_existing_loggers`
+    false and so keeps loggers created before it ran.
+
+    Every debug record on these two loggers is promoted, not just the accounting
+    ones: the CPU worker's region-cleanup failure carries `exc_info`, so that
+    one now prints a traceback at INFO. The harness's patterns match any level
+    word, so the promotion itself needs no change on the parsing side.
+
+    The marker goes to stderr because logging is not configured yet; `verify()`
+    requires it in a fresh server log, so a PYTHONPATH that never reached the
+    server fails as itself instead of as an arm that transferred nothing.
     """
     for name in _ACCOUNTING_LOGGERS:
         logger = logging.getLogger(name)
         logger.debug = logger.info
+    print(_ACCOUNTING_MARKER, file=sys.stderr)
 
 
 _accounting_to_info()

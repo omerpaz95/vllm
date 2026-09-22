@@ -8,7 +8,7 @@ one. Everything runs against `main`; no patches to vLLM are needed.
 ## Arms
 
 | arm | topology | connector | decode instance receives |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `baseline` | one instance | none | n/a, encodes and decodes itself |
 | `offload` | one instance | `ECCPUConnector`, `ec_both` | n/a, repeats reload from the CPU region |
 | `cpu-data` | encoder + decode | `ECCPUConnector` over NIXL | pixels + `ec_transfer_params` |
@@ -30,7 +30,7 @@ same GPU list as the decode instance for a resource-matched comparison.
 ## Files
 
 | file | role |
-|---|---|
+| --- | --- |
 | `gen_workload.py` | builds the image pool, the `custom_image` JSONL, `warmup.jsonl` and `manifest.json` |
 | `hf_workload.py` | the same directory from a Hugging Face dataset (DocVQA, MuirBench, VisionArena-Chat, any image column) |
 | `plot_results.py` | charts (PNG + SVG) and a self-contained `report.html` from one or more `bench.json` |
@@ -39,7 +39,7 @@ same GPU list as the decode instance for a resource-matched comparison.
 | `ec_log_stats.py` | log parsers: EC transfers (both connectors), encoder inputs, proxy `STAGE` lines, rewrite counts |
 | `phase0_hit_check.py` | correctness gate for one `ec_both` instance: a repeat pass must reload, not recompute |
 | `micro_swap_blocks.py` | descriptor-layout microbenchmark of the region's batched copies |
-| `patches/sitecustomize.py` | descriptor-count instrumentation for `--frag`; wraps `_coalesce_runs` without touching the connector. Not yet exercised. |
+| `patches/sitecustomize.py` | on PYTHONPATH for every server `run_bench.py` launches: raises the connector's transfer accounting to INFO so the servers can run at INFO. Under `--frag` it also counts descriptors, wrapping `_coalesce_runs` without touching the connector |
 | `sitecustomize.py` (optional, not in the tree) | if present, `k8s_bench.py` ships it to every pod and every interpreter there auto-imports it: a connector monkeypatch without an image rebuild. `deferred_fails` in `bench.json` counts its `deferred-fail tally=` lines |
 
 ## Running
@@ -92,8 +92,12 @@ python run_bench.py --pod my-pod --python /venv/bin/python \
 
 `--frag` runs the `offload` arm with a region smaller than the working set
 and descriptor counting on, to see whether entries still collapse to one
-descriptor after the region has churned. `--patch-dir` must point at
-`patches/` on the target.
+descriptor after the region has churned.
+
+`--patch-dir` must point at `patches/` **on the target**, for every run and not
+only `--frag`: the servers load its `sitecustomize.py` to get the connector's
+transfer accounting at INFO. With `--pod` the directory has to already exist in
+the pod; `verify()` fails the arm by name if the servers never loaded it.
 
 The archived real-photo results used `hf-tar:ofsoundof/LSDIR:shard-00.tar.gz`,
 which is gated and licensed for academic research only. Every measured
@@ -113,7 +117,7 @@ by pixel hash so shared images become reuse, and the manifest then reports
 the reuse the dataset actually has.
 
 | dataset | reuse (refs per distinct image) | why |
-|---|---|---|
+| --- | --- | --- |
 | `lmms-lab/DocVQA` (config `DocVQA`, validation) | ~4.2x, scanned pages of ~10k embeddings | the primary choice: high-resolution images asked about repeatedly is the pattern the connector exists for |
 | `lmms-lab/DocVQA` (config `InfographicVQA`) | ~5.6x, images that hit `max_pixels` | fewer, much larger entries |
 | `MUIRBENCH/MUIRBENCH` (test) | ~1.6x, only within counterpart pairs | 4.3 images per request: the fan-out arm, where one request can occupy several encoders. Do not expect it to move the offload numbers |
@@ -248,13 +252,14 @@ line prints both figures side by side.
 ## Configuration that matters
 
 | setting | why |
-|---|---|
+| --- | --- |
 | `--encoder-max-num-batched-tokens 65536` | 8192 against 5,350 tokens/image forbids batching two image requests and pins the encoder at one image per step; every `rate=inf` number is then queue depth |
 | `--max-concurrency 1,4,8` | never `--request-rate inf` unbounded: TTFT becomes queue depth divided by service rate |
 | `--enable-mm-embeds` on decode | otherwise every grid request is HTTP 400; set in every EPD arm so it is not a confound |
 | `--mm-processor-cache-type lru` on encoders | with `shm` the engine keeps no receiver cache, the connector reports no grid, and the grid arm silently becomes the data arm |
 | `--limit-mm-per-prompt '{"video":0}'` | drops the encoder-cache floor from 32768 to 16384 embeddings |
-| `--enable-logging-iteration-details` + `VLLM_LOGGING_LEVEL=DEBUG` | the accounting this reads lives on those lines |
+| `--enable-logging-iteration-details` | the encoder counts this reads live on those INFO lines |
+| `patches/sitecustomize.py` on PYTHONPATH | the connector's transfer accounting is a debug line; this raises it to INFO so the servers need not run at DEBUG |
 | `--mm-encoder-only` + `--enforce-eager` on encoders | ~16 GB to ~1.4 GB, and the EPD example requires eager encoders |
 | `VLLM_USE_V2_MODEL_RUNNER=1` | required by the CPU connector; set on every arm |
 | `ec_enable_nixl` inside `ec_connector_extra_config` | `ECTransferConfig` rejects it as a top-level key |

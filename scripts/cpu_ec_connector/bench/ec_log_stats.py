@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Read EC connector accounting out of a vLLM server log.
 
-The connector reports every batched DMA on a DEBUG line, so the server must
-run with `VLLM_LOGGING_LEVEL=DEBUG` or nothing here finds anything. Encoder
+The connector reports every batched DMA on a debug line, which reaches the log
+either because the server runs at DEBUG or because `patches/sitecustomize.py`
+raised that logger to INFO. Without one of the two, nothing here finds
+anything. Encoder
 inputs come from the per-step iteration line that
 `--enable-logging-iteration-details` enables.
 
