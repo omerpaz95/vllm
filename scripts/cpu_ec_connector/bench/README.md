@@ -130,8 +130,16 @@ python run_bench.py --workload-dir /data/wl-muir --out-dir results \
    rather than by checking whether the pipe file exists — a crashed daemon can
    leave that file behind, and a check that only looked for the file would
    mistake a dead daemon for a live one. If none answers, it starts one:
-   `nvidia-cuda-mps-control -d` with `CUDA_MPS_PIPE_DIRECTORY`/
-   `CUDA_MPS_LOG_DIRECTORY` set to `--mps-pipe-dir`/`--mps-log-dir`.
+   `nvidia-cuda-mps-control -d` with `CUDA_VISIBLE_DEVICES` cleared and
+   `CUDA_MPS_PIPE_DIRECTORY`/`CUDA_MPS_LOG_DIRECTORY` set to
+   `--mps-pipe-dir`/`--mps-log-dir`. Clearing `CUDA_VISIBLE_DEVICES` matters
+   on a multi-GPU node: if it were left at whatever's ambient (a Kubernetes
+   GPU device plugin commonly sets one, often by UUID), the daemon would
+   remap its device ordinals to that subset, and every encoder's own numeric
+   `--encoder-devices` index would only land on the right physical GPU by
+   coincidence. Clearing it makes the daemon see every device node this
+   container actually has, in physical order — the same order every
+   encoder's index already assumes.
 2. **Pins the daemon's default thread-percentage ceiling to 100.** A reused
    daemon may carry a `set_default_active_thread_percentage` below 100 from
    some earlier session (that setting lives on the daemon, not any one
@@ -158,13 +166,14 @@ python run_bench.py --workload-dir /data/wl-muir --out-dir results \
 
 ### What it does not do
 
-- **It does not set the GPU's compute mode.** MPS's single-user workflow (one
-  pod holding the GPU exclusively, which is the case this bench harness
-  assumes) does not require `EXCLUSIVE_PROCESS` the way MPS's multi-user
-  workflow does, but if your setup needs it, run
-  `nvidia-smi -c EXCLUSIVE_PROCESS` yourself first — it needs root and changes
-  every process on that GPU, which is out of scope for a benchmark script to
-  do on your behalf.
+- **It does not set the GPU's compute mode, and does not need to.** MPS's
+  single-user workflow (one pod holding the GPU exclusively, which is what
+  this harness assumes) runs in the driver's ordinary `Default` compute mode
+  — confirmed by `nvidia-smi` showing `Compute M.: Default` while the MPS
+  server and its clients are up and running, clients tagged `M+C` (versus
+  plain `C` for a non-MPS process). `EXCLUSIVE_PROCESS` is only NVIDIA's
+  documented **multi-user** MPS setup; nothing here needs it, and this
+  harness does not set it.
 - **It does not stop the daemon.** The daemon is meant to be a long-lived,
   per-node service and this harness treats it that way: it outlives every
   arm and load point in a run, and outlives the run itself. If you reset the

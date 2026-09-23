@@ -729,9 +729,21 @@ def ensure_mps_daemon(target: Target, args: argparse.Namespace) -> None:
     A crashed daemon can leave its `control` pipe behind, so liveness is
     checked by sending it a command rather than by the pipe's existence.
 
-    This only starts the daemon; the GPU's compute mode must already be
-    EXCLUSIVE_PROCESS (`nvidia-smi -c EXCLUSIVE_PROCESS`, needs root), which
-    this harness does not set.
+    This only starts the daemon; it does not touch the GPU's compute mode.
+    MPS's single-user workflow (one pod, one daemon, no other tenant on the
+    GPU -- what this harness assumes) runs in the driver's ordinary Default
+    compute mode, confirmed by `nvidia-smi` showing clients as `M+C` with no
+    mode change; EXCLUSIVE_PROCESS is only NVIDIA's documented multi-user
+    setup, not a precondition here.
+
+    A `CUDA_VISIBLE_DEVICES` set ambiently in the shell (a Kubernetes GPU
+    device plugin commonly sets one, by UUID) would make the daemon remap
+    its device ordinals to that subset -- every encoder's own numeric
+    `CUDA_VISIBLE_DEVICES` then has to guess the same remapping to land on
+    the right physical GPU, which only holds by coincidence. Clearing it
+    before the daemon starts makes it see every device node this container
+    actually has, in physical order, matching what every encoder's index
+    already assumes.
     """
     pipe_dir, log_dir = shlex.quote(args.mps_pipe_dir), shlex.quote(args.mps_log_dir)
     alive = target.sh(
@@ -741,7 +753,7 @@ def ensure_mps_daemon(target: Target, args: argparse.Namespace) -> None:
     ).stdout.strip()
     if alive != "yes":
         target.sh(
-            f"mkdir -p {pipe_dir} {log_dir} && "
+            f"mkdir -p {pipe_dir} {log_dir} && unset CUDA_VISIBLE_DEVICES && "
             f"CUDA_MPS_PIPE_DIRECTORY={pipe_dir} CUDA_MPS_LOG_DIRECTORY={log_dir} "
             "nvidia-cuda-mps-control -d"
         )
@@ -1667,9 +1679,8 @@ def add_single_node_options(p: argparse.ArgumentParser) -> None:
         "CUDA MPS instead of time-slicing (CUDA_MPS_ACTIVE_THREAD_PERCENTAGE "
         "= 100 / encoders sharing that device), and start the MPS control "
         "daemon on the target if one is not already running at "
-        "--mps-pipe-dir. The GPU's compute mode must already be "
-        "EXCLUSIVE_PROCESS (`nvidia-smi -c EXCLUSIVE_PROCESS`, needs root); "
-        "this only starts the daemon",
+        "--mps-pipe-dir. Assumes single-user MPS (no other tenant on the "
+        "GPU); this only starts the daemon, and does not touch compute mode",
     )
     epd.add_argument(
         "--mps-pipe-dir",
