@@ -107,6 +107,106 @@ get right is the JPEG size that sets wire payload and decode time; the
 synthetic source is calibrated to that, and an enlarged photo compresses the
 same as a native crop.
 
+## MPS: an even SM (and memory) split across encoders on one GPU
+
+Encoders sharing a GPU (`--encoder-devices "0;0;0;0"`) are time-sliced by
+default: the driver's default compute mode round-robins whichever encoder's
+kernels are ready, with no fairness guarantee, so one busy encoder can starve
+the other three. `--mps` switches that sharing from time-slicing to CUDA's
+Multi-Process Service (MPS), which gives each encoder its own soft-capped
+share of the GPU's SMs instead.
+
+```bash
+python run_bench.py --workload-dir /data/wl-muir --out-dir results \
+    --encoder-devices "0;0;0;0" --mps --arms baseline,cpu-grid \
+    --max-concurrency 1,4,8
+```
+
+### What `--mps` actually does
+
+1. **Starts (or reuses) an MPS control daemon on the target.** `ensure_mps_daemon`
+   checks whether a daemon is already listening at `--mps-pipe-dir` by asking
+   it for its server list (`echo get_server_list | ... nvidia-cuda-mps-control`)
+   rather than by checking whether the pipe file exists — a crashed daemon can
+   leave that file behind, and a check that only looked for the file would
+   mistake a dead daemon for a live one. If none answers, it starts one:
+   `nvidia-cuda-mps-control -d` with `CUDA_MPS_PIPE_DIRECTORY`/
+   `CUDA_MPS_LOG_DIRECTORY` set to `--mps-pipe-dir`/`--mps-log-dir`.
+2. **Pins the daemon's default thread-percentage ceiling to 100.** A reused
+   daemon may carry a `set_default_active_thread_percentage` below 100 from
+   some earlier session (that setting lives on the daemon, not any one
+   client), and a client's own percentage can only narrow that ceiling, never
+   raise it — so every encoder's requested share would be silently capped
+   further. `ensure_mps_daemon` resets it unconditionally, whether the
+   daemon was just started or found already running.
+3. **Gives each encoder an equal share.** For each encoder, `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`
+   is set to `100 / gpu_share`, where `gpu_share` is how many encoder groups
+   share that physical GPU — the same count `--encoder-devices` already uses
+   to divide `--gpu-memory-utilization` for the memory split. Four encoders
+   on one GPU: 25% SM share each, alongside the ~25% memory share they
+   already got. `CUDA_MPS_PIPE_DIRECTORY` is set to match the daemon's, since
+   a mismatch there is how a client fails to find the daemon at all.
+4. **Verifies each encoder actually joined MPS.** Nothing in the driver's own
+   behavior is confirmed to make a client that cannot reach the daemon (wrong
+   pipe dir, daemon not running) fail loudly — the failure mode most sources
+   describe is a silent fallback to ordinary, non-MPS execution, which would
+   let a run measure plain time-sliced sharing while believing it has an even
+   split. `verify()` cross-checks, for every encoder, that some PID in its
+   process group appears in the MPS daemon's own client list
+   (`get_client_list`) and raises rather than letting the run continue if
+   not.
+
+### What it does not do
+
+- **It does not set the GPU's compute mode.** MPS's single-user workflow (one
+  pod holding the GPU exclusively, which is the case this bench harness
+  assumes) does not require `EXCLUSIVE_PROCESS` the way MPS's multi-user
+  workflow does, but if your setup needs it, run
+  `nvidia-smi -c EXCLUSIVE_PROCESS` yourself first — it needs root and changes
+  every process on that GPU, which is out of scope for a benchmark script to
+  do on your behalf.
+- **It does not stop the daemon.** The daemon is meant to be a long-lived,
+  per-node service and this harness treats it that way: it outlives every
+  arm and load point in a run, and outlives the run itself. If you reset the
+  GPU's compute mode back to `DEFAULT` between runs, the daemon started under
+  the old mode is still sitting at `--mps-pipe-dir` and will be reused as-is;
+  remove that directory (or point `--mps-pipe-dir` elsewhere) if encoders
+  start failing right after such a reset.
+- **It does not add an MPS-level memory cap.** The equal memory split comes
+  entirely from dividing vLLM's own `--gpu-memory-utilization` budget
+  (`--encoder-gpu-memory-utilization` overrides it) — a software-side
+  allocation limit inside vLLM, not anything MPS enforces. MPS has a
+  `CUDA_MPS_PINNED_DEVICE_MEM_LIMIT` env var for capping pinned memory per
+  client, but it does not cover ordinary device allocations, and CUDA 13.0
+  (this repo's target) predates MPS's newer cgroup-based device-memory
+  partitioning (`nvidia-smi memory-limits`, which needs CUDA 13.4+) — so
+  there is currently no MPS-side backstop if vLLM's own accounting is off.
+- **It does not use Hopper's static SM partitioning.** H100 and newer GPUs
+  support a separate, hard-isolation feature (`sm-partition create`, in
+  8-SM chunks) that reserves SMs exclusively per client instead of a soft
+  percentage cap the scheduler can still let one client exceed briefly. It's
+  a stronger guarantee than `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`, at the cost
+  of H100's 132 SMs not dividing evenly into 8-SM chunks across an arbitrary
+  encoder count; not used here, but worth reaching for if the percentage-based
+  split ever looks less even than expected in practice. It also lives on a
+  different control surface than what this harness speaks (see below), so
+  reaching for it means more than adding one more `echo` command.
+
+### v2, not v3
+
+Everything above runs against the **legacy MPS v2 control interface**:
+`nvidia-cuda-mps-control -d` starts it, and from then on the *only* way to
+talk to it is by piping a command into a second, foreground invocation —
+`echo "<command>" | CUDA_MPS_PIPE_DIRECTORY=<dir> nvidia-cuda-mps-control` —
+which is exactly what `ensure_mps_daemon`, `_mps_client_pids`, and
+`verify_mps_client` all do. MPS v3 is a separate interface with its own
+subcommand-style CLI (`nvidia-cuda-mps-control client list`, `sm-partition
+create`, a config file, namespaces) that this harness does not speak and a
+v2 daemon does not answer — `sm-partition create` above is a v3-only
+command, not a fourth pipe command you could add to this codebase's existing
+calls. Moving to it would mean starting the daemon differently, not just
+sending it new commands.
+
 ## Real datasets
 
 `vllm bench serve` supports a handful of Hugging Face datasets natively, but
@@ -138,6 +238,10 @@ MuirBench is the fan-out workload: give it several encoders, for example
 GPU 0), so a 4-image request can occupy them all. `--num-prompts` replays
 only the first lines of the file, so the reuse a run sees is the reuse
 within that prefix; for the DocVQA story run the whole file at least once.
+
+Encoders sharing a GPU are time-sliced by default; add `--mps` to divide the
+GPU's SMs evenly across them via CUDA MPS instead — see
+[MPS: an even SM (and memory) split across encoders on one GPU](#mps-an-even-sm-and-memory-split-across-encoders-on-one-gpu).
 
 On the multi-node harness the conversion runs inside the client pod and
 lands on the PVC, so every later run reuses it:

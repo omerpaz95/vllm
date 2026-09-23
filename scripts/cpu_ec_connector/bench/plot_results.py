@@ -254,6 +254,59 @@ def baseline_arm(bench: Bench) -> str | None:
     return None
 
 
+@dataclass
+class ReuseSweep:
+    """One `Bench` per image-reuse level, keyed by its rounded max_hit_rate.
+
+    Each level is a full load-point sweep on its own (same arms, same request
+    rates); the levels differ only in how much of the workload's images
+    repeat, so this is an axis across files rather than within one.
+    """
+
+    levels: list[float]
+    benches: dict[float, Bench]
+
+
+def load_reuse_sweep(paths: Sequence[Path]) -> ReuseSweep:
+    """Group `bench.json` files by `manifest_expected.max_hit_rate`."""
+    groups: dict[float, list[Path]] = {}
+    for path in paths:
+        doc = json.loads(path.read_text())
+        hit_rate = doc.get("manifest_expected", {}).get("max_hit_rate")
+        if hit_rate is None:
+            raise SystemExit(
+                f"[plot] {path}: no manifest_expected.max_hit_rate; not a "
+                "reuse-sweep bench.json"
+            )
+        groups.setdefault(round(float(hit_rate), 2), []).append(path)
+    benches = {level: load_bench(files) for level, files in sorted(groups.items())}
+    return ReuseSweep(sorted(benches), benches)
+
+
+def sweep_rates(sweep: ReuseSweep) -> list[str]:
+    """Distinct request-rate labels across every reuse level, numeric order."""
+    rates = {p[0] for bench in sweep.benches.values() for p in bench.points}
+    return sorted(rates, key=lambda r: (0, float(r)) if _is_number(r) else (1, r))
+
+
+def sweep_arms(sweep: ReuseSweep) -> list[str]:
+    return sort_arms({a for bench in sweep.benches.values() for a in bench.arms})
+
+
+def _reuse_note(sweep: ReuseSweep, extra: str = "") -> str:
+    files = sorted({p.name for b in sweep.benches.values() for p in b.sources})
+    levels = ", ".join(f"{level * 100:.0f}%" for level in sweep.levels)
+    reps = max((b.reps for b in sweep.benches.values()), default=1)
+    spread = (
+        "mean of reps, bars/bands span min-max" if reps > 1 else "single rep per level"
+    )
+    note = (
+        f"Source: run_bench.py bench.json across reuse levels {levels} "
+        f"({', '.join(files)}) - {spread}"
+    )
+    return f"{note}. {extra}" if extra else note
+
+
 # --------------------------------------------------------------------------
 # Metric accessors
 # --------------------------------------------------------------------------
@@ -1384,6 +1437,434 @@ def chart_queues(bench: Bench, axis: LoadAxis, styles, out_dir: Path) -> Chart |
 
 
 # --------------------------------------------------------------------------
+# Reuse sweep (image-reuse hit rate on the x axis, one panel per rate)
+# --------------------------------------------------------------------------
+
+
+def _reuse_panels(
+    n: int,
+    *,
+    cols_max: int = 4,
+    col_in: float = 2.6,
+    row_in: float = 3.4,
+    extra_in: float = 1.9,
+    sharey: bool = False,
+) -> tuple[plt.Figure, np.ndarray, int, int]:
+    """A grid of panels, one per rate.
+
+    Not shared-y by default: each rate spans a very different throughput
+    range, so a shared axis would clip every panel but the one with the
+    largest values. Ratio charts (speedup, TTFT reduction), whose panels sit
+    on the same -ish scale regardless of rate, opt into `sharey=True`.
+    """
+    cols = min(n, cols_max)
+    rows = math.ceil(n / cols)
+    fig, axes = plt.subplots(
+        rows,
+        cols,
+        figsize=(col_in * cols + 0.8, row_in * rows + extra_in),
+        sharey=sharey,
+    )
+    return fig, np.atleast_1d(axes).ravel(), rows, cols
+
+
+def _reuse_xaxis(ax: plt.Axes, sweep: ReuseSweep) -> None:
+    ax.set_xticks(sweep.levels)
+    ax.set_xticklabels([f"{level * 100:.0f}%" for level in sweep.levels])
+
+
+def chart_reuse_throughput(sweep: ReuseSweep, styles, out_dir: Path) -> Chart | None:
+    rates = sweep_rates(sweep)
+    if not rates:
+        return None
+    fig, axes, *_ = _reuse_panels(len(rates))
+    layout(
+        fig, top_in=1.2, bottom_in=1.3, left=0.075, right=0.99, wspace=0.14, hspace=0.55
+    )
+    arms = sweep_arms(sweep)
+    for ax, rate in zip(axes, rates):
+        for arm in arms:
+            style = styles[arm]
+            xs, ys, los, his = [], [], [], []
+            for level in sweep.levels:
+                stat = sweep.benches[level].stat(
+                    arm, (rate, 0), client("output_throughput")
+                )
+                if stat is None:
+                    continue
+                xs.append(level)
+                ys.append(stat.mean)
+                los.append(stat.lo)
+                his.append(stat.hi)
+            if not xs:
+                continue
+            ax.plot(
+                xs,
+                ys,
+                color=style.color,
+                marker=style.marker,
+                label=display(arm),
+                dashes=style.dashes or (),
+                markeredgecolor=SURFACE,
+                zorder=3,
+            )
+            ax.fill_between(
+                xs, los, his, color=style.color, alpha=0.14, linewidth=0, zorder=1
+            )
+        style_axes(ax)
+        _reuse_xaxis(ax, sweep)
+        ax.set_title(f"rate={rate}", color=INK_2, fontsize=10, loc="left")
+        ax.set_ylim(bottom=0)
+    for ax in axes[len(rates) :]:
+        ax.set_visible(False)
+    axes[0].set_ylabel("Output throughput (generated tokens/s)")
+    figure_legend(fig, axes[0], ncol=len(arms))
+    titles(
+        fig,
+        "Output throughput across image-reuse levels",
+        "Each panel holds the request rate fixed and sweeps the image-reuse hit "
+        "rate; higher is better.",
+    )
+    source_note(fig, _reuse_note(sweep))
+    svg, png = _save(fig, out_dir, "09_reuse_throughput")
+    return Chart(
+        "09_reuse_throughput",
+        "Throughput vs image reuse",
+        "Client-observed generation rate at each reuse level, request rate held "
+        "fixed per panel. Bands span the min-max over reps.",
+        svg,
+        png,
+    )
+
+
+def chart_reuse_speedup(sweep: ReuseSweep, styles, out_dir: Path) -> Chart | None:
+    base = next(
+        (baseline_arm(b) for b in sweep.benches.values() if baseline_arm(b)), None
+    )
+    rates = sweep_rates(sweep)
+    if not base or not rates:
+        return None
+    arms = [a for a in sweep_arms(sweep) if a != base]
+    fig, axes, *_ = _reuse_panels(len(rates), sharey=True)
+    layout(
+        fig, top_in=1.2, bottom_in=1.3, left=0.075, right=0.99, wspace=0.14, hspace=0.55
+    )
+    for ax, rate in zip(axes, rates):
+        for arm in arms:
+            style = styles[arm]
+            xs, ys, errs = [], [], []
+            for level in sweep.levels:
+                bench = sweep.benches[level]
+                point = (rate, 0)
+                if not bench.rows(base, point):
+                    continue
+                stat = ratio_stat(bench, arm, base, point, client("output_throughput"))
+                if not stat.n or math.isnan(stat.mean):
+                    continue
+                xs.append(level)
+                ys.append(stat.mean)
+                errs.append(stat.err)
+            if not xs:
+                continue
+            ax.errorbar(
+                xs,
+                ys,
+                yerr=np.array(errs).T,
+                color=style.color,
+                marker=style.marker,
+                label=display(arm),
+                dashes=style.dashes or (),
+                markeredgecolor=SURFACE,
+                elinewidth=1.0,
+                capsize=3,
+                zorder=3,
+            )
+        ax.axhline(1.0, color=AXIS, linewidth=1.2, zorder=2)
+        style_axes(ax)
+        _reuse_xaxis(ax, sweep)
+        ax.set_title(f"rate={rate}", color=INK_2, fontsize=10, loc="left")
+        ax.margins(y=0.18)
+    for ax in axes[len(rates) :]:
+        ax.set_visible(False)
+    axes[0].set_ylabel(f"Output throughput / {base} (x)")
+    figure_legend(fig, axes[0], ncol=len(arms))
+    titles(
+        fig,
+        "Speedup over baseline across image-reuse levels",
+        "Each panel holds the request rate fixed; 1.0 = baseline at the same "
+        "rate and reuse level.",
+    )
+    source_note(fig, _reuse_note(sweep, "Ratios formed per rep, then averaged."))
+    svg, png = _save(fig, out_dir, "10_reuse_speedup")
+    return Chart(
+        "10_reuse_speedup",
+        "Speedup vs image reuse",
+        "Output throughput divided by the baseline's at the same rate and reuse "
+        "level. Whiskers span the min-max over reps.",
+        svg,
+        png,
+    )
+
+
+def chart_reuse_ttft(sweep: ReuseSweep, styles, out_dir: Path) -> Chart | None:
+    base = next(
+        (baseline_arm(b) for b in sweep.benches.values() if baseline_arm(b)), None
+    )
+    rates = sweep_rates(sweep)
+    if not base or not rates:
+        return None
+    arms = [a for a in sweep_arms(sweep) if a != base]
+    fig, axes, *_ = _reuse_panels(len(rates), sharey=True)
+    layout(
+        fig, top_in=1.2, bottom_in=1.3, left=0.075, right=0.99, wspace=0.14, hspace=0.55
+    )
+    panels = (("median_ttft_ms", "median", None), ("p99_ttft_ms", "p99", (4.0, 2.0)))
+    for ax, rate in zip(axes, rates):
+        for arm in arms:
+            style = styles[arm]
+            for key, name, dashes in panels:
+                xs, ys = [], []
+                for level in sweep.levels:
+                    bench = sweep.benches[level]
+                    point = (rate, 0)
+                    if not bench.rows(base, point):
+                        continue
+                    stat = ratio_stat(bench, arm, base, point, client(key))
+                    if not stat.n or math.isnan(stat.mean):
+                        continue
+                    xs.append(level)
+                    ys.append((1.0 - stat.mean) * 100)
+                if not xs:
+                    continue
+                ax.plot(
+                    xs,
+                    ys,
+                    color=style.color,
+                    marker=style.marker if name == "median" else None,
+                    dashes=dashes or (),
+                    label=display(arm) if name == "median" else None,
+                    markeredgecolor=SURFACE,
+                    zorder=3,
+                )
+        ax.axhline(0.0, color=AXIS, linewidth=1.2, zorder=2)
+        style_axes(ax)
+        _reuse_xaxis(ax, sweep)
+        ax.set_title(f"rate={rate}", color=INK_2, fontsize=10, loc="left")
+    for ax in axes[len(rates) :]:
+        ax.set_visible(False)
+    axes[0].set_ylabel("TTFT reduction vs baseline (%)")
+    figure_legend(fig, axes[0], ncol=len(arms))
+    titles(
+        fig,
+        "TTFT reduction across image-reuse levels",
+        "Each panel holds the request rate fixed; positive is a lower TTFT "
+        "than baseline. Solid = median, dashed = p99.",
+    )
+    source_note(fig, _reuse_note(sweep, "Ratios formed per rep, then averaged."))
+    svg, png = _save(fig, out_dir, "11_reuse_ttft")
+    return Chart(
+        "11_reuse_ttft",
+        "TTFT reduction vs image reuse",
+        "1 minus (arm TTFT / baseline TTFT) at the same rate and reuse level, "
+        "median and p99.",
+        svg,
+        png,
+    )
+
+
+def chart_reuse_mechanism(sweep: ReuseSweep, styles, out_dir: Path) -> Chart | None:
+    base = next(
+        (baseline_arm(b) for b in sweep.benches.values() if baseline_arm(b)), None
+    )
+    rates = sweep_rates(sweep)
+    if not base or not rates:
+        return None
+    arms = [a for a in sweep_arms(sweep) if a != base]
+    fig, axes, *_ = _reuse_panels(len(rates), col_in=2.7, row_in=3.6)
+    layout(
+        fig,
+        top_in=1.25,
+        bottom_in=1.35,
+        left=0.075,
+        right=0.94,
+        wspace=0.35,
+        hspace=0.6,
+    )
+    moved_color, avoided_color = "#2a78d6", "#1baf7a"
+    handles: dict[str, Any] = {}
+    for ax, rate in zip(axes, rates):
+        ax2 = ax.twinx()
+        for arm in arms:
+            xs_m, ys_m, xs_a, ys_a = [], [], [], []
+            for level in sweep.levels:
+                bench = sweep.benches[level]
+                point = (rate, 0)
+                if not bench.rows(arm, point):
+                    continue
+                load_bytes = bench.stat(arm, point, server("ec_load_bytes"))
+                save_bytes = bench.stat(arm, point, producer_save_bytes)
+                moved = (
+                    (load_bytes.mean if load_bytes else 0.0)
+                    + (save_bytes.mean if save_bytes else 0.0)
+                ) / 1e9
+                xs_m.append(level)
+                ys_m.append(moved)
+                ref = bench.stat(base, point, server("encoder_inputs_computed"))
+                got = bench.stat(arm, point, server("encoder_inputs_computed"))
+                if ref and got and ref.mean:
+                    xs_a.append(level)
+                    ys_a.append((1 - got.mean / ref.mean) * 100)
+            if xs_m:
+                (line,) = ax.plot(
+                    xs_m,
+                    ys_m,
+                    color=moved_color,
+                    marker="o",
+                    markeredgecolor=SURFACE,
+                    zorder=3,
+                    label="bytes moved (GB)",
+                )
+                handles.setdefault("bytes moved (GB)", line)
+            if xs_a:
+                (line,) = ax2.plot(
+                    xs_a,
+                    ys_a,
+                    color=avoided_color,
+                    marker="s",
+                    dashes=(4.0, 2.0),
+                    markeredgecolor=SURFACE,
+                    zorder=3,
+                    label="encoder inputs avoided (%)",
+                )
+                handles.setdefault("encoder inputs avoided (%)", line)
+        style_axes(ax)
+        ax2.grid(visible=False)
+        ax2.tick_params(length=0)
+        ax2.spines["top"].set_visible(False)
+        _reuse_xaxis(ax, sweep)
+        ax.set_title(f"rate={rate}", color=INK_2, fontsize=10, loc="left")
+        ax.set_ylim(bottom=0)
+        ax2.set_ylim(0, 100)
+    for ax in axes[len(rates) :]:
+        ax.set_visible(False)
+    axes[0].set_ylabel("Bytes moved over the connector (GB)")
+    fig.legend(
+        list(handles.values()),
+        list(handles),
+        loc="upper left",
+        bbox_to_anchor=(0.012, 1 - 0.62 / fig.get_figheight()),
+        ncol=2,
+        handlelength=1.8,
+        columnspacing=1.6,
+        borderaxespad=0.0,
+    )
+    titles(
+        fig,
+        "What the connector moved and avoided across image-reuse levels",
+        "Each panel holds the request rate fixed; left axis is bytes moved "
+        "(solid), right axis is encoder work avoided vs baseline (dashed).",
+    )
+    source_note(fig, _reuse_note(sweep))
+    svg, png = _save(fig, out_dir, "12_reuse_mechanism")
+    return Chart(
+        "12_reuse_mechanism",
+        "Mechanism vs image reuse",
+        "Counters from the servers' own logs: bytes moved over the connector "
+        "and encoder inputs the consumer skipped, vs baseline, at the same "
+        "rate and reuse level.",
+        svg,
+        png,
+    )
+
+
+def build_reuse_report(
+    sweep: ReuseSweep, charts: Sequence[Chart], styles: dict[str, ArmStyle], title: str
+) -> str:
+    first = sweep.benches[sweep.levels[0]]
+    args = first.docs[0].get("args", {})
+    arms = sweep_arms(sweep)
+
+    figures = "".join(
+        f'<figure id="{escape(c.name)}"><h3>{escape(c.title)}</h3>{c.svg}'
+        f"<figcaption>{escape(c.caption)}</figcaption></figure>"
+        for c in charts
+    )
+
+    headers = [
+        "reuse",
+        "arm",
+        "rate",
+        "reps",
+        "ttft p50 (ms)",
+        "ttft p99 (ms)",
+        "tpot (ms)",
+        "out tok/s",
+        "x base",
+        "loads",
+        "saves",
+        "enc inputs",
+    ]
+    body = []
+    for level in sweep.levels:
+        bench = sweep.benches[level]
+        base = baseline_arm(bench)
+        for row in table_rows(bench, base):
+            swatch = (
+                '<span class="swatch" style="background:'
+                f'{styles[row["arm"]].color}"></span>'
+            )
+            ratio = row["ratio"]
+            body.append(
+                [
+                    f"{level * 100:.0f}%",
+                    f"{swatch}{escape(display(row['arm']))}",
+                    escape(str(row["rate"])),
+                    str(row["reps"]),
+                    _fmt(row["ttft_p50"].mean if row["ttft_p50"] else None),
+                    _fmt(row["ttft_p99"].mean if row["ttft_p99"] else None),
+                    _fmt(row["tpot"].mean if row["tpot"] else None, 2),
+                    _fmt(row["out_tps"].mean if row["out_tps"] else None),
+                    f"{ratio.mean:.2f}" if ratio and ratio.n else "-",
+                    _fmt(row["loads"].mean if row["loads"] else None, 0),
+                    _fmt(row["saves"].mean if row["saves"] else None, 0),
+                    _fmt(row["inputs"].mean if row["inputs"] else None, 0),
+                ]
+            )
+
+    levels_text = ", ".join(f"{level * 100:.0f}%" for level in sweep.levels)
+    sources = sorted({p.name for b in sweep.benches.values() for p in b.sources})
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{escape(title)}</title><style>{CSS}</style></head>
+<body><div class="wrap">
+<header>
+<h1>{escape(title)} &mdash; image-reuse sweep</h1>
+<p class="sub">{escape(str(args.get("model", "")))} &middot;
+reuse levels: {escape(levels_text)} &middot;
+arms: {escape(", ".join(display(a) for a in arms))}</p>
+</header>
+
+<h2>Charts</h2>
+<p>Each chart holds the request rate fixed per panel and sweeps the
+image-reuse hit rate on the x axis, so the effect of reuse is visible
+independently of load.</p>
+{figures}
+
+<h2>The numbers</h2>
+<p>Mean over reps at each reuse level and rate. <em>x base</em> is output
+throughput relative to the baseline arm at the same rate and reuse level.</p>
+{_table(headers, body)}
+
+<footer>Generated by
+<code>scripts/cpu_ec_connector/bench/plot_results.py --reuse-sweep</code> from
+{escape(", ".join(sources))}. Charts are inline SVG; this page needs no
+network access.</footer>
+</div></body></html>
+"""
+
+
+# --------------------------------------------------------------------------
 # Report
 # --------------------------------------------------------------------------
 
@@ -2072,9 +2553,19 @@ def parse_args() -> argparse.Namespace:
         help="display name for an arm in every chart and table, e.g. "
         "cpu-grid='NIXL E/PD'; repeatable, overrides the built-in names",
     )
+    p.add_argument(
+        "--reuse-sweep",
+        nargs="+",
+        type=Path,
+        default=None,
+        metavar="BENCH_JSON",
+        help="bench.json files, one (or more reps) per image-reuse level, "
+        "keyed by manifest_expected.max_hit_rate; renders reuse_report.html "
+        "instead of the usual report.html",
+    )
     args = p.parse_args()
-    if not args.files and not args.demo:
-        p.error("give at least one bench.json, or --demo")
+    if not args.files and not args.demo and not args.reuse_sweep:
+        p.error("give at least one bench.json, --demo, or --reuse-sweep")
     for pair in args.label:
         arm, sep, name = pair.partition("=")
         if not sep or not name:
@@ -2087,6 +2578,26 @@ def main() -> int:
     args = parse_args()
     out_dir: Path = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.reuse_sweep:
+        sweep = load_reuse_sweep(args.reuse_sweep)
+        styles = arm_styles(sweep_arms(sweep))
+        with plt.rc_context(RC):
+            charts: list[Chart | None] = [
+                chart_reuse_throughput(sweep, styles, out_dir),
+                chart_reuse_speedup(sweep, styles, out_dir),
+                chart_reuse_ttft(sweep, styles, out_dir),
+                chart_reuse_mechanism(sweep, styles, out_dir),
+            ]
+        rendered = [c for c in charts if c is not None]
+        report = out_dir / "reuse_report.html"
+        report.write_text(build_reuse_report(sweep, rendered, styles, args.title))
+        print(
+            f"[plot] {len(rendered)} reuse-sweep charts and {report} "
+            f"from {len(args.reuse_sweep)} file(s), {len(sweep.levels)} reuse level(s)"
+        )
+        return 0
+
     files = list(args.files)
     if args.demo:
         files = write_demo(out_dir) + files

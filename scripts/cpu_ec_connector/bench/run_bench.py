@@ -81,6 +81,8 @@ _STOP_TIMEOUT_S = 180
 _DETACH_TIMEOUT_S = 120
 _PGID_READ_ATTEMPTS = 10
 _PGID_READ_DELAY_S = 1.0
+_MPS_CLIENT_ATTEMPTS = 5
+_MPS_CLIENT_DELAY_S = 1.0
 _EC_REGION_MARKER = "Created EC mmap file"
 _GPU_PROCESSOR_MARKER = "Running the multi-modal processor on cuda"
 # Either line proves the log belongs to a server that got as far as serving;
@@ -230,6 +232,7 @@ class BenchServer:
     extra_env: tuple[str, ...] = ()
     match: tuple[str, str] = ()
     log_path: str = field(init=False)
+    pgid: str = field(init=False, default="")
 
     def __post_init__(self) -> None:
         self.log_path = f"{self.args.work_dir}/logs/{self.name}.log"
@@ -399,6 +402,7 @@ class BenchServer:
                 break
             time.sleep(_PGID_READ_DELAY_S)
         if pgid.isdigit():
+            self.pgid = pgid
             print(f"[bench] {self.name} pid {pid}, process group {pgid}")
         else:
             print(
@@ -577,7 +581,42 @@ class BenchServer:
                 f"{self.name}: an EC region was created, so a connector is "
                 "active in an instance that is supposed to have none"
             )
+        if self.args.mps and self.name.startswith("encoder"):
+            self.verify_mps_client()
         print(f"[bench] verified {self.name} from {self.log_path}")
+
+    def verify_mps_client(self) -> None:
+        """Confirm this encoder actually registered with the MPS daemon.
+
+        A client that cannot reach the daemon (wrong pipe dir, daemon not
+        running) is not known to fail loudly -- CUDA_MPS_ACTIVE_THREAD_PERCENTAGE
+        would then silently do nothing and the run would measure ordinary
+        time-sliced sharing while believing it has an even SM split.
+
+        Retries briefly: /health answering does not guarantee every TP
+        worker has already opened its CUDA context and registered with MPS,
+        so a single immediate check can catch that startup gap rather than
+        an actual failure to join.
+        """
+        if not self.pgid:
+            raise RuntimeError(
+                f"{self.name}: no process group was recorded for it (see the "
+                "WARNING above), so its MPS membership cannot be checked"
+            )
+        for attempt in range(_MPS_CLIENT_ATTEMPTS):
+            clients = _mps_client_pids(self.target, self.args.mps_pipe_dir)
+            group_pids = set(
+                self.target.sh(f"ps -o pid= -g {self.pgid}", check=False).stdout.split()
+            )
+            if clients & group_pids:
+                return
+            if attempt + 1 < _MPS_CLIENT_ATTEMPTS:
+                time.sleep(_MPS_CLIENT_DELAY_S)
+        raise ServerMismatchError(
+            f"{self.name}: no process in its group ({self.pgid}) appears "
+            f"in the MPS daemon's client list at {self.args.mps_pipe_dir}; "
+            "it is not sharing the GPU through MPS"
+        )
 
     def reset_caches(self) -> None:
         """Drop the prefix and processor caches (VLLM_SERVER_DEV_MODE routes).
@@ -683,6 +722,55 @@ def _gpus(spec: str) -> list[str]:
     return [g.strip() for g in spec.split(",") if g.strip()]
 
 
+def ensure_mps_daemon(target: Target, args: argparse.Namespace) -> None:
+    """Start the CUDA MPS control daemon on the target, unless one is already
+    listening on `--mps-pipe-dir`.
+
+    A crashed daemon can leave its `control` pipe behind, so liveness is
+    checked by sending it a command rather than by the pipe's existence.
+
+    This only starts the daemon; the GPU's compute mode must already be
+    EXCLUSIVE_PROCESS (`nvidia-smi -c EXCLUSIVE_PROCESS`, needs root), which
+    this harness does not set.
+    """
+    pipe_dir, log_dir = shlex.quote(args.mps_pipe_dir), shlex.quote(args.mps_log_dir)
+    alive = target.sh(
+        f"echo get_server_list | CUDA_MPS_PIPE_DIRECTORY={pipe_dir} "
+        "timeout 5 nvidia-cuda-mps-control >/dev/null 2>&1 && echo yes || echo no",
+        check=False,
+    ).stdout.strip()
+    if alive != "yes":
+        target.sh(
+            f"mkdir -p {pipe_dir} {log_dir} && "
+            f"CUDA_MPS_PIPE_DIRECTORY={pipe_dir} CUDA_MPS_LOG_DIRECTORY={log_dir} "
+            "nvidia-cuda-mps-control -d"
+        )
+        print(f"[bench] started MPS control daemon (pipe dir {args.mps_pipe_dir})")
+    # A daemon this harness finds already running (left over from an earlier
+    # arm, or an earlier invocation entirely) may carry a
+    # set_default_active_thread_percentage below 100 from some prior session;
+    # a client's own CUDA_MPS_ACTIVE_THREAD_PERCENTAGE can only narrow that
+    # ceiling, never raise it, so every encoder's requested share would be
+    # silently capped further. Pin the ceiling back to 100 unconditionally.
+    target.sh(
+        "echo set_default_active_thread_percentage 100 | "
+        f"CUDA_MPS_PIPE_DIRECTORY={pipe_dir} nvidia-cuda-mps-control >/dev/null"
+    )
+
+
+def _mps_client_pids(target: Target, pipe_dir: str) -> set[str]:
+    """Every PID the MPS daemon at `pipe_dir` currently lists as a client."""
+    quoted = shlex.quote(pipe_dir)
+    out = target.sh(
+        "for srv in $(echo get_server_list | "
+        f"CUDA_MPS_PIPE_DIRECTORY={quoted} nvidia-cuda-mps-control); do "
+        f"echo get_client_list $srv | CUDA_MPS_PIPE_DIRECTORY={quoted} "
+        "nvidia-cuda-mps-control; done",
+        check=False,
+    ).stdout
+    return {tok for tok in out.split() if tok.isdigit()}
+
+
 def build_system(
     target: Target,
     args: argparse.Namespace,
@@ -721,11 +809,14 @@ def build_system(
             )
     if args.decode_port == args.proxy_port:
         raise SystemExit("[bench] --decode-port and --proxy-port are the same")
+    if args.mps:
+        ensure_mps_daemon(target, args)
 
     encoders: list[BenchServer] = []
     for index, group in enumerate(groups):
+        gpu_share = max(share[gpu] for gpu in group)
         util = args.encoder_gpu_memory_utilization or round(
-            args.gpu_memory_utilization / max(share[gpu] for gpu in group), 3
+            args.gpu_memory_utilization / gpu_share, 3
         )
         env: tuple[str, ...] = ()
         if arm.connector == "ECCPUConnector":
@@ -734,6 +825,13 @@ def build_system(
             env = (
                 f"VLLM_EC_SIDE_CHANNEL_HOST={args.side_channel_host}",
                 f"VLLM_EC_SIDE_CHANNEL_PORT={args.side_channel_port + index}",
+            )
+        if args.mps:
+            # An equal SM share alongside the equal memory share `util`
+            # already gives it: with 4 encoders on one GPU each gets 25%.
+            env += (
+                f"CUDA_MPS_PIPE_DIRECTORY={args.mps_pipe_dir}",
+                f"CUDA_MPS_ACTIVE_THREAD_PERCENTAGE={round(100 / gpu_share)}",
             )
         # The encoder needs a token budget several images deep or it can never
         # batch two image requests, which pins it to one image per step and
@@ -1551,8 +1649,9 @@ def add_single_node_options(p: argparse.ArgumentParser) -> None:
         default="0",
         help="one encoder instance per `;`-separated group, each group a "
         "comma-separated GPU list whose length is that encoder's tensor-parallel "
-        "size: '0;0' is two encoders sharing GPU 0 (they split its memory), "
-        "'0,1;2,3' is two TP=2 encoders. Accepts indices or MIG UUIDs",
+        "size: '0;0' is two encoders sharing GPU 0 (they split its memory, and "
+        "with --mps its SMs too), '0,1;2,3' is two TP=2 encoders. Accepts "
+        "indices or MIG UUIDs",
     )
     epd.add_argument(
         "--encoder-gpu-memory-utilization",
@@ -1560,6 +1659,27 @@ def add_single_node_options(p: argparse.ArgumentParser) -> None:
         default=0.0,
         help="per-encoder memory share; 0 divides --gpu-memory-utilization by "
         "the number of encoders sharing that device",
+    )
+    epd.add_argument(
+        "--mps",
+        action="store_true",
+        help="split a shared GPU's SMs evenly across the encoders on it via "
+        "CUDA MPS instead of time-slicing (CUDA_MPS_ACTIVE_THREAD_PERCENTAGE "
+        "= 100 / encoders sharing that device), and start the MPS control "
+        "daemon on the target if one is not already running at "
+        "--mps-pipe-dir. The GPU's compute mode must already be "
+        "EXCLUSIVE_PROCESS (`nvidia-smi -c EXCLUSIVE_PROCESS`, needs root); "
+        "this only starts the daemon",
+    )
+    epd.add_argument(
+        "--mps-pipe-dir",
+        default="/tmp/nvidia-mps",
+        help="CUDA_MPS_PIPE_DIRECTORY for the control daemon and every client",
+    )
+    epd.add_argument(
+        "--mps-log-dir",
+        default="/tmp/nvidia-mps-log",
+        help="CUDA_MPS_LOG_DIRECTORY for the control daemon",
     )
     epd.add_argument(
         "--decode-gpu",

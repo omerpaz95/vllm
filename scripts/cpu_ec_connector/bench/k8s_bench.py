@@ -1208,6 +1208,12 @@ def parse_args() -> argparse.Namespace:
     args.side_channel_host = "$(POD_IP)"
     args.frag = False
     args.patch_dir = ""
+    # --mps and its two directories are single-node-only options (added by
+    # run_bench.add_single_node_options, which this parser never calls);
+    # BenchServer.verify() reads args.mps unconditionally for every server.
+    args.mps = False
+    args.mps_pipe_dir = ""
+    args.mps_log_dir = ""
     gpus = ",".join(str(i) for i in range(args.decode_gpus))
     args.gpu = args.decode_gpu = gpus
     args.encoder_devices = ";".join(
