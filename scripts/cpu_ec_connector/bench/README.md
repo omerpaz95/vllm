@@ -163,6 +163,14 @@ python run_bench.py --workload-dir /data/wl-muir --out-dir results \
    process group appears in the MPS daemon's own client list
    (`get_client_list`) and raises rather than letting the run continue if
    not.
+5. **Keeps decode and the single-instance arms off MPS.** Only encoders are
+   meant to be MPS clients; nothing about decode or `baseline`/`offload`
+   shares a GPU with anything else. But `CUDA_MPS_PIPE_DIRECTORY` alone is
+   enough for any CUDA process to join MPS, and a shell an earlier manual
+   `nvidia-cuda-mps-control` session touched can leave it exported ambiently
+   — so their launch explicitly runs under `env -u CUDA_MPS_PIPE_DIRECTORY
+   -u CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`, stripping both regardless of what
+   the shell already has, rather than just not setting them.
 
 ### What it does not do
 

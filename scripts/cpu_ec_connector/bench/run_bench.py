@@ -83,6 +83,10 @@ _PGID_READ_ATTEMPTS = 10
 _PGID_READ_DELAY_S = 1.0
 _MPS_CLIENT_ATTEMPTS = 5
 _MPS_CLIENT_DELAY_S = 1.0
+# Stripped from a server that must never become an MPS client, regardless of
+# what an ambient shell already exports -- CUDA_MPS_PIPE_DIRECTORY alone is
+# enough for a CUDA process to join MPS on its own GPU unintentionally.
+_MPS_ENV_VARS = ("CUDA_MPS_PIPE_DIRECTORY", "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE")
 _EC_REGION_MARKER = "Created EC mmap file"
 _GPU_PROCESSOR_MARKER = "Running the multi-modal processor on cuda"
 # Either line proves the log belongs to a server that got as far as serving;
@@ -231,6 +235,7 @@ class BenchServer:
     extra_args: tuple[str, ...] = ()
     extra_env: tuple[str, ...] = ()
     match: tuple[str, str] = ()
+    unset_env: tuple[str, ...] = ()
     log_path: str = field(init=False)
     pgid: str = field(init=False, default="")
 
@@ -311,11 +316,18 @@ class BenchServer:
         # background the whole `&&` list as one subshell, so `$!` would name
         # that subshell and `d` would race its `mkdir`.
         inner = f"echo $$ > {self.pgid_file}; exec " + " ".join(serve)
+        # `env -u` strips a var an ambient shell may already carry (e.g.
+        # CUDA_MPS_PIPE_DIRECTORY exported outside this harness) rather than
+        # merely not setting it, since a server this isn't meant for must not
+        # become an MPS client by accident of whatever's in the environment.
+        unset = "".join(f"-u {v} " for v in self.unset_env)
+        launcher = f"env {unset}" if unset else ""
         return "\n".join(
             [
                 f"mkdir -p {self.args.work_dir}/logs && cd {self.args.work_dir} "
                 "|| exit 1",
-                " ".join(env)
+                f"{launcher}"
+                + " ".join(env)
                 + f" setsid bash -c {shlex.quote(inner)}"
                 + f" < /dev/null > {self.log_path} 2>&1 &",
                 f"echo $! > {self.pid_file}; disown",
@@ -801,6 +813,7 @@ def build_system(
             tp=len(_gpus(args.gpu)),
             ec_config=_connector_config(args, arm, "ec_both"),
             extra_args=tuple(filter(None, [args.decode_serve_args])),
+            unset_env=_MPS_ENV_VARS if args.mps else (),
         )
         return System(front=server, consumer=server)
 
@@ -894,6 +907,7 @@ def build_system(
         # is what a rewritten request is made of. Set in every EPD arm: a flag
         # that differs between arms is a confound rather than a switch.
         extra_args=tuple(filter(None, ["--enable-mm-embeds", args.decode_serve_args])),
+        unset_env=_MPS_ENV_VARS if args.mps else (),
     )
     encode_urls = ",".join(e.base_url for e in encoders)
     proxy_cmd = " ".join(
