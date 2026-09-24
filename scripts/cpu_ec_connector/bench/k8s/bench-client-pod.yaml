@@ -1,0 +1,23 @@
+# The load generator: the same image without a GPU, holding the PVC and the
+# bench scripts. Everything the driver runs in-cluster goes through `oc exec`
+# into this pod.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: RENDERED
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsUser: 0
+  containers:
+  - name: client
+    image: RENDERED
+    imagePullPolicy: Always
+    command: ["sleep", "infinity"]
+    env: []
+    resources:
+      requests:
+        cpu: "4"
+        memory: 16Gi
+    volumeMounts: []
+  volumes: []

@@ -1,0 +1,466 @@
+# EC connector benchmark
+
+Measures the encoder-cache (EC) connectors on a multimodal serving workload:
+whether offloading or transferring encoder outputs beats recomputing them,
+and how the CPU/NIXL transport compares to the reference shared-filesystem
+one. Everything runs against `main`; no patches to vLLM are needed.
+
+## Arms
+
+| arm | topology | connector | decode instance receives |
+| --- | --- | --- | --- |
+| `baseline` | one instance | none | n/a, encodes and decodes itself |
+| `offload` | one instance | `ECCPUConnector`, `ec_both` | n/a, repeats reload from the CPU region |
+| `cpu-data` | encoder + decode | `ECCPUConnector` over NIXL | pixels + `ec_transfer_params` |
+| `cpu-grid` | encoder + decode | `ECCPUConnector` over NIXL | `image_grid_thw` + `ec_transfer_params` |
+| `example-data` | encoder + decode | `ECExampleConnector` | pixels + `ec_transfer_params` |
+| `example-grid` | encoder + decode | `ECExampleConnector` | grid + `ec_transfer_params` |
+
+`data` vs `grid` isolates what the grid substitution (PR #50390) saves with
+the transport held fixed; `cpu` vs `example` compares the transports. The
+`data` arms are the EPD proxy's `--no-rewrite` mode: the proxy attaches the
+connector's handles to the decode body whether or not it rewrites, so the
+CPU connector's consumer can locate the producer's entry either way.
+
+`x_base` compares whatever GPU sets `--gpu`, `--encoder-devices` and
+`--decode-gpu` gave each arm, so a baseline on one GPU against an EPD pair
+on two credits disaggregation with the extra hardware; give the baseline the
+same GPU list as the decode instance for a resource-matched comparison.
+
+## Files
+
+| file | role |
+| --- | --- |
+| `gen_workload.py` | builds the image pool, the `custom_image` JSONL, `warmup.jsonl` and `manifest.json` |
+| `hf_workload.py` | the same directory from a Hugging Face dataset (DocVQA, MuirBench, VisionArena-Chat, any image column) |
+| `plot_results.py` | charts (PNG + SVG) and a self-contained `report.html` from one or more `bench.json` |
+| `run_bench.py` | server lifecycle, load driving, log accounting, gates, table |
+| `k8s_bench.py` + `k8s/` | the same arms on OpenShift with encoder and decode on different nodes; see [`k8s/README.md`](k8s/README.md). `test_k8s_bench.py` checks the rendered manifests |
+| `ec_log_stats.py` | log parsers: EC transfers (both connectors), encoder inputs, proxy `STAGE` lines, rewrite counts |
+| `phase0_hit_check.py` | correctness gate for one `ec_both` instance: a repeat pass must reload, not recompute |
+| `micro_swap_blocks.py` | descriptor-layout microbenchmark of the region's batched copies |
+| `patches/sitecustomize.py` | on PYTHONPATH for every server `run_bench.py` launches: raises the connector's transfer accounting to INFO so the servers can run at INFO. Under `--frag` it also counts descriptors, wrapping `_coalesce_runs` without touching the connector |
+| `sitecustomize.py` (optional, not in the tree) | if present, `k8s_bench.py` ships it to every pod and every interpreter there auto-imports it: a connector monkeypatch without an image rebuild. `deferred_fails` in `bench.json` counts its `deferred-fail tally=` lines |
+
+## Running
+
+```bash
+# 1. Workload: 96 images at 2048x2048, 400 requests, zipf reuse. The default
+#    --photo-source is `synth`: generated fractal noise, no download, each
+#    image's JPEG calibrated to 0.17 MB/MP (what a real-photo pool measured
+#    at q85), about 2.5 s of CPU per image, rendered on --jobs cores at
+#    once (default: all of them, up to 16). `dir:<path>` uses a directory of photos
+#    (searched recursively; add --allow-upscale for sources smaller than the
+#    bucket) and `hf-tar:<repo>[:<file>]` streams a tar.gz from Hugging Face.
+python gen_workload.py --out-dir /data/wl --pool-size 96 \
+    --buckets 2048x2048:1.0 --num-requests 400 --reuse zipf:1.1 --self-check
+
+#    Or fix the share of repeated images outright: exactly 30% of the image
+#    references repeat an earlier image. The pool is sized to match, so
+#    --pool-size is not needed (see "Reuse and region size").
+python gen_workload.py --out-dir /data/wl-30 \
+    --buckets 2048x2048:1.0 --num-requests 400 --reuse exact:0.3 --self-check
+
+#    The same pool from real LSDIR photos (gated on Hugging Face, academic
+#    research licence; needs a token whose account accepted the terms, and
+#    `env -u HF_TOKEN` if a stored login should win over the environment):
+python gen_workload.py --photo-source hf-tar:ofsoundof/LSDIR:shard-00.tar.gz \
+    --allow-upscale --out-dir /data/wl --pool-size 96 \
+    --buckets 2048x2048:1.0 --num-requests 400 --reuse zipf:1.1 --self-check
+
+# 2. Always dry-run first: it prints every launch command and the load
+#    command, and has caught port collisions before they cost a run.
+python run_bench.py --workload-dir /data/wl --out-dir results --dry-run
+
+# 3. Sweep concurrency across all six arms, fresh servers per load point.
+python run_bench.py --workload-dir /data/wl --out-dir results \
+    --max-concurrency 1,4,8 --num-prompts 120 --restart-per-load-point
+
+# A larger model: GPU lists set the tensor-parallel size of every instance.
+# Here the baseline and the decode instance get TP=4 and two TP=2 encoders
+# share GPUs 0-3; --serve-args / --encoder-serve-args / --decode-serve-args
+# pass anything else through to `vllm serve`.
+python run_bench.py --model Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 \
+    --gpu 0,1,2,3 --encoder-devices "0,1;2,3" --decode-gpu 4,5,6,7 \
+    --workload-dir /data/wl --out-dir results --max-concurrency 1,4,8
+
+# Inside a pod (oc): the servers and the load generator run there.
+python run_bench.py --pod my-pod --python /venv/bin/python \
+    --vllm-repo /workspace/vllm --work-dir /workspace/ec_bench \
+    --workload-dir /workspace/wl --out-dir results --arms cpu-grid,example-grid
+```
+
+`--frag` runs the `offload` arm with a region smaller than the working set
+and descriptor counting on, to see whether entries still collapse to one
+descriptor after the region has churned.
+
+`--patch-dir` must point at `patches/` **on the target**, for every run and not
+only `--frag`: the servers load its `sitecustomize.py` to get the connector's
+transfer accounting at INFO. With `--pod` the directory has to already exist in
+the pod; `verify()` fails the arm by name if the servers never loaded it.
+
+The archived real-photo results used `hf-tar:ofsoundof/LSDIR:shard-00.tar.gz`,
+which is gated and licensed for academic research only. Every measured
+quantity is pixel-count driven, and an EC entry's size is purely resolution
+(5,329 embeddings x 7,168 B = 38.2 MB at 2048x2048), so what a source has to
+get right is the JPEG size that sets wire payload and decode time; the
+synthetic source is calibrated to that, and an enlarged photo compresses the
+same as a native crop.
+
+## MPS: an even SM (and memory) split across encoders on one GPU
+
+Encoders sharing a GPU (`--encoder-devices "0;0;0;0"`) are time-sliced by
+default: the driver's default compute mode round-robins whichever encoder's
+kernels are ready, with no fairness guarantee, so one busy encoder can starve
+the other three. `--mps` switches that sharing from time-slicing to CUDA's
+Multi-Process Service (MPS), which gives each encoder its own soft-capped
+share of the GPU's SMs instead.
+
+```bash
+python run_bench.py --workload-dir /data/wl-muir --out-dir results \
+    --encoder-devices "0;0;0;0" --mps --arms baseline,cpu-grid \
+    --max-concurrency 1,4,8
+```
+
+### What `--mps` actually does
+
+1. **Starts (or reuses) an MPS control daemon on the target.** `ensure_mps_daemon`
+   checks whether a daemon is already listening at `--mps-pipe-dir` by asking
+   it for its server list (`echo get_server_list | ... nvidia-cuda-mps-control`)
+   rather than by checking whether the pipe file exists — a crashed daemon can
+   leave that file behind, and a check that only looked for the file would
+   mistake a dead daemon for a live one. If none answers, it starts one:
+   `nvidia-cuda-mps-control -d` with `CUDA_VISIBLE_DEVICES` cleared and
+   `CUDA_MPS_PIPE_DIRECTORY`/`CUDA_MPS_LOG_DIRECTORY` set to
+   `--mps-pipe-dir`/`--mps-log-dir`. Clearing `CUDA_VISIBLE_DEVICES` matters
+   on a multi-GPU node: if it were left at whatever's ambient (a Kubernetes
+   GPU device plugin commonly sets one, often by UUID), the daemon would
+   remap its device ordinals to that subset, and every encoder's own numeric
+   `--encoder-devices` index would only land on the right physical GPU by
+   coincidence. Clearing it makes the daemon see every device node this
+   container actually has, in physical order — the same order every
+   encoder's index already assumes.
+2. **Pins the daemon's default thread-percentage ceiling to 100.** A reused
+   daemon may carry a `set_default_active_thread_percentage` below 100 from
+   some earlier session (that setting lives on the daemon, not any one
+   client), and a client's own percentage can only narrow that ceiling, never
+   raise it — so every encoder's requested share would be silently capped
+   further. `ensure_mps_daemon` resets it unconditionally, whether the
+   daemon was just started or found already running.
+3. **Gives each encoder an equal share.** For each encoder, `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`
+   is set to `100 / gpu_share`, where `gpu_share` is how many encoder groups
+   share that physical GPU — the same count `--encoder-devices` already uses
+   to divide `--gpu-memory-utilization` for the memory split. Four encoders
+   on one GPU: 25% SM share each, alongside the ~25% memory share they
+   already got. `CUDA_MPS_PIPE_DIRECTORY` is set to match the daemon's, since
+   a mismatch there is how a client fails to find the daemon at all.
+4. **Verifies each encoder actually joined MPS.** Nothing in the driver's own
+   behavior is confirmed to make a client that cannot reach the daemon (wrong
+   pipe dir, daemon not running) fail loudly — the failure mode most sources
+   describe is a silent fallback to ordinary, non-MPS execution, which would
+   let a run measure plain time-sliced sharing while believing it has an even
+   split. `verify()` cross-checks, for every encoder, that some PID in its
+   process group appears in the MPS daemon's own client list
+   (`get_client_list`) and raises rather than letting the run continue if
+   not.
+5. **Keeps decode and the single-instance arms off MPS.** Only encoders are
+   meant to be MPS clients; nothing about decode or `baseline`/`offload`
+   shares a GPU with anything else. But `CUDA_MPS_PIPE_DIRECTORY` alone is
+   enough for any CUDA process to join MPS, and a shell an earlier manual
+   `nvidia-cuda-mps-control` session touched can leave it exported ambiently
+   — so their launch explicitly runs under `env -u CUDA_MPS_PIPE_DIRECTORY
+   -u CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`, stripping both regardless of what
+   the shell already has, rather than just not setting them.
+
+### What it does not do
+
+- **It does not set the GPU's compute mode, and does not need to.** MPS's
+  single-user workflow (one pod holding the GPU exclusively, which is what
+  this harness assumes) runs in the driver's ordinary `Default` compute mode
+  — confirmed by `nvidia-smi` showing `Compute M.: Default` while the MPS
+  server and its clients are up and running, clients tagged `M+C` (versus
+  plain `C` for a non-MPS process). `EXCLUSIVE_PROCESS` is only NVIDIA's
+  documented **multi-user** MPS setup; nothing here needs it, and this
+  harness does not set it.
+- **It does not stop the daemon.** The daemon is meant to be a long-lived,
+  per-node service and this harness treats it that way: it outlives every
+  arm and load point in a run, and outlives the run itself. If you reset the
+  GPU's compute mode back to `DEFAULT` between runs, the daemon started under
+  the old mode is still sitting at `--mps-pipe-dir` and will be reused as-is;
+  remove that directory (or point `--mps-pipe-dir` elsewhere) if encoders
+  start failing right after such a reset.
+- **It does not add an MPS-level memory cap.** The equal memory split comes
+  entirely from dividing vLLM's own `--gpu-memory-utilization` budget
+  (`--encoder-gpu-memory-utilization` overrides it) — a software-side
+  allocation limit inside vLLM, not anything MPS enforces. MPS has a
+  `CUDA_MPS_PINNED_DEVICE_MEM_LIMIT` env var for capping pinned memory per
+  client, but it does not cover ordinary device allocations, and CUDA 13.0
+  (this repo's target) predates MPS's newer cgroup-based device-memory
+  partitioning (`nvidia-smi memory-limits`, which needs CUDA 13.4+) — so
+  there is currently no MPS-side backstop if vLLM's own accounting is off.
+- **It does not use Hopper's static SM partitioning.** H100 and newer GPUs
+  support a separate, hard-isolation feature (`sm-partition create`, in
+  8-SM chunks) that reserves SMs exclusively per client instead of a soft
+  percentage cap the scheduler can still let one client exceed briefly. It's
+  a stronger guarantee than `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`, at the cost
+  of H100's 132 SMs not dividing evenly into 8-SM chunks across an arbitrary
+  encoder count; not used here, but worth reaching for if the percentage-based
+  split ever looks less even than expected in practice. It also lives on a
+  different control surface than what this harness speaks (see below), so
+  reaching for it means more than adding one more `echo` command.
+
+### v2, not v3
+
+Everything above runs against the **legacy MPS v2 control interface**:
+`nvidia-cuda-mps-control -d` starts it, and from then on the *only* way to
+talk to it is by piping a command into a second, foreground invocation —
+`echo "<command>" | CUDA_MPS_PIPE_DIRECTORY=<dir> nvidia-cuda-mps-control` —
+which is exactly what `ensure_mps_daemon`, `_mps_client_pids`, and
+`verify_mps_client` all do. MPS v3 is a separate interface with its own
+subcommand-style CLI (`nvidia-cuda-mps-control client list`, `sm-partition
+create`, a config file, namespaces) that this harness does not speak and a
+v2 daemon does not answer — `sm-partition create` above is a v3-only
+command, not a fourth pipe command you could add to this codebase's existing
+calls. Moving to it would mean starting the daemon differently, not just
+sending it new commands.
+
+## CPU threads: dividing the pod's cores across encoders too
+
+Encoders sharing a GPU also share the pod's CPU budget, and nothing splits
+that by default: a TP=1, `--mm-encoder-only` instance runs under vLLM's
+`UniProcExecutor`, which never sets `OMP_NUM_THREADS` (that oversubscription
+guard -- `available_cpu_count() // num_local_procs` -- only exists in the
+multiprocess/TP>1 executor path). Left alone, every encoder on the pod
+independently sizes its own OpenMP/torch thread pool to the whole visible
+core count, so four encoders on a 128-core pod can mean four processes each
+defaulting toward ~128 threads at once. Under load that oversubscription can
+surface as `libgomp: Thread creation failed: Resource temporarily
+unavailable` followed by a segfault in unrelated-looking code -- a failed
+`pthread_create()` mid-thread-pool-init can leave C++ state half-built, and
+the next tensor op to touch it crashes instead of raising a clean exception.
+
+`--encoder-omp-threads` sets `OMP_NUM_THREADS` per encoder; 0 (the default)
+divides the target's `nproc` evenly across however many encoders
+`--encoder-devices` names, mirroring how `--gpu-memory-utilization` is
+already divided by `gpu_share`. Before assuming this is the cause of a given
+crash, check the numbers a static limit wouldn't show:
+
+```bash
+nproc                                          # what run_bench.py divides
+ps -eLf | wc -l                                # total threads this pod can see
+cat /proc/sys/kernel/threads-max                # host-wide ceiling (not namespaced)
+```
+
+## Real datasets
+
+`vllm bench serve` supports a handful of Hugging Face datasets natively, but
+none of them repeats an image across requests or carries more than one
+image per request, and MuirBench is not among them. `hf_workload.py`
+converts a dataset into this directory layout instead, deduplicating images
+by pixel hash so shared images become reuse, and the manifest then reports
+the reuse the dataset actually has.
+
+| dataset | reuse (refs per distinct image) | why |
+| --- | --- | --- |
+| `lmms-lab/DocVQA` (config `DocVQA`, validation) | ~4.2x, scanned pages of ~10k embeddings | the primary choice: high-resolution images asked about repeatedly is the pattern the connector exists for |
+| `lmms-lab/DocVQA` (config `InfographicVQA`) | ~5.6x, images that hit `max_pixels` | fewer, much larger entries |
+| `MUIRBENCH/MUIRBENCH` (test) | ~1.6x, only within counterpart pairs | 4.3 images per request: the fan-out arm, where one request can occupy several encoders. Do not expect it to move the offload numbers |
+| `lmarena-ai/VisionArena-Chat` | ~1x as vLLM uses it, 2-3x with `--expand-turns` | real user images and multi-turn conversations |
+
+```bash
+uv pip install datasets
+python hf_workload.py --dataset lmms-lab/DocVQA --subset DocVQA \
+    --split validation --out-dir /data/wl-docvqa --max-samples 1200
+python hf_workload.py --out-dir /data/wl-muir --max-samples 600 \
+    --max-embeds-per-request 28000   # MuirBench; see the cap note below
+python run_bench.py --workload-dir /data/wl-docvqa --out-dir results \
+    --arms baseline,offload,cpu-grid --max-concurrency 1,4,8
+```
+
+MuirBench is the fan-out workload: give it several encoders, for example
+`--encoder-devices "0;0;0;0"` (four `--mm-encoder-only` encoders sharing
+GPU 0), so a 4-image request can occupy them all. `--num-prompts` replays
+only the first lines of the file, so the reuse a run sees is the reuse
+within that prefix; for the DocVQA story run the whole file at least once.
+
+Encoders sharing a GPU are time-sliced by default; add `--mps` to divide the
+GPU's SMs evenly across them via CUDA MPS instead — see
+[MPS: an even SM (and memory) split across encoders on one GPU](#mps-an-even-sm-and-memory-split-across-encoders-on-one-gpu).
+
+On the multi-node harness the conversion runs inside the client pod and
+lands on the PVC, so every later run reuses it:
+
+```bash
+python k8s_bench.py --namespace my-ns --out-dir results/docvqa \
+    --arms baseline,cpu-data,cpu-grid --max-concurrency 1,4,8 \
+    --workload-dir /bench/wl-docvqa \
+    --hf-workload "--dataset lmms-lab/DocVQA --subset DocVQA --split validation --max-samples 1200"
+python k8s_bench.py --namespace my-ns --out-dir results/muir \
+    --arms baseline,cpu-grid --num-encoders 4 --max-concurrency 1,4,8 \
+    --workload-dir /bench/wl-muir \
+    --hf-workload "--dataset MUIRBENCH/MUIRBENCH --split test --max-samples 600 --max-embeds-per-request 28000"
+```
+
+A multi-image request whose images together outgrow the decode instance's
+`--max-model-len` (32768 by default) is rejected by every arm alike, and one
+such request fails the completion gate for the whole point. MuirBench has a
+few: `--max-embeds-per-request 28000` drops them at conversion (the
+converter reports how many), and the bench refuses to start when the
+manifest's largest request cannot fit the context window.
+
+The real downloads were not exercised where this was written (no access to
+huggingface.co), so the MuirBench column names are auto-detected with
+`--image-column`/`--question-column` as the override. The manifest the
+converter writes reports the reuse the dataset actually has; check its
+`max_hit_rate` before reading anything else.
+
+## Charts and report
+
+```bash
+uv pip install matplotlib regex
+python plot_results.py --out-dir report results/rep1/bench.json results/rep2/bench.json
+python plot_results.py --out-dir report_demo --demo   # synthetic fixture, no hardware
+```
+
+Several files are treated as replications: lines show the mean with min-max
+bands. `report.html` embeds every chart, an executive summary computed from
+the data, the full table and a validity section (completion, queue depth,
+rewrite coverage, the encoder-compute gate).
+
+## Multi-node
+
+`k8s_bench.py` runs the same arms on OpenShift with the encoder(s) and the
+decode instance forced onto different nodes, the CPU connector crossing
+nodes over NIXL and the example connector over a ReadWriteMany PVC. Model,
+image, GPU counts per role and storage class are flags. See
+[`k8s/README.md`](k8s/README.md); nothing there has run on a cluster yet.
+
+## What is gated
+
+A run that fails any of these raises instead of printing a delta, because the
+timings would then measure something other than the arm's name:
+
+- every request completed (`completed == num_prompts`)
+- each server's fresh log carries a startup line, and for the CPU connector
+  the region creation line tagged with this run's engine id (a survivor
+  from the previous arm would otherwise answer `/health`)
+- connector arms loaded entries on the consumer; the baseline loaded none
+- `grid` arms rewrote at least `--min-rewrite-coverage` of the image
+  references; `data` arms rewrote nothing
+- with several encoders, each computed something
+- the encoder's image transform ran on the requested `--mm-processor-device`
+- after the run, every connector arm's consumer computed fewer encoder inputs
+  than the baseline at the same load point
+
+## Reuse and region size
+
+The two knobs that decide what the connector can do for a run.
+
+**Reuse** is the share of image references that repeat an image an earlier
+request already used. Only a repeat can be served from the connector; a
+first appearance is always encoded. `gen_workload.py` builds it one of two
+ways:
+
+- `--reuse exact:F` sets it directly: exactly the fraction `F` of all image
+  references are repeats (`exact:0.3` means 30%). First appearances are
+  spread evenly through the run, so the share is the same early and late,
+  and each repeat picks one of the images seen so far, all equally likely.
+  The pool is sized to the number of distinct images this needs, so
+  `--pool-size` is ignored. Repeats are counted over image references, not
+  requests: `--mm-fraction` still decides how many requests carry no image
+  at all. The figure is exact to one image unless the widest request needs
+  more distinct images than the share allows, which the generator warns
+  about. Generating many distinct images takes time: 400 requests at
+  `exact:0.25` need about 350 images, a few minutes on a many-core box and
+  about 15 minutes on four cores; the generator prints progress.
+- `--reuse zipf:A`, `uniform` or `none` draw each request's image from a
+  pool of `--pool-size` images, and the reuse is whatever comes out. With
+  `uniform` every pool image is equally likely, so the share of repeats is
+  fixed by how many draws there are per image: 400 requests over 96 images
+  repeat a lot (about 76%), over 400 images much less (about 40%). `zipf:A`
+  makes a few images far more popular than the rest, the way real traffic
+  has a handful of images that everyone sends; a larger `A` concentrates
+  more of the requests on fewer images, so more repeats. `none` walks the
+  pool in order and only repeats once the requests outnumber the pool.
+
+Either way the manifest's `expected.max_hit_rate` is the figure that came
+out, and `run_bench.py` prints it at startup. It is a ceiling: the
+connector serves a repeat only if its entry is still in the region.
+
+**Region size** is `--ec-cpu-bytes` on `run_bench.py` and `k8s_bench.py`,
+the `ec_cpu_bytes` the CPU connector is given. It takes bytes, a size
+(`8GiB`, `512MiB`, `2GB`) or a multiple of the workload's working set
+(`0.5x`), the working set being the bytes every distinct image's embeddings
+occupy at once. The default is `1.25x`, so nothing is ever evicted and the
+measured hit rate can reach the manifest's ceiling. Below `1x` the region
+evicts in first-in-first-out order and the measured hit rate falls under
+the ceiling; that is a different question, worth its own run. The startup
+line prints both figures side by side.
+
+## Configuration that matters
+
+| setting | why |
+| --- | --- |
+| `--encoder-max-num-batched-tokens 65536` | 8192 against 5,350 tokens/image forbids batching two image requests and pins the encoder at one image per step; every `rate=inf` number is then queue depth |
+| `--max-concurrency 1,4,8` | never `--request-rate inf` unbounded: TTFT becomes queue depth divided by service rate |
+| `--enable-mm-embeds` on decode | otherwise every grid request is HTTP 400; set in every EPD arm so it is not a confound |
+| `--mm-processor-cache-type lru` on encoders | with `shm` the engine keeps no receiver cache, the connector reports no grid, and the grid arm silently becomes the data arm |
+| `--limit-mm-per-prompt '{"video":0}'` | drops the encoder-cache floor from 32768 to 16384 embeddings |
+| `--enable-logging-iteration-details` | the encoder counts this reads live on those INFO lines |
+| `patches/sitecustomize.py` on PYTHONPATH | the connector's transfer accounting is a debug line; this raises it to INFO so the servers need not run at DEBUG |
+| `--mm-encoder-only` + `--enforce-eager` on encoders | ~16 GB to ~1.4 GB, and the EPD example requires eager encoders |
+| `VLLM_USE_V2_MODEL_RUNNER=1` | required by the CPU connector; set on every arm |
+| `ec_enable_nixl` inside `ec_connector_extra_config` | `ECTransferConfig` rejects it as a top-level key |
+
+Queue depth is sampled from every instance's `/metrics` once a second and
+reported per load point (`encQmax`, `decQmax`). If `waiting` tracks the
+offered concurrency, that point measures the queue, not the work.
+
+## Caveats to state with any result
+
+- **The EC region is never reset by a route.** Without
+  `--restart-per-load-point`, the first load point pays the saves and later
+  points run against a warm region; the `saves` column shows which regime a
+  point was in. Arm-to-arm comparison at one point is still fair.
+- **The warmup uses held-out images** (`warmup.jsonl`, built from
+  `--warmup-images` extra pool slots that no measured request references),
+  so first-request costs are paid without seeding any cache the measurement
+  hits. A workload directory without `warmup.jsonl` predates this and must
+  be rebuilt.
+- **Region larger vs smaller than the working set** answer different
+  questions (all hits vs continuous eviction). `--ec-cpu-bytes` defaults to
+  1.25x the working set (`--ec-cpu-bytes 0.5x` or `8GiB` to change it); the
+  frag arm uses 0.5x.
+- **A multi-image request must fit the consumer's encoder cache**, or it is
+  chunked across steps. The manifest's `max_embeds_per_request` is the floor.
+- **Log-text parsing depends on unpromised strings.** Every parser is paired
+  with a gate that fails when it matched nothing.
+
+## Prior results
+
+Grid vs pixels with `ECExampleConnector` at 2048x2048, two replications,
+queue-verified: throughput 1.23-1.28x at c=1 decaying to ~1.02x at c=32 as
+the decode GPU saturates, reproducing PR #50390's published 1.18-1.31x. The
+CPU-connector comparison was run on an older proxy whose `--no-rewrite`
+dropped the transfer params, so the CPU `data` arm transferred nothing there;
+rerun it before quoting. Nothing has been measured with more than one
+encoder, and `--frag` has not been exercised.
+
+## Traps
+
+- **Verify the pod runs the code you think**, by content rather than SHA:
+  `grep get_from_extra_config vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/__init__.py`.
+- **`pkill -f <pattern>` matches its own shell.** The teardown here brackets
+  the pattern and refuses to signal its own process group.
+- **Zombies count as alive to `pgrep`**, which makes every teardown look
+  hung and escalate to SIGKILL; SIGKILL is how multi-GiB `/dev/shm` files
+  leak. The liveness check skips `Z` state.
+- **Kill the process group.** Signalling the API server alone leaves
+  EngineCore holding the GPU and the port, which presents as the next arm's
+  server never becoming healthy.
+- **`subprocess.run(capture_output=True)` never returns for a launched
+  daemon.** Fire-and-forget launches use DEVNULL.
+- **`HF_TOKEN` in the environment overrides a stored `hf auth login`**; run
+  `gen_workload.py` with `env -u HF_TOKEN` to use the stored one.
+- **LSDIR's `val1.tar.gz` contains downscaled copies beside the HR files**;
+  train shards are flat HR.
