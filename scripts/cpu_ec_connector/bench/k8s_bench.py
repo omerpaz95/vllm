@@ -1214,6 +1214,10 @@ def parse_args() -> argparse.Namespace:
     args.mps = False
     args.mps_pipe_dir = ""
     args.mps_log_dir = ""
+    # Same gap: build_system() reads args.encoder_omp_threads unconditionally
+    # for every EPD arm. 0 keeps run_bench's own "divide nproc by len(groups)"
+    # default.
+    args.encoder_omp_threads = 0
     gpus = ",".join(str(i) for i in range(args.decode_gpus))
     args.gpu = args.decode_gpu = gpus
     args.encoder_devices = ";".join(

@@ -795,6 +795,18 @@ def _mps_client_pids(target: Target, pipe_dir: str) -> set[str]:
     return {tok for tok in out.split() if tok.isdigit()}
 
 
+def _nproc(target: Target) -> int:
+    """Cores visible to the target, for dividing OMP threads across encoders.
+
+    `UniProcExecutor` -- what a TP=1, `--mm-encoder-only` instance runs under
+    -- never sets `OMP_NUM_THREADS`; that oversubscription guard only exists
+    in the multiprocess/TP>1 executor path. Left alone, every encoder sharing
+    this pod independently sizes its own thread pool to this whole count.
+    """
+    out = target.sh("nproc", check=False).stdout.strip()
+    return int(out) if out.isdigit() else 1
+
+
 def build_system(
     target: Target,
     args: argparse.Namespace,
@@ -836,6 +848,7 @@ def build_system(
         raise SystemExit("[bench] --decode-port and --proxy-port are the same")
     if args.mps:
         ensure_mps_daemon(target, args)
+    omp_threads = args.encoder_omp_threads or max(1, _nproc(target) // len(groups))
 
     encoders: list[BenchServer] = []
     for index, group in enumerate(groups):
@@ -843,11 +856,11 @@ def build_system(
         util = args.encoder_gpu_memory_utilization or round(
             args.gpu_memory_utilization / gpu_share, 3
         )
-        env: tuple[str, ...] = ()
+        env: tuple[str, ...] = (f"OMP_NUM_THREADS={omp_threads}",)
         if arm.connector == "ECCPUConnector":
             # Each producer binds its own side channel and announces it through
             # ec_transfer_params; the consumer needs no side-channel setting.
-            env = (
+            env += (
                 f"VLLM_EC_SIDE_CHANNEL_HOST={args.side_channel_host}",
                 f"VLLM_EC_SIDE_CHANNEL_PORT={args.side_channel_port + index}",
             )
@@ -1685,6 +1698,17 @@ def add_single_node_options(p: argparse.ArgumentParser) -> None:
         default=0.0,
         help="per-encoder memory share; 0 divides --gpu-memory-utilization by "
         "the number of encoders sharing that device",
+    )
+    epd.add_argument(
+        "--encoder-omp-threads",
+        type=int,
+        default=0,
+        help="OMP_NUM_THREADS per encoder; 0 divides the target's core count "
+        "evenly across every encoder sharing this pod. A TP=1, "
+        "--mm-encoder-only instance runs under UniProcExecutor, which never "
+        "sets this itself (that guard is scoped to the multiprocess/TP>1 "
+        "executor), so left unset every encoder independently sizes its own "
+        "thread pool to the whole core count",
     )
     epd.add_argument(
         "--mps",

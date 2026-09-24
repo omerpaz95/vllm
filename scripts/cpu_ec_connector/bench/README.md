@@ -224,6 +224,33 @@ command, not a fourth pipe command you could add to this codebase's existing
 calls. Moving to it would mean starting the daemon differently, not just
 sending it new commands.
 
+## CPU threads: dividing the pod's cores across encoders too
+
+Encoders sharing a GPU also share the pod's CPU budget, and nothing splits
+that by default: a TP=1, `--mm-encoder-only` instance runs under vLLM's
+`UniProcExecutor`, which never sets `OMP_NUM_THREADS` (that oversubscription
+guard -- `available_cpu_count() // num_local_procs` -- only exists in the
+multiprocess/TP>1 executor path). Left alone, every encoder on the pod
+independently sizes its own OpenMP/torch thread pool to the whole visible
+core count, so four encoders on a 128-core pod can mean four processes each
+defaulting toward ~128 threads at once. Under load that oversubscription can
+surface as `libgomp: Thread creation failed: Resource temporarily
+unavailable` followed by a segfault in unrelated-looking code -- a failed
+`pthread_create()` mid-thread-pool-init can leave C++ state half-built, and
+the next tensor op to touch it crashes instead of raising a clean exception.
+
+`--encoder-omp-threads` sets `OMP_NUM_THREADS` per encoder; 0 (the default)
+divides the target's `nproc` evenly across however many encoders
+`--encoder-devices` names, mirroring how `--gpu-memory-utilization` is
+already divided by `gpu_share`. Before assuming this is the cause of a given
+crash, check the numbers a static limit wouldn't show:
+
+```bash
+nproc                                          # what run_bench.py divides
+ps -eLf | wc -l                                # total threads this pod can see
+cat /proc/sys/kernel/threads-max                # host-wide ceiling (not namespaced)
+```
+
 ## Real datasets
 
 `vllm bench serve` supports a handful of Hugging Face datasets natively, but
