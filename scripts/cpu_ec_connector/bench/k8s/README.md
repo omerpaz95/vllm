@@ -116,9 +116,35 @@ Each server log then shows UCX's choice in a line like
 `rma(rc_mlx5/mlx5_4:1)`; `tcp` there means the pod is not on RDMA.
 
 The side channel and the NIXL handshake still use the pod IP on the primary
-network; only the bulk transfer crosses the RDMA interface. The added
-capabilities need an SCC that allows them (on the pokprod cluster the pods
-are admitted under `nvidia-driver`; PodSecurity `baseline` only warns).
+network; only the bulk transfer crosses the RDMA interface.
+
+The added capabilities need an SCC that permits them, and a Deployment's
+pods are checked only against their service account: the ReplicaSet
+controller creates them, so the SCCs *you* may use do not count. Under the
+namespace's `default` service account (`anyuid`, `restricted-v2`) the
+server pods are rejected, which shows up as a Deployment with no pod and a
+`FailedCreate ... unable to validate against any security context
+constraint` event. Create a service account allowed to use an SCC that
+permits the capabilities, once per namespace, and pass it with
+`--service-account`:
+
+```bash
+oc create serviceaccount ec-bench -n my-ns
+oc create role ec-bench-scc -n my-ns --verb=use \
+    --resource=securitycontextconstraints.security.openshift.io --resource-name=privileged
+oc create rolebinding ec-bench-scc -n my-ns --role=ec-bench-scc --serviceaccount=my-ns:ec-bench
+oc auth can-i use securitycontextconstraints/privileged \
+    --as=system:serviceaccount:my-ns:ec-bench        # yes
+
+python k8s_bench.py ... --rdma --service-account ec-bench
+```
+
+Granting `use` needs that permission yourself (RBAC lets you grant only what
+you hold); otherwise ask a cluster admin. `--service-account` applies to
+every pod; pods that add no capabilities (client, proxy, pre-pull) are still
+admitted under the most restrictive SCC that fits. PodSecurity `baseline`
+only warns about the capabilities on that cluster.
+
 Host networking is not an option on that cluster: NetworkManager retries
 DHCP on every RDMA port every 45 s and removes all addresses on it, so a
 host-level RDMA address does not stay up. The same pod settings, on a

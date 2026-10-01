@@ -583,6 +583,8 @@ class PodServer(BenchServer):
                 RDMA_NETWORK_ANNOTATION: self.args.rdma_network
             }
         spec = template["spec"]
+        if self.args.service_account:
+            spec["serviceAccountName"] = self.args.service_account
         spec["containers"][0].update(self._container())
         spec["volumes"] = self._volumes()
         affinity = node_affinity(self.args)
@@ -744,6 +746,8 @@ class ClientPod:
             }
         )
         spec = pod["spec"]
+        if self.args.service_account:
+            spec["serviceAccountName"] = self.args.service_account
         container = spec["containers"][0]
         container["image"] = self.args.image
         container["env"] = common_env(self.args)
@@ -988,6 +992,8 @@ def prepull_image(oc: Oc, args: argparse.Namespace) -> None:
             }
         ],
     }
+    if args.service_account:
+        spec["serviceAccountName"] = args.service_account
     affinity = node_affinity(args)
     if affinity:
         spec["affinity"] = affinity
@@ -1160,6 +1166,14 @@ def parse_args() -> argparse.Namespace:
         "--proxy-from-image",
         action="store_true",
         help=f"run {PROXY_IN_IMAGE} instead of this checkout's proxy",
+    )
+    k.add_argument(
+        "--service-account",
+        default="",
+        help="service account for every pod (default: the namespace's "
+        "`default`). Pods created by a Deployment pass OpenShift's SCC check "
+        "only through their service account, so --rdma's capabilities need one "
+        "allowed to use an SCC that permits them",
     )
     k.add_argument(
         "--run-as-root",

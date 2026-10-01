@@ -314,6 +314,23 @@ def test_rdma_wiring():
     assert env_of(plain)["UCX_TLS"]["value"] == "tcp,sm"
 
 
+def test_service_account():
+    args = parse("--service-account", "ec-bench")
+    for docs in rendered(args, "cpu-grid").values():
+        assert (
+            deployment(docs)["spec"]["template"]["spec"]["serviceAccountName"]
+            == "ec-bench"
+        )
+    (client,) = ClientPod(args, None).render()
+    assert client["spec"]["serviceAccountName"] == "ec-bench"
+    # Unset, the pods keep the namespace's default service account.
+    plain = parse()
+    for docs in rendered(plain, "cpu-grid").values():
+        assert "serviceAccountName" not in deployment(docs)["spec"]["template"]["spec"]
+    (client,) = ClientPod(plain, None).render()
+    assert "serviceAccountName" not in client["spec"]
+
+
 def test_server_flags_mirror_run_bench():
     args = parse()
     docs = rendered(args, "cpu-grid")
