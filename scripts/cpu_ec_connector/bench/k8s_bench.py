@@ -393,6 +393,17 @@ def shm_bytes(args: argparse.Namespace, server: BenchServer) -> int:
     return int(region * 1.25) + _SHM_HEADROOM_BYTES
 
 
+# What a pod needs for NIXL over RoCE on a multi-NIC cluster: the network
+# attachment gives the pod one interface per RDMA port with a stable IPv4
+# address (so its RoCE v2 GIDs are stable), the device-plugin resource injects
+# the RDMA devices, and IPC_LOCK lets UCX pin the memory it registers.
+RDMA_NETWORK_ANNOTATION = "k8s.v1.cni.cncf.io/networks"
+RDMA_CAPABILITIES = ["IPC_LOCK", "SYS_RAWIO", "NET_ADMIN", "NET_RAW"]
+# RDMA only: a broken RDMA path fails the transfer instead of falling back to
+# TCP and passing as a slow connector.
+RDMA_UCX_TLS = "rc,cuda_copy,cuda_ipc"
+
+
 def common_env(args: argparse.Namespace) -> list[dict[str, Any]]:
     env = [
         # First, so `$(POD_IP)` in a later value expands.
@@ -517,7 +528,7 @@ class PodServer(BenchServer):
             mounts.append({"name": "dshm", "mountPath": "/dev/shm"})
         else:
             resources = {"requests": {"cpu": "4", "memory": "8Gi"}}
-        return {
+        container = {
             "image": self.args.image,
             "command": ["bash", "-c", self.launch_script()],
             "ports": ports,
@@ -525,6 +536,13 @@ class PodServer(BenchServer):
             "resources": resources,
             "volumeMounts": mounts,
         }
+        if self.is_vllm and self.args.rdma:
+            for kind in ("requests", "limits"):
+                resources[kind][self.args.rdma_resource] = "1"
+            container["securityContext"] = {
+                "capabilities": {"add": list(RDMA_CAPABILITIES)}
+            }
+        return container
 
     def _volumes(self) -> list[dict[str, Any]]:
         volumes: list[dict[str, Any]] = [
@@ -560,6 +578,10 @@ class PodServer(BenchServer):
         dep["spec"]["progressDeadlineSeconds"] = self.args.startup_timeout_s
         template = dep["spec"]["template"]
         template["metadata"]["labels"] = pod_labels
+        if self.is_vllm and self.args.rdma:
+            template["metadata"]["annotations"] = {
+                RDMA_NETWORK_ANNOTATION: self.args.rdma_network
+            }
         spec = template["spec"]
         spec["containers"][0].update(self._container())
         spec["volumes"] = self._volumes()
@@ -1108,8 +1130,25 @@ def parse_args() -> argparse.Namespace:
     k.add_argument("--pod-cpus", type=int, default=8)
     k.add_argument(
         "--ucx-tls",
-        default="tcp,sm",
-        help="UCX_TLS for every pod; '' leaves it unset so UCX may pick RDMA",
+        default=None,
+        help=f"UCX_TLS for every pod; default tcp,sm, or {RDMA_UCX_TLS} with "
+        "--rdma; '' leaves it unset",
+    )
+    k.add_argument(
+        "--rdma",
+        action="store_true",
+        help="NIXL over RoCE: attach --rdma-network and request --rdma-resource "
+        "on the vLLM pods (pick the device with --pod-env UCX_NET_DEVICES=...)",
+    )
+    k.add_argument(
+        "--rdma-network",
+        default="multi-nic-compute",
+        help="network attachment for --rdma (Multus networks annotation)",
+    )
+    k.add_argument(
+        "--rdma-resource",
+        default="rdma/roce_gdr",
+        help="device-plugin resource for --rdma, one per vLLM pod",
     )
     k.add_argument(
         "--pod-env",
@@ -1194,6 +1233,8 @@ def parse_args() -> argparse.Namespace:
     for pair in args.pod_env:
         if "=" not in pair:
             raise SystemExit(f"[k8s] --pod-env {pair!r} is not NAME=VALUE")
+    if args.ucx_tls is None:
+        args.ucx_tls = RDMA_UCX_TLS if args.rdma else "tcp,sm"
 
     # What run_bench's server construction reads, pinned for pods. python3 is
     # symlinked into /usr/bin in the vllm-openai image, so it resolves even

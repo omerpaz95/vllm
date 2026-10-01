@@ -10,7 +10,7 @@ servers are Deployments, the load generator is a GPU-less pod on the same
 image.
 
 | arm | what crosses the node boundary |
-|---|---|
+| --- | --- |
 | `cpu-data`, `cpu-grid` | `ECCPUConnector` over NIXL; the consumer dials the producer's pod IP |
 | `example-data`, `example-grid` | `ECExampleConnector` over a ReadWriteMany PVC |
 | `baseline`, `offload` | nothing: one pod (the `x_base` reference) |
@@ -85,10 +85,67 @@ python k8s_bench.py --namespace my-ns --out-dir results/docvqa \
 # 3. Example connector arms over the shared filesystem.
 python k8s_bench.py --namespace my-ns --out-dir results \
     --arms baseline,example-data,example-grid --max-concurrency 1,4,8
-
-# RDMA instead of TCP for UCX: clear UCX_TLS and name the device.
-python k8s_bench.py ... --ucx-tls "" --pod-env UCX_NET_DEVICES=mlx5_0:1
 ```
+
+### NIXL over RoCE (`--rdma`)
+
+By default UCX runs over TCP (`UCX_TLS=tcp,sm`). `--rdma` puts the CPU
+arms' NIXL traffic on RoCE instead. On every vLLM pod (the proxy and client
+pod are unchanged) it adds:
+
+- the annotation `k8s.v1.cni.cncf.io/networks: <--rdma-network>` (default
+  `multi-nic-compute`). The multi-NIC CNI gives the pod one interface per
+  RDMA port (`net1-0`..`net1-15`) with a stable IPv4 address, so the port's
+  RoCE v2 GIDs are stable inside the pod;
+- one `<--rdma-resource>` (default `rdma/roce_gdr`), which injects the RDMA
+  devices;
+- the capabilities `IPC_LOCK` (UCX pins the memory it registers),
+  `SYS_RAWIO`, `NET_ADMIN` and `NET_RAW`;
+- `UCX_TLS=rc,cuda_copy,cuda_ipc` unless `--ucx-tls` is given. With no
+  `tcp` in the list, a broken RDMA path fails the transfer rather than
+  falling back to TCP.
+
+Name the device the transfer uses with `UCX_NET_DEVICES`:
+
+```bash
+python k8s_bench.py ... --arms baseline,cpu-data,cpu-grid \
+    --rdma --pod-env UCX_NET_DEVICES=mlx5_4:1
+```
+
+Each server log then shows UCX's choice in a line like
+`rma(rc_mlx5/mlx5_4:1)`; `tcp` there means the pod is not on RDMA.
+
+The side channel and the NIXL handshake still use the pod IP on the primary
+network; only the bulk transfer crosses the RDMA interface. The added
+capabilities need an SCC that allows them (on the pokprod cluster the pods
+are admitted under `nvidia-driver`; PodSecurity `baseline` only warns).
+Host networking is not an option on that cluster: NetworkManager retries
+DHCP on every RDMA port every 45 s and removes all addresses on it, so a
+host-level RDMA address does not stay up. The same pod settings, on a
+standalone pair of pods running llm-d-benchmark's `benchmark_nixl.py`, reach
+about 11.2 GB/s (90 Gb/s) on one 100 Gb/s port.
+
+Caveats:
+
+- **Exclude the known-bad nodes.** GPU anti-affinity spreads encoders and
+  decode across nodes, so it can place a pod on a broken one. On the pokprod
+  cluster, as of 2026-10-01:
+    - `pokprod-b93r38s0`: a GPU has fallen off the bus. The device plugin's
+      `GetPreferredAllocation` fails with `GPU is lost`, which blocks every
+      GPU allocation on the node (`UnexpectedAdmissionError`).
+    - `pokprod-b93r38s1`: unreachable (`Ready=Unknown`, kubelet not posting
+      status, `no route to host` on 10250). Pods there stay Pending, and a
+      deleted one stays Terminating until
+      `oc delete pod <name> --grace-period=0 --force`.
+
+  Pass `--exclude-nodes pokprod-b93r38s0,pokprod-b93r38s1`. Node names are
+  rack and slot (`r38s0`), so `pokprod-b93r44s0` is a different, healthy
+  machine.
+- **`--same-node --rdma` loops back through the NIC.** `UCX_TLS` has no `sm`,
+  so traffic between pods on one node goes over the RDMA NIC rather than
+  shared memory. That keeps the transport identical to the multi-node arms,
+  but the result is not the best achievable same-node figure; pass
+  `--ucx-tls rc,sm,cuda_copy,cuda_ipc` for that.
 
 `--serve-args`, `--encoder-serve-args`, `--decode-serve-args`, `--model`,
 `--request-rates`, `--max-concurrency`, `--num-prompts`,
@@ -159,7 +216,8 @@ first cluster run must confirm:
 - `vllm bench serve` and `gen_workload.py` run in the GPU-less client pod
   on the official image (platform detection without a GPU).
 - `import nixl` in the chosen image, and UCX picking a transport that
-  crosses nodes with `UCX_TLS=tcp,sm` (or the RDMA override).
+  crosses nodes with `UCX_TLS=tcp,sm`. (`--rdma` is validated only with a
+  standalone NIXL pod pair, not with these Deployments.)
 - `exec deployment/<name>` and `rollout status` behave as assumed on both
   `oc` and `kubectl`, and the pod's own Service name resolves from inside
   it (`reset_caches` and the health probe use it).

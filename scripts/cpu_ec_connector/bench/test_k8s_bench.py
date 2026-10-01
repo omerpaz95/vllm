@@ -278,6 +278,42 @@ def test_shm_and_env_on_vllm_pods():
     assert container(encoder)["resources"]["requests"]["memory"] == "200Gi"
 
 
+def test_rdma_wiring():
+    args = parse("--rdma", "--pod-env", "UCX_NET_DEVICES=mlx5_4:1")
+    docs = rendered(args, "cpu-grid")
+    for name in ("encoder0", "decode"):
+        template = deployment(docs[name])["spec"]["template"]
+        assert template["metadata"]["annotations"] == {
+            "k8s.v1.cni.cncf.io/networks": "multi-nic-compute"
+        }
+        resources = container(docs[name])["resources"]
+        assert resources["requests"]["rdma/roce_gdr"] == "1"
+        assert resources["limits"]["rdma/roce_gdr"] == "1"
+        assert (
+            "IPC_LOCK"
+            in container(docs[name])["securityContext"]["capabilities"]["add"]
+        )
+        env = env_of(docs[name])
+        assert env["UCX_TLS"]["value"] == "rc,cuda_copy,cuda_ipc"
+        assert env["UCX_NET_DEVICES"]["value"] == "mlx5_4:1"
+    # The proxy carries no RDMA traffic.
+    proxy = deployment(docs["proxy"])["spec"]["template"]
+    assert "annotations" not in proxy["metadata"]
+    assert "rdma/roce_gdr" not in container(docs["proxy"])["resources"]["requests"]
+    # An explicit --ucx-tls wins over the --rdma default; without --rdma nothing
+    # RDMA-specific is rendered and UCX_TLS stays tcp,sm.
+    assert (
+        env_of(rendered(parse("--rdma", "--ucx-tls", "rc"), "cpu-grid")["decode"])[
+            "UCX_TLS"
+        ]["value"]
+        == "rc"
+    )
+    plain = rendered(parse(), "cpu-grid")["decode"]
+    assert "annotations" not in deployment(plain)["spec"]["template"]["metadata"]
+    assert "securityContext" not in container(plain)
+    assert env_of(plain)["UCX_TLS"]["value"] == "tcp,sm"
+
+
 def test_server_flags_mirror_run_bench():
     args = parse()
     docs = rendered(args, "cpu-grid")
