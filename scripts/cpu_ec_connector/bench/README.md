@@ -122,6 +122,13 @@ python run_bench.py --workload-dir /data/wl-muir --out-dir results \
     --max-concurrency 1,4,8
 ```
 
+Encoders sharing a GPU run longer steps, and an encoder answers the decode's
+NIXL read requests only between steps. Past the connector's 2 s
+`consumer_ack_timeout_s` the decode gives up and schedules a local encode,
+which a decode fed embeddings cannot run: the engine dies in
+`sanity_check_mm_encoder_outputs` with `got <class 'NoneType'>`. Raise the
+timeout with `--consumer-ack-timeout-s 15` for shared-GPU runs.
+
 ### What `--mps` actually does
 
 1. **Starts (or reuses) an MPS control daemon on the target.** `ensure_mps_daemon`

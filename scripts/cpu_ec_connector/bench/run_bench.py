@@ -708,6 +708,8 @@ def _cpu_connector_config(args: argparse.Namespace, role: str) -> dict[str, Any]
         # dials it. Set inside extra config; ECTransferConfig rejects it as a
         # top-level key.
         extra["ec_enable_nixl"] = True
+    if role == "ec_consumer" and args.consumer_ack_timeout_s is not None:
+        extra["consumer_ack_timeout_s"] = args.consumer_ack_timeout_s
     return {
         "ec_connector": "ECCPUConnector",
         "ec_role": role,
@@ -1560,6 +1562,15 @@ def add_common_options(p: argparse.ArgumentParser) -> None:
         help="the CPU connector's region: bytes, a size (8GiB, 512MiB, 2GB) or "
         "a multiple of the workload's working set (0.5x). Default 1.25x, so "
         "nothing is evicted; --frag uses 0.5x",
+    )
+    p.add_argument(
+        "--consumer-ack-timeout-s",
+        type=float,
+        default=None,
+        help="how long the decode waits for an encoder to answer a NIXL read "
+        "request before encoding locally, which a decode fed embeddings "
+        "cannot do. Encoders sharing a GPU answer slower than the connector's "
+        "2s default; raise it for --mps runs",
     )
     p.add_argument("--max-model-len", type=int, default=32768)
     p.add_argument("--max-num-batched-tokens", type=int, default=8192)
