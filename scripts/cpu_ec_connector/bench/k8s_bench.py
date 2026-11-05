@@ -36,11 +36,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import regex as re
@@ -69,12 +70,23 @@ _SHM_HEADROOM_BYTES = 8 * GIB
 _POD_MEMORY_HEADROOM_BYTES = 32 * GIB
 _CONFIGMAP_LIMIT_BYTES = 1024 * 1024
 # What runs inside the pods; the drivers stay on the laptop.
-_POD_SCRIPTS = ("gen_workload.py", "hf_workload.py", "ec_log_stats.py", "run_bench.py")
+_POD_SCRIPTS = (
+    "embed_profiles.py",
+    "embed_workload.py",
+    "gen_workload.py",
+    "hf_workload.py",
+    "ec_log_stats.py",
+    "run_bench.py",
+)
 # Shipped only when present beside this file. PYTHONPATH points every
 # interpreter in every pod at the scripts mount, so a `sitecustomize.py` there
 # is auto-imported at startup: the way a connector monkeypatch reaches the
 # servers without rebuilding the image.
-_OPTIONAL_POD_SCRIPTS = ("sitecustomize.py",)
+_OPTIONAL_POD_SCRIPTS = (
+    "sitecustomize.py",
+    "internvl_ec_patch.py",
+    "encoder_budget_patch.py",
+)
 _HEALTH_POLL_S = 5.0
 _STOP_TIMEOUT_S = 300
 _RUN_ID_RE = re.compile(r"^[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$")
@@ -273,8 +285,18 @@ class Oc:
 
 _CONTAINER_GONE_RE = re.compile(
     r"container not found|unable to upgrade connection|pods? .* not found|"
-    r"is not running|Terminated|ContainerCreating"
+    r"is not running|Terminated|ContainerCreating|does not have a host assigned"
 )
+# The exec stream itself dropped (API server or kubelet hiccup) while the
+# container kept running; the command is re-run, which every read here
+# tolerates.
+_EXEC_DROPPED_RE = re.compile(
+    r"error: unexpected EOF|error: error reading from error stream|"
+    r"error dialing backend|connection reset by peer|"
+    r"http2: client connection lost|TLS handshake timeout"
+)
+_EXEC_ATTEMPTS = 4
+_EXEC_RETRY_DELAY_S = 5.0
 
 
 class PodTarget(Target):
@@ -317,6 +339,37 @@ class PodTarget(Target):
                 raise ServerMismatchError(self.diagnose()) from exc
             raise
 
+    def _read(self, read: Callable[[], Any]) -> Any:
+        """Run one of the read helpers, re-running it when the exec stream
+        dropped. Only reads come through here: re-running a command that
+        drives load or changes state could repeat it."""
+        for attempt in range(1, _EXEC_ATTEMPTS):
+            try:
+                return read()
+            except RuntimeError as exc:
+                if isinstance(exc, ServerMismatchError) or not _EXEC_DROPPED_RE.search(
+                    str(exc)
+                ):
+                    raise
+            print(
+                f"[k8s] exec into {self.pod} dropped; retrying "
+                f"({attempt}/{_EXEC_ATTEMPTS - 1})"
+            )
+            time.sleep(_EXEC_RETRY_DELAY_S)
+        return read()
+
+    def file_size(self, path: str) -> int:
+        return self._read(lambda: super(PodTarget, self).file_size(path))
+
+    def read_bytes(self, path: str, start: int, end: int) -> str:
+        return self._read(lambda: super(PodTarget, self).read_bytes(path, start, end))
+
+    def read_text(self, path: str) -> str:
+        return self._read(lambda: super(PodTarget, self).read_text(path))
+
+    def grep_lines(self, path: str, *needles: str) -> str:
+        return self._read(lambda: super(PodTarget, self).grep_lines(path, *needles))
+
 
 def pod_status(pod: dict[str, Any]) -> dict[str, Any]:
     status = pod.get("status", {})
@@ -342,23 +395,32 @@ def pod_status(pod: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
-def node_affinity(args: argparse.Namespace) -> dict[str, Any]:
-    if not args.exclude_nodes:
+def node_affinity(
+    args: argparse.Namespace, hosts: Sequence[str] = (), avoid: Sequence[str] = ()
+) -> dict[str, Any]:
+    """Required hostname affinity: never on `--exclude-nodes` or `avoid` and,
+    when `hosts` is non-empty, only on one of `hosts`. The expressions sit in
+    one nodeSelectorTerm, so all must hold."""
+    exprs = []
+    never = [*args.exclude_nodes, *(h for h in avoid if h not in args.exclude_nodes)]
+    if never:
+        exprs.append(
+            {
+                "key": "kubernetes.io/hostname",
+                "operator": "NotIn",
+                "values": never,
+            }
+        )
+    if hosts:
+        exprs.append(
+            {"key": "kubernetes.io/hostname", "operator": "In", "values": list(hosts)}
+        )
+    if not exprs:
         return {}
     return {
         "nodeAffinity": {
             "requiredDuringSchedulingIgnoredDuringExecution": {
-                "nodeSelectorTerms": [
-                    {
-                        "matchExpressions": [
-                            {
-                                "key": "kubernetes.io/hostname",
-                                "operator": "NotIn",
-                                "values": args.exclude_nodes,
-                            }
-                        ]
-                    }
-                ]
+                "nodeSelectorTerms": [{"matchExpressions": exprs}]
             }
         }
     }
@@ -561,6 +623,28 @@ class PodServer(BenchServer):
             )
         return volumes
 
+    def _pinned_hosts(self) -> list[str]:
+        """`--gpu-node` for the pod holding `--decode-gpus` (`single` or
+        `decode`), `--encoder-nodes` for encoders, nothing for the rest."""
+        if self.name in ("single", "decode") and self.args.gpu_node:
+            return [self.args.gpu_node]
+        if self.name.startswith("encoder"):
+            return self.args.encoder_nodes
+        return []
+
+    def _avoided_hosts(self) -> list[str]:
+        """`--gpu-node` for an unpinned encoder on separate nodes: its GPUs
+        are the decode's, and the decode's anti-affinity would then keep the
+        decode off the only node it may run on."""
+        if (
+            self.name.startswith("encoder")
+            and self.args.gpu_node
+            and not self.args.encoder_nodes
+            and not self.args.same_node
+        ):
+            return [self.args.gpu_node]
+        return []
+
     def render(self) -> list[dict[str, Any]]:
         docs = load_template("vllm-deployment.yaml")
         by_kind = {d["kind"]: d for d in docs}
@@ -578,7 +662,7 @@ class PodServer(BenchServer):
         dep["spec"]["progressDeadlineSeconds"] = self.args.startup_timeout_s
         template = dep["spec"]["template"]
         template["metadata"]["labels"] = pod_labels
-        if self.is_vllm and self.args.rdma:
+        if self.is_vllm and self.args.rdma and self.args.rdma_network:
             template["metadata"]["annotations"] = {
                 RDMA_NETWORK_ANNOTATION: self.args.rdma_network
             }
@@ -587,7 +671,9 @@ class PodServer(BenchServer):
             spec["serviceAccountName"] = self.args.service_account
         spec["containers"][0].update(self._container())
         spec["volumes"] = self._volumes()
-        affinity = node_affinity(self.args)
+        affinity = node_affinity(
+            self.args, self._pinned_hosts(), avoid=self._avoided_hosts()
+        )
         if self.is_vllm:
             if self.args.node_selector:
                 spec["nodeSelector"] = dict(self.args.node_selector)
@@ -613,6 +699,8 @@ class PodServer(BenchServer):
             raise SystemExit("[k8s] --frag instrumentation is not supported in pods")
         self.stop()
         self.starts += 1
+        if self._holds_gpu_node():
+            node_hold(self.args, self._oc()).release()
         print(f"[bench] applying {self.resource}")
         self._oc().apply(self.render())
         self._oc().rollout_status(self.resource, self.args.startup_timeout_s)
@@ -696,6 +784,13 @@ class PodServer(BenchServer):
             self.save_log()
         oc.delete("deployment,service", self.selector)
         oc.wait_gone(self.selector)
+        if self._holds_gpu_node():
+            node_hold(self.args, oc).acquire()
+
+    def _holds_gpu_node(self) -> bool:
+        """The pod pinned to `--gpu-node` takes the whole node, so the node is
+        held across the gap between one arm's teardown and the next start."""
+        return bool(self.args.gpu_node) and self.name in ("single", "decode")
 
     def wait_healthy(self) -> None:
         deadline = time.monotonic() + self.args.startup_timeout_s
@@ -779,6 +874,93 @@ class ClientPod:
 
 def scripts_configmap_name(args: argparse.Namespace) -> str:
     return f"ec-bench-{args.run_id}-scripts"
+
+
+class NodeHold:
+    """A placeholder pod that holds `--gpu-node`'s GPUs between arms.
+
+    Each arm tears its servers down before the next arm starts them, and on a
+    shared cluster another workload can be scheduled onto the freed GPUs in
+    that gap, leaving the next arm's pod Pending until its startup timeout.
+    The hold requests the same GPUs on the same node, runs nothing but
+    `sleep`, and is deleted the moment before the next arm's pod is applied.
+    """
+
+    def __init__(self, args: argparse.Namespace, oc: Oc) -> None:
+        self.args = args
+        self.oc = oc
+        self.role = "node-hold"
+
+    @property
+    def name(self) -> str:
+        return f"ec-bench-{self.args.run_id}-{self.role}"
+
+    def manifest(self) -> dict[str, Any]:
+        gpus = str(self.args.decode_gpus)
+        spec: dict[str, Any] = {
+            "restartPolicy": "Never",
+            "terminationGracePeriodSeconds": 0,
+            "containers": [
+                {
+                    "name": "hold",
+                    "image": self.args.image,
+                    "command": ["sleep", "infinity"],
+                    "resources": {
+                        "requests": {
+                            "cpu": "10m",
+                            "memory": "16Mi",
+                            "nvidia.com/gpu": gpus,
+                        },
+                        "limits": {"nvidia.com/gpu": gpus},
+                    },
+                }
+            ],
+            "affinity": node_affinity(self.args, [self.args.gpu_node]),
+        }
+        if self.args.service_account:
+            spec["serviceAccountName"] = self.args.service_account
+        return {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": self.name,
+                "namespace": self.args.namespace,
+                "labels": labels(self.args, self.role),
+            },
+            "spec": spec,
+        }
+
+    def acquire(self) -> None:
+        # An evicted or killed hold (restartPolicy Never) stays listed but
+        # holds nothing; it is replaced, not counted.
+        held = self.oc.pods(selector(self.args, self.role))
+        if any(
+            p.get("status", {}).get("phase") in ("Pending", "Running") for p in held
+        ):
+            return
+        if held:
+            self.release()
+        print(f"[k8s] holding {self.args.gpu_node}'s GPUs between arms")
+        self.oc.apply([self.manifest()])
+
+    def release(self) -> None:
+        sel = selector(self.args, self.role)
+        if self.oc.pods(sel):
+            self.oc.run(
+                "delete",
+                "pod",
+                "-l",
+                sel,
+                "--ignore-not-found",
+                "--grace-period=0",
+                "--force",
+                check=False,
+            )
+            self.oc.wait_gone(sel)
+
+
+def node_hold(args: argparse.Namespace, oc: Oc) -> NodeHold:
+    return NodeHold(args, oc)
 
 
 def pvc_volume(args: argparse.Namespace) -> dict[str, Any]:
@@ -905,7 +1087,20 @@ def ensure_workload(client: ClientPod, args: argparse.Namespace) -> None:
     manifest = f"{args.workload_dir}/manifest.json"
     if client.target.exists(manifest):
         print(f"[k8s] using the workload at {args.workload_dir}")
-        return
+    else:
+        build_workload(client, args)
+    # Inline the images once here, so no load point spends minutes encoding
+    # them in the client; a copy newer than its source is kept as it is.
+    print(
+        client.target.sh(
+            f"{args.python} {SCRIPTS_MOUNT}/embed_workload.py "
+            f"--workload-dir {args.workload_dir}",
+            timeout=args.gen_timeout_s,
+        ).stdout.strip()
+    )
+
+
+def build_workload(client: ClientPod, args: argparse.Namespace) -> None:
     print(f"[k8s] no manifest.json in {args.workload_dir} on the PVC")
     if not (args.gen_workload or args.hf_workload):
         raise SystemExit(
@@ -922,9 +1117,12 @@ def ensure_workload(client: ClientPod, args: argparse.Namespace) -> None:
     else:
         print(f"[k8s] generating the workload in {args.workload_dir}")
         script, extra = "gen_workload.py", args.gen_workload
+    # The served model picks the embedding profile the manifest is sized
+    # with; an explicit --model in the script's own arguments wins.
+    model = "" if "--model" in extra.split() else f"--model {shlex.quote(args.model)}"
     client.target.sh(
         f"mkdir -p {args.workload_dir} && {args.python} {SCRIPTS_MOUNT}/{script} "
-        f"--out-dir {args.workload_dir} {extra}",
+        f"--out-dir {args.workload_dir} {model} {extra}",
         timeout=args.gen_timeout_s,
     )
 
@@ -1124,6 +1322,16 @@ def parse_args() -> argparse.Namespace:
     )
     k.add_argument("--exclude-nodes", default="", help="comma-separated hostnames")
     k.add_argument(
+        "--gpu-node",
+        default="",
+        help="hostname the single/decode pod is pinned to",
+    )
+    k.add_argument(
+        "--encoder-nodes",
+        default="",
+        help="comma-separated hostnames the encoder pods are restricted to",
+    )
+    k.add_argument(
         "--shm-size",
         default="",
         help="/dev/shm per GPU pod (e.g. 64Gi); default 1.25x the EC region + 8Gi",
@@ -1149,7 +1357,9 @@ def parse_args() -> argparse.Namespace:
     k.add_argument(
         "--rdma-network",
         default="multi-nic-compute",
-        help="network attachment for --rdma (Multus networks annotation)",
+        help="network attachment for --rdma (Multus networks annotation); '' "
+        "attaches none, for clusters whose RDMA devices come from the device "
+        "plugin alone (InfiniBand with --rdma-resource rdma/ib)",
     )
     k.add_argument(
         "--rdma-resource",
@@ -1244,6 +1454,8 @@ def parse_args() -> argparse.Namespace:
         kv.split("=", 1) for kv in args.node_selector.split(",") if kv.strip()
     )
     args.exclude_nodes = [n.strip() for n in args.exclude_nodes.split(",") if n.strip()]
+    args.encoder_nodes = [n.strip() for n in args.encoder_nodes.split(",") if n.strip()]
+    args.gpu_node = args.gpu_node.strip()
     for pair in args.pod_env:
         if "=" not in pair:
             raise SystemExit(f"[k8s] --pod-env {pair!r} is not NAME=VALUE")
@@ -1376,11 +1588,21 @@ def main() -> int:
     oc.apply([render_scripts_configmap(args)])
     if args.prepull:
         prepull_image(oc, args)
-    client.start()
-    if not args.skip_preflight:
-        preflight(oc, client, args)
-    ensure_workload(client, args)
-    expected, num_prompts = run_bench.prepare_workload(client.target, args)
+    # The node the watcher found free stays free only until something else is
+    # scheduled there: hold it from the first moment, through workload
+    # conversion and the encoders' startup, until the first arm's GPU pod.
+    if args.gpu_node:
+        node_hold(args, oc).acquire()
+    try:
+        client.start()
+        if not args.skip_preflight:
+            preflight(oc, client, args)
+        ensure_workload(client, args)
+        expected, num_prompts = run_bench.prepare_workload(client.target, args)
+    except BaseException:
+        if args.gpu_node:
+            node_hold(args, oc).release()
+        raise
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     out_path = args.out_dir / "bench.json"
@@ -1409,18 +1631,20 @@ def main() -> int:
     topology = "same-node" if args.same_node else "multinode"
     try:
         for name in args.arms:
+            # Filled point by point, so a failure keeps the points before it.
+            new: list[dict[str, Any]] = []
             try:
-                new = run_bench.run_arm(client.target, args, name, num_prompts, build)
+                run_bench.run_arm(client.target, args, name, num_prompts, build, new)
             finally:
                 records = [placement_record(name, s, args) for s in built]
                 placement[name] = records
                 built.clear()
+                for entry in new:
+                    if entry["topology"] == "epd":
+                        entry["topology"] = topology
+                results.extend(new)
             for record in records:
                 check_placement(record)
-            for entry in new:
-                if entry["topology"] == "epd":
-                    entry["topology"] = topology
-            results.extend(new)
             persist()
     except Exception:
         persist()
@@ -1432,6 +1656,10 @@ def main() -> int:
         else:
             client.stop()
             oc.delete("configmap", selector(args, "scripts"))
+        # The last arm's teardown leaves the GPU node held for a next arm that
+        # never comes; release it, --keep or not.
+        if args.gpu_node:
+            node_hold(args, oc).release()
 
     run_bench.print_table(results)
     print_placement(placement)

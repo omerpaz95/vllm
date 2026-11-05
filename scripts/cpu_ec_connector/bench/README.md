@@ -33,6 +33,7 @@ same GPU list as the decode instance for a resource-matched comparison.
 | --- | --- |
 | `gen_workload.py` | builds the image pool, the `custom_image` JSONL, `warmup.jsonl` and `manifest.json` |
 | `hf_workload.py` | the same directory from a Hugging Face dataset (DocVQA, MuirBench, VisionArena-Chat, any image column) |
+| `embed_workload.py` | `workload-embedded.jsonl` / `warmup-embedded.jsonl`: the same requests with every image inlined as the client's own PNG data URL, so no load point re-encodes them; `run_bench.py` replays a copy newer than its source, and `k8s_bench.py` builds it in the client pod. `test_embed_workload.py` checks the client sends identical requests from both |
 | `plot_results.py` | charts (PNG + SVG) and a self-contained `report.html` from one or more `bench.json` |
 | `run_bench.py` | server lifecycle, load driving, log accounting, gates, table |
 | `k8s_bench.py` + `k8s/` | the same arms on OpenShift with encoder and decode on different nodes; see [`k8s/README.md`](k8s/README.md). `test_k8s_bench.py` checks the rendered manifests |
@@ -102,7 +103,9 @@ the pod; `verify()` fails the arm by name if the servers never loaded it.
 The archived real-photo results used `hf-tar:ofsoundof/LSDIR:shard-00.tar.gz`,
 which is gated and licensed for academic research only. Every measured
 quantity is pixel-count driven, and an EC entry's size is purely resolution
-(5,329 embeddings x 7,168 B = 38.2 MB at 2048x2048), so what a source has to
+and model (at 2048x2048: Qwen2.5-VL-7B 5,329 embeddings x 7,168 B = 38.2 MB,
+Qwen3-VL-235B 4,096 x 32,768 B = 134.2 MB, InternVL3.5-241B 2,560 x 8,192 B =
+21.0 MB), so what a source has to
 get right is the JPEG size that sets wire payload and decode time; the
 synthetic source is calibrated to that, and an enlarged photo compresses the
 same as a native crop.
@@ -258,6 +261,23 @@ ps -eLf | wc -l                                # total threads this pod can see
 cat /proc/sys/kernel/threads-max                # host-wide ceiling (not namespaced)
 ```
 
+## Sizing the workload for the served model
+
+`gen_workload.py` and `hf_workload.py` take `--model`, the model the bench
+will serve, and size every entry with that model's profile in
+`embed_profiles.py`: the processor's resize rule (Qwen2-VL's `smart_resize`,
+or InternVL's 448 px tiling) for the embedding count, and the bytes the
+connector stores per embedding (for Qwen3-VL that includes the three
+deepstack layers, 4 x 4096 x bf16). The manifest's working set, and the
+default `--ec-cpu-bytes` derived from it, follow. `run_bench.py` and
+`k8s_bench.py` refuse a manifest built for a different model than `--model`,
+and `k8s_bench.py` passes `--model` to an in-cluster workload build. A model
+without a profile is refused rather than guessed; add one from its
+`config.json` and `preprocessor_config.json`.
+
+`gen_workload.py --reuse-pool --model <other>` keeps the image files and
+recomputes their sizes, so one LSDIR pool serves every model.
+
 ## Real datasets
 
 `vllm bench serve` supports a handful of Hugging Face datasets natively, but
@@ -348,6 +368,10 @@ A run that fails any of these raises instead of printing a delta, because the
 timings would then measure something other than the arm's name:
 
 - every request completed (`completed == num_prompts`)
+- no request was failed by the CPU connector's consumer for an unreadable
+  remote encoding (`remote read failed`). The engine finishes such a request
+  with an error but the client still counts it as completed, so without this
+  gate the point's throughput credits requests that returned nothing
 - each server's fresh log carries a startup line, and for the CPU connector
   the region creation line tagged with this run's engine id (a survivor
   from the previous arm would otherwise answer `/health`)
@@ -355,6 +379,9 @@ timings would then measure something other than the arm's name:
 - `grid` arms rewrote at least `--min-rewrite-coverage` of the image
   references; `data` arms rewrote nothing
 - with several encoders, each computed something
+- with `--disjoint-points`, an EPD arm's decode read every image reference of
+  the point over NIXL (`EC consumer: NIXL READ completed`, logged at DEBUG);
+  fewer means some came from a cache, so the point did not measure fan-out
 - the encoder's image transform ran on the requested `--mm-processor-device`
 - after the run, every connector arm's consumer computed fewer encoder inputs
   than the baseline at the same load point
@@ -404,6 +431,36 @@ evicts in first-in-first-out order and the measured hit rate falls under
 the ceiling; that is a different question, worth its own run. The startup
 line prints both figures side by side.
 
+## Encode fan-out
+
+A reuse workload replayed point after point measures the decode's own warm
+region from the second point on: the encoders still run, but the decode
+finds every embedding locally and reads nothing over the network. That says
+nothing about encoding in parallel and sending the results to one decode.
+
+A fan-out run makes every image new to every cache, at every point:
+
+    python hf_workload.py --dataset lmms-lab/DocVQA --subset DocVQA \
+        --split validation+test \
+        --distinct-key ucsf_document_id,ucsf_document_page_no \
+        --no-reuse --points 6 --max-samples 2416 \
+        --model OpenGVLab/InternVL3_5-241B-A28B-HF --out-dir /bench/wl-fanout
+
+- `--distinct-key` keeps one row per page while streaming. DocVQA asks
+  several questions about each page, and `validation+test` holds 2,573
+  distinct pages.
+- `--no-reuse` drops any row sharing an image with an earlier request, and
+  uses one question per row, so no image is referenced twice. The manifest
+  reports `reuses: 0`.
+- `--points N` also writes `workload-p0.jsonl` to `workload-p{N-1}.jsonl`,
+  equal contiguous blocks. `run_bench.py --disjoint-points` replays block `k`
+  at load point `k`, so no point meets an image an earlier point sent. It
+  needs one block per load point.
+
+Each point then encodes every image on the encoders and reads each one over
+NIXL on the decode, which the gate above checks. Throughput compares the
+baseline, where one server does both, with N encoders feeding one decode.
+
 ## Configuration that matters
 
 | setting | why |
@@ -426,9 +483,11 @@ offered concurrency, that point measures the queue, not the work.
 ## Caveats to state with any result
 
 - **The EC region is never reset by a route.** Without
-  `--restart-per-load-point`, the first load point pays the saves and later
-  points run against a warm region; the `saves` column shows which regime a
-  point was in. Arm-to-arm comparison at one point is still fair.
+  `--restart-per-load-point` or `--disjoint-points`, the first load point pays
+  the saves and later points run against a warm region; the `saves` column
+  shows which regime a point was in. Arm-to-arm comparison at one point is
+  still fair, but in an EPD arm the decode then reads its own region rather
+  than the encoders over NIXL, so such a point measures reuse, not fan-out.
 - **The warmup uses held-out images** (`warmup.jsonl`, built from
   `--warmup-images` extra pool slots that no measured request references),
   so first-request costs are paid without seeding any cache the measurement

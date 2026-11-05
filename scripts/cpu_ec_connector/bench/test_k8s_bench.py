@@ -162,6 +162,147 @@ def test_node_selection():
     assert "nodeAffinity" in client["spec"]["affinity"]
 
 
+def test_gpu_node_and_encoder_nodes():
+    def exprs(docs):
+        spec = deployment(docs)["spec"]["template"]["spec"]
+        terms = spec["affinity"]["nodeAffinity"][
+            "requiredDuringSchedulingIgnoredDuringExecution"
+        ]["nodeSelectorTerms"]
+        assert len(terms) == 1
+        return terms[0]["matchExpressions"]
+
+    exclude = {"key": "kubernetes.io/hostname", "operator": "NotIn", "values": ["n1"]}
+    pin = {"key": "kubernetes.io/hostname", "operator": "In", "values": ["g8"]}
+    args = parse("--exclude-nodes", "n1", "--gpu-node", "g8")
+    for arm, pinned in (("cpu-grid", "decode"), ("baseline", "single")):
+        docs = rendered(args, arm)
+        assert exprs(docs[pinned]) == [exclude, pin]
+        for name, doc in docs.items():
+            if name.startswith("encoder"):
+                assert exprs(doc) == [{**exclude, "values": ["n1", "g8"]}]
+            elif name != pinned:
+                assert exprs(doc) == [exclude]
+    docs = rendered(args, "cpu-grid")
+    assert (
+        "podAntiAffinity"
+        in deployment(docs["decode"])["spec"]["template"]["spec"]["affinity"]
+    )
+
+    args = parse("--gpu-node", "g8", "--encoder-nodes", "e1, e2")
+    docs = rendered(args, "cpu-grid")
+    assert exprs(docs["decode"]) == [pin]
+    for name in ("encoder0", "encoder1"):
+        assert exprs(docs[name]) == [
+            {"key": "kubernetes.io/hostname", "operator": "In", "values": ["e1", "e2"]}
+        ]
+    assert "affinity" not in deployment(docs["proxy"])["spec"]["template"]["spec"]
+    client = ClientPod(args, None).render()[0]
+    assert "affinity" not in client["spec"]
+
+
+class _RecordingOc:
+    """Records the cluster calls a NodeHold makes; `held` drives `pods()`."""
+
+    def __init__(self, held: bool = False, phase: str = "Running"):
+        self.held = held
+        self.phase = phase
+        self.calls: list[tuple] = []
+
+    def pods(self, sel):
+        self.calls.append(("pods", sel))
+        return [{"status": {"phase": self.phase}}] if self.held else []
+
+    def apply(self, docs):
+        self.calls.append(("apply", docs[0]["metadata"]["name"]))
+        self.held = True
+        self.phase = "Running"
+
+    def run(self, *argv, **kwargs):
+        self.calls.append(("run", argv[0]))
+        self.held = False
+
+    def wait_gone(self, sel):
+        self.calls.append(("wait_gone", sel))
+
+
+def test_node_hold_pins_gpus_to_gpu_node():
+    args = parse("--exclude-nodes", "n1", "--gpu-node", "g8")
+    hold = k8s_bench.node_hold(args, _RecordingOc())
+    manifest = hold.manifest()
+    spec = manifest["spec"]
+    res = spec["containers"][0]["resources"]
+    # Exactly the decode pod's GPUs, so nothing else fits on the node.
+    assert res["requests"]["nvidia.com/gpu"] == res["limits"]["nvidia.com/gpu"] == "4"
+    assert spec["containers"][0]["command"] == ["sleep", "infinity"]
+    exprs = spec["affinity"]["nodeAffinity"][
+        "requiredDuringSchedulingIgnoredDuringExecution"
+    ]["nodeSelectorTerms"][0]["matchExpressions"]
+    assert {
+        "key": "kubernetes.io/hostname",
+        "operator": "In",
+        "values": ["g8"],
+    } in exprs
+    # Run-scoped label: a cleanup by run id removes it, other runs' holds stay.
+    assert manifest["metadata"]["labels"]["run-id"] == args.run_id
+    assert manifest["metadata"]["labels"]["role"] == "node-hold"
+
+
+def test_node_hold_acquire_is_idempotent_and_release_deletes():
+    args = parse("--gpu-node", "g8")
+    oc = _RecordingOc()
+    hold = k8s_bench.node_hold(args, oc)
+    hold.acquire()
+    hold.acquire()
+    assert [c for c in oc.calls if c[0] == "apply"] == [("apply", hold.name)]
+    hold.release()
+    assert ("run", "delete") in oc.calls and not oc.held
+    oc.calls.clear()
+    hold.release()
+    assert ("run", "delete") not in oc.calls
+
+
+def test_node_hold_replaces_a_dead_hold():
+    args = parse("--gpu-node", "g8")
+    for phase in ("Failed", "Succeeded"):
+        oc = _RecordingOc(held=True, phase=phase)
+        hold = k8s_bench.node_hold(args, oc)
+        hold.acquire()
+        assert ("run", "delete") in oc.calls, phase
+        assert ("apply", hold.name) in oc.calls, phase
+
+
+def test_unpinned_encoders_avoid_the_gpu_node():
+    def never(doc):
+        spec = deployment(doc)["spec"]["template"]["spec"]
+        terms = spec["affinity"]["nodeAffinity"][
+            "requiredDuringSchedulingIgnoredDuringExecution"
+        ]["nodeSelectorTerms"]
+        return [
+            v
+            for e in terms[0]["matchExpressions"]
+            if e["operator"] == "NotIn"
+            for v in e["values"]
+        ]
+
+    docs = rendered(parse("--exclude-nodes", "n1", "--gpu-node", "g8"), "cpu-grid")
+    assert never(docs["encoder0"]) == ["n1", "g8"]
+    assert never(docs["decode"]) == ["n1"]
+    pinned = rendered(parse("--gpu-node", "g8", "--encoder-nodes", "e1"), "cpu-grid")
+    assert "NotIn" not in str(deployment(pinned["encoder0"]))
+    shared = rendered(parse("--gpu-node", "g8", "--same-node"), "cpu-grid")
+    assert "NotIn" not in str(deployment(shared["encoder0"]))
+
+
+def test_only_gpu_node_pods_hold_the_node():
+    args = parse("--gpu-node", "g8")
+    for arm, holder in (("cpu-grid", "decode"), ("baseline", "single")):
+        sys_ = build_pod_system(ClientPod(args, None).target, args, arm)
+        holders = {s.name for s in sys_.servers if s._holds_gpu_node()}
+        assert holders == {holder}, (arm, holders)
+    no_pin = build_pod_system(ClientPod(parse(), None).target, parse(), "cpu-grid")
+    assert not any(s._holds_gpu_node() for s in no_pin.servers)
+
+
 def test_side_channel_wiring():
     args = parse()
     docs = rendered(args, "cpu-grid")
@@ -458,3 +599,72 @@ if __name__ == "__main__":
             failed += 1
             print(f"FAIL {name}: {exc!r}")
     sys.exit(1 if failed else 0)
+
+
+class _FlakyExec(k8s_bench.PodTarget):
+    """Fails its first `drops` execs the way a dropped exec stream does."""
+
+    def __init__(self, drops: int, diagnose=None):
+        super().__init__("ns", "pod/p", diagnose=diagnose, kube_bin="oc")
+        self.drops = drops
+        self.calls = 0
+
+    def _argv(self, script):
+        self.calls += 1
+        if self.calls <= self.drops:
+            return ["bash", "-c", "echo 'error: unexpected EOF' >&2; exit 1"]
+        return ["bash", "-c", script]
+
+
+def test_reads_retry_a_dropped_exec(monkeypatch, tmp_path):
+    monkeypatch.setattr(k8s_bench, "_EXEC_RETRY_DELAY_S", 0)
+    log = tmp_path / "server.log"
+    log.write_text("hello marker\n")
+    target = _FlakyExec(drops=2)
+    assert target.file_size(str(log)) == len("hello marker\n")
+    assert target.calls == 3
+    assert "marker" in _FlakyExec(drops=1).grep_lines(str(log), "marker")
+    # A stream that keeps dropping still fails, after every attempt.
+    stuck = _FlakyExec(drops=99)
+    try:
+        stuck.read_text(str(log))
+    except RuntimeError as exc:
+        assert "unexpected EOF" in str(exc)
+    else:
+        raise AssertionError("expected the last attempt's error")
+    assert stuck.calls == k8s_bench._EXEC_ATTEMPTS
+
+
+def test_commands_are_not_retried(monkeypatch):
+    monkeypatch.setattr(k8s_bench, "_EXEC_RETRY_DELAY_S", 0)
+    target = _FlakyExec(drops=1)
+    try:
+        target.sh("echo load")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a dropped command must surface, not re-run")
+    assert target.calls == 1
+
+
+def test_a_gone_container_is_diagnosed_not_retried(monkeypatch):
+    monkeypatch.setattr(k8s_bench, "_EXEC_RETRY_DELAY_S", 0)
+
+    class Gone(_FlakyExec):
+        def _argv(self, script):
+            self.calls += 1
+            return [
+                "bash",
+                "-c",
+                "echo 'Error from server (BadRequest): pod p does not have a "
+                "host assigned' >&2; exit 1",
+            ]
+
+    target = Gone(drops=0, diagnose=lambda: "replaced")
+    try:
+        target.file_size("/tmp/x")
+    except k8s_bench.ServerMismatchError as exc:
+        assert str(exc) == "replaced"
+    else:
+        raise AssertionError("expected the diagnosis")
+    assert target.calls == 1

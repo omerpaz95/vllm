@@ -64,11 +64,14 @@ import regex as re
 from ec_log_stats import (
     decay_report,
     deferred_fail_count,
+    remote_read_failures,
     rewritten_items,
     stage_summary,
     summarize,
     window_stats,
 )
+from embed_profiles import embeds_for_image, profile_for
+from embed_workload import embedded_name, point_file_name
 
 PROXY = "examples/disaggregated/disaggregated_encoder/disagg_epd_proxy.py"
 BENCH_DIR = Path(__file__).resolve().parent
@@ -207,6 +210,17 @@ class Target:
 
     def read_text(self, path: str) -> str:
         return self.sh(f"cat {shlex.quote(path)} 2>/dev/null || true").stdout
+
+    def grep_lines(self, path: str, *needles: str) -> str:
+        """The lines of `path` containing any needle, filtered on the target.
+
+        A server log at DEBUG reaches tens of MB; a marker check ships only
+        the lines it tests through `oc exec`.
+        """
+        patterns = " ".join(f"-e {shlex.quote(n)}" for n in needles)
+        return self.sh(
+            f"grep -F {patterns} {shlex.quote(path)} 2>/dev/null || true"
+        ).stdout
 
     def exists(self, path: str) -> bool:
         probe = f"test -s {shlex.quote(path)} && echo ok"
@@ -475,7 +489,9 @@ class BenchServer:
         rm -f {self.pid_file} {self.pgid_file}
         """
         result = self.target.sh(script, check=False, timeout=_STOP_TIMEOUT_S + 60)
-        log = self.target.read_text(self.log_path)
+        log = self.target.grep_lines(
+            self.log_path, _EC_REGION_MARKER, _REGION_REMOVED_MARKER
+        )
         if _EC_REGION_MARKER in log and _REGION_REMOVED_MARKER not in log:
             print(
                 f"[bench] WARNING: {self.name} created an EC region but never "
@@ -555,7 +571,7 @@ class BenchServer:
         """For the proxy, which serves no /health endpoint of its own."""
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            if marker in self.target.read_text(self.log_path):
+            if self.target.grep_lines(self.log_path, marker):
                 return
             time.sleep(2.0)
         raise RuntimeError(f"{self.name}: {marker!r} never appeared in {self.log_path}")
@@ -565,10 +581,16 @@ class BenchServer:
 
         A survivor from the previous arm would answer /health and have its
         numbers recorded under this arm's name. For the CPU connector the
-        region's creation line, tagged with this run's engine id, also proves
-        the connector is active and the region is not a reused one.
+        region's creation line, in a log that names this run's engine id, also
+        proves the connector is active and the region is not a reused one.
         """
-        log = self.target.read_text(self.log_path)
+        log = self.target.grep_lines(
+            self.log_path,
+            *_STARTUP_MARKERS,
+            _EC_REGION_MARKER,
+            _ACCOUNTING_MARKER,
+            self.engine_id,
+        )
         if not any(marker in log for marker in _STARTUP_MARKERS):
             raise ServerMismatchError(
                 f"{self.log_path} contains none of {_STARTUP_MARKERS}: the "
@@ -649,7 +671,7 @@ class BenchServer:
         rate: str,
         out: str,
         concurrency: int = 0,
-        dataset: str = "workload.jsonl",
+        dataset: str = "",
     ) -> str:
         cmd = [
             f"{self.args.python} -m vllm.entrypoints.cli.main bench serve",
@@ -658,10 +680,13 @@ class BenchServer:
             "--endpoint /v1/chat/completions",
             f"--model {self.args.model}",
             "--dataset-name custom_image",
-            f"--dataset-path {self.args.workload_dir}/{dataset}",
+            f"--dataset-path {self.args.workload_dir}/"
+            f"{dataset or self.args.workload_file}",
             # The emitted order IS the workload; shuffling would destroy the
             # reuse distances the manifest predicts.
             "--disable-shuffle",
+            # Inlines images still given as paths; the data URLs of an
+            # embedded copy (embed_workload.py) pass through unchanged.
             "--custom-ensure-client-side-data",
             f"--custom-output-len {self.args.output_len}",
             f"--num-prompts {num_prompts}",
@@ -1029,14 +1054,19 @@ def queue_stats(csv_text: str, t_start: float, t_end: float) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
-def image_refs_in_prefix(target: Target, workload_dir: str, num_prompts: int) -> int:
-    """Image references in the first `num_prompts` lines of the workload.
+def image_refs_in_prefix(
+    target: Target,
+    workload_dir: str,
+    num_prompts: int,
+    source: str = "workload.jsonl",
+) -> int:
+    """Image references in the first `num_prompts` lines of `source`.
 
     The manifest counts the whole workload, so a short run's rewrite count
     must be measured against the prefix it actually sent. `--disable-shuffle`
     means the client replays the file in order, so the prefix is exact.
     """
-    text = target.read_text(f"{workload_dir}/workload.jsonl")
+    text = target.read_text(f"{workload_dir}/{source}")
     refs = 0
     for index, line in enumerate(text.splitlines()):
         if index >= num_prompts:
@@ -1152,6 +1182,42 @@ def check_fanout(name: str, when: str, per_encoder: dict[str, int]) -> None:
         )
 
 
+def check_all_transferred(
+    name: str, when: str, consumer: dict[str, Any], image_refs: int
+) -> None:
+    """Under --disjoint-points no image of a point was seen before, so every
+    one must reach the decode over NIXL. A shortfall means some were served
+    from a cache instead, and the point would credit fan-out with work that
+    was never encoded and sent."""
+    reads = consumer["nixl_reads"]
+    if reads < image_refs:
+        raise ServerMismatchError(
+            f"{name} ({when}): the decode read {reads} encodings over NIXL for "
+            f"{image_refs} image references that no earlier point used; the "
+            "rest came from a cache, so this point does not measure fan-out. "
+            "Check that the workload was built with hf_workload.py --no-reuse"
+        )
+
+
+def check_warmup_completed(name: str, target: Target, args: argparse.Namespace) -> None:
+    """Fail unless every warmup request completed.
+
+    A request the decode rejects outright (a 400 on a malformed rewrite, a
+    model the patch does not cover) fails the same way at every load point,
+    so it is caught here before the first point is spent on it.
+    """
+    raw = target.read_text(f"{args.work_dir}/warmup.json")
+    client = json.loads(raw) if raw.strip() else {}
+    done = client.get("completed", 0)
+    if done < args.warmup_prompts:
+        errors = [e for e in client.get("errors") or [] if str(e).strip()]
+        distinct = list(dict.fromkeys(str(e)[-300:] for e in errors))[:2]
+        raise ServerMismatchError(
+            f"{name}: only {done} of {args.warmup_prompts} warmup requests "
+            f"completed; reasons: {distinct or 'none recorded'}"
+        )
+
+
 def verify_epd_engaged(
     name: str, args: argparse.Namespace, sys_: System, when: str
 ) -> None:
@@ -1162,7 +1228,7 @@ def verify_epd_engaged(
     was asked not to.
     """
     encoder = sys_.encoders[0]
-    on_gpu = _GPU_PROCESSOR_MARKER in encoder.target.read_text(encoder.log_path)
+    on_gpu = bool(encoder.target.grep_lines(encoder.log_path, _GPU_PROCESSOR_MARKER))
     if (args.mm_processor_device == "cuda") != on_gpu:
         raise ServerMismatchError(
             f"{name}: asked for the image transform on {args.mm_processor_device}, "
@@ -1216,22 +1282,32 @@ def measure_point(
     num_prompts: int,
     rate: str,
     conc: int,
+    point: int = 0,
 ) -> dict[str, Any]:
     """One load point: drive the workload once and account for it.
 
     `target` is where the load generator runs; each server's log is read
     through that server's own target, which differs when the servers are
-    pods.
+    pods. With `--disjoint-points`, point `point` replays its own block of
+    requests, whose images no other point uses.
     """
     when = f"rate={rate} c={conc}"
     for server in sys_.vllm_servers:
         server.reset_caches()
     marks = {s.name: s.target.file_size(s.log_path) for s in sys_.servers}
     out_path = f"{args.work_dir}/bench_{name}_{rate}_c{conc}.json"
-    print(f"[bench] {name}: {when} ({conc or 'unbounded'}), {num_prompts} prompts")
+    dataset = ""
+    if args.disjoint_points:
+        dataset = args.point_files[point]
+        num_prompts = args.point_prompts[point]
+        args.image_refs = args.point_image_refs[point]
+    print(
+        f"[bench] {name}: {when} ({conc or 'unbounded'}), {num_prompts} prompts"
+        + (f" from {dataset}" if dataset else "")
+    )
     t_start = time.time()
     target.sh(
-        sys_.front.bench_serve_script(num_prompts, rate, out_path, conc),
+        sys_.front.bench_serve_script(num_prompts, rate, out_path, conc, dataset),
         timeout=args.bench_timeout_s,
     )
     t_end = time.time()
@@ -1272,8 +1348,20 @@ def measure_point(
             f"client counted {failed if failed is not None else num_prompts - done}"
             f" failed; {detail}" + log_error_lines(slices[sys_.consumer.name])
         )
+    unreadable = remote_read_failures(slices[sys_.consumer.name])
+    if unreadable:
+        # These count as completed on the client, so throughput would credit
+        # requests that returned nothing.
+        raise ServerMismatchError(
+            f"{name} ({when}): the consumer failed {unreadable} of {num_prompts} "
+            "requests whose encodings it could not read from the producer, and "
+            "the client counted them as completed. The producer evicted entries "
+            "before the consumer read them: give it a larger --ec-cpu-bytes"
+        )
     consumer = summarize(slices[sys_.consumer.name])
     check_loads(name, when, consumer)
+    if args.disjoint_points and sys_.proxy is not None:
+        check_all_transferred(name, when, consumer, args.image_refs)
     per_encoder = {
         e.name: summarize(slices[e.name])["encoder_inputs_computed"]
         for e in sys_.encoders
@@ -1324,8 +1412,14 @@ def run_points(
     num_prompts: int,
     points: list[tuple[str, int]],
     build: Callable[[Target, argparse.Namespace, str], System] = build_system,
+    results: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Start the arm's system once, measure `points` on it, tear it down."""
+    """Start the arm's system once, measure `points` on it, tear it down.
+
+    Each measured point is appended to `results` as it completes, so a caller
+    passing its own list keeps the points measured before a failure.
+    """
+    results = [] if results is None else results
     sys_ = build(target, args, name)
     if ARMS[name].topology == "epd":
         # A config must not inherit encodings the previous one saved: those
@@ -1353,20 +1447,23 @@ def run_points(
                 args.warmup_prompts,
                 "inf",
                 f"{args.work_dir}/warmup.json",
-                dataset="warmup.jsonl",
+                dataset=args.warmup_file,
             ),
             timeout=args.bench_timeout_s,
             check=False,
         )
+        check_warmup_completed(name, target, args)
         if sys_.proxy is not None:
             verify_epd_engaged(name, args, sys_, "warmup")
 
-        results = []
         start_queue_sampler(target, args, sys_)
         try:
             for rate, conc in points:
+                point = args.load_points.index((rate, conc))
                 results.append(
-                    measure_point(target, args, name, sys_, num_prompts, rate, conc)
+                    measure_point(
+                        target, args, name, sys_, num_prompts, rate, conc, point
+                    )
                 )
         finally:
             stop_queue_sampler(target, args)
@@ -1401,8 +1498,10 @@ def run_arm(
     name: str,
     num_prompts: int,
     build: Callable[[Target, argparse.Namespace, str], System] = build_system,
+    results: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Measure one arm across every load point.
+    """Measure one arm across every load point, appending each to `results`
+    (a fresh list when not given) as it completes.
 
     With `--restart-per-load-point` each point gets fresh servers, so the EC
     region (which no reset route touches) starts empty every time and every
@@ -1410,12 +1509,12 @@ def run_arm(
     run against a warm region: arm-to-arm comparison at one point stays fair,
     the within-arm scaling curve does not.
     """
+    results = [] if results is None else results
     if args.restart_per_load_point:
-        results = []
         for point in args.load_points:
-            results.extend(run_points(target, args, name, num_prompts, [point], build))
+            run_points(target, args, name, num_prompts, [point], build, results)
         return results
-    return run_points(target, args, name, num_prompts, args.load_points, build)
+    return run_points(target, args, name, num_prompts, args.load_points, build, results)
 
 
 # --------------------------------------------------------------------------
@@ -1555,6 +1654,13 @@ def add_common_options(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="fresh servers for every load point, so the EC region starts "
         "empty each time and every point pays its saves",
+    )
+    p.add_argument(
+        "--disjoint-points",
+        action="store_true",
+        help="load point k replays workload-pk.jsonl, a block of requests "
+        "sharing no image with any other point (hf_workload.py --no-reuse "
+        "--points N), so every point encodes and transfers all its images",
     )
     p.add_argument(
         "--ec-cpu-bytes",
@@ -1801,6 +1907,8 @@ def finalize_args(args: argparse.Namespace) -> argparse.Namespace:
     args.ec_cpu_bytes, args.ec_region_mult = parse_region_size(args.ec_cpu_bytes)
     args.queue_csv = f"{args.work_dir}/queue.csv"
     args.frag_file = f"{args.work_dir}/frag.jsonl"
+    args.workload_file = "workload.jsonl"
+    args.warmup_file = "warmup.jsonl"
     rates = [r.strip() for r in args.request_rates.split(",") if r.strip()]
     concurrencies = [int(c) for c in args.max_concurrency.split(",") if c.strip()]
     args.load_points = [(r, c) for r in rates for c in concurrencies or [0]]
@@ -1843,13 +1951,98 @@ def load_manifest(target: Target, args: argparse.Namespace) -> dict[str, Any]:
     return manifest
 
 
+def check_manifest_profile(manifest: dict[str, Any], model: str) -> None:
+    """Refuse a manifest sized for a different model than the one served.
+
+    The working set, and so the default region size, is the manifest's
+    embedding count times its bytes per embedding, both of which depend on the
+    model. A workload built for one model and served with another sizes the
+    region for the wrong entries: too small, and the producer evicts entries a
+    consumer still has to read, which fails those requests.
+    """
+    profile = profile_for(model)
+    problems = []
+    have = manifest.get("bytes_per_embed")
+    if have != profile.bytes_per_embed:
+        problems.append(
+            f"it charges {have} B per embedding, {model} stores "
+            f"{profile.bytes_per_embed}"
+        )
+    for entry in (manifest.get("pool") or [])[:64]:
+        want = embeds_for_image(entry["w"], entry["h"], profile)
+        if entry.get("embeds") != want:
+            problems.append(
+                f"it counts {entry.get('embeds')} embeddings for a "
+                f"{entry['w']}x{entry['h']} image, {model} produces {want}"
+            )
+            break
+    if problems:
+        raise SystemExit(
+            f"[bench] the workload's manifest was sized for another model: "
+            f"{'; '.join(problems)}. Rebuild it with gen_workload.py or "
+            f"hf_workload.py --model {model} (gen_workload.py --reuse-pool keeps "
+            "the images)"
+        )
+
+
+def pick_dataset_file(target: Target, workload_dir: str, source: str) -> str:
+    """`source`'s embedded copy (embed_workload.py) when it is newer than
+    both `source` and the image pool, else `source` itself.
+
+    The client then sends the copy's inlined images as they are, skipping
+    the per-load-point PNG encoding of every image reference.
+    """
+    copy = embedded_name(source)
+    src, dst = (shlex.quote(f"{workload_dir}/{n}") for n in (source, copy))
+    pool = shlex.quote(f"{workload_dir}/pool")
+    # An image rewritten in place changes no JSONL, only the pool.
+    fresh = target.sh(
+        f"test -s {dst} -a {dst} -nt {src} && "
+        f"! find {pool} -newer {dst} -print -quit 2>/dev/null | grep -q . && echo ok",
+        check=False,
+    )
+    return copy if fresh.stdout.strip() else source
+
+
+def prepare_point_files(target: Target, args: argparse.Namespace) -> None:
+    """One block of requests per load point (hf_workload.py --points).
+
+    Every point then meets only images no earlier point sent, so its
+    encodings start in no cache: each request is encoded, and in the EPD
+    arms transferred to the decode, within the point that measures it. A
+    point's prompt count and image references come from its own block.
+    """
+    needed = len(args.load_points)
+    args.point_files, args.point_prompts, args.point_image_refs = [], [], []
+    for point in range(needed):
+        source = point_file_name(point)
+        lines = target.read_text(f"{args.workload_dir}/{source}").splitlines()
+        prompts = sum(1 for line in lines if line.strip())
+        if not prompts:
+            raise SystemExit(
+                f"[bench] --disjoint-points needs {needed} point files; "
+                f"{args.workload_dir}/{source} is missing or empty. Rebuild the "
+                f"workload with hf_workload.py --no-reuse --points {needed}"
+            )
+        args.point_files.append(pick_dataset_file(target, args.workload_dir, source))
+        args.point_prompts.append(prompts)
+        args.point_image_refs.append(
+            image_refs_in_prefix(target, args.workload_dir, prompts, source)
+        )
+    print(
+        f"[bench] disjoint points: {needed} blocks of {args.point_prompts} "
+        f"requests, {args.point_image_refs} image refs"
+    )
+
+
 def prepare_workload(
     target: Target, args: argparse.Namespace
 ) -> tuple[dict[str, Any], int]:
     """Read the workload's manifest and settle what the run takes from it.
 
     Returns the manifest's `expected` block and the request count; sets
-    `image_refs`, `warmup_prompts` and a manifest-derived `ec_cpu_bytes`.
+    `image_refs`, `warmup_prompts`, a manifest-derived `ec_cpu_bytes` and the
+    `workload_file`/`warmup_file` the client replays.
     """
     manifest = load_manifest(target, args)
     expected = manifest["expected"]
@@ -1862,6 +2055,14 @@ def prepare_workload(
             f"[bench] no warmup.jsonl in {args.workload_dir}; rebuild the workload "
             "with the current gen_workload.py, which holds out warmup images"
         )
+    # An explicit region size does not use the manifest's sizing, so a model
+    # without a profile can still run.
+    if not args.ec_cpu_bytes:
+        check_manifest_profile(manifest, args.model)
+    args.workload_file = pick_dataset_file(target, args.workload_dir, "workload.jsonl")
+    args.warmup_file = pick_dataset_file(target, args.workload_dir, "warmup.jsonl")
+    if args.disjoint_points:
+        prepare_point_files(target, args)
     working_set = expected["working_set_bytes"]
     if not args.ec_cpu_bytes:
         mult = args.ec_region_mult or (0.5 if args.frag else 1.25)
@@ -1926,7 +2127,7 @@ def main() -> int:
     results: list[dict[str, Any]] = []
     try:
         for name in args.arms:
-            results.extend(run_arm(target, args, name, num_prompts))
+            run_arm(target, args, name, num_prompts, results=results)
             persist(results)
     except Exception:
         persist(results)

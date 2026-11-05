@@ -53,11 +53,14 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import NamedTuple
 
-# Qwen2-VL family: patch_size * spatial_merge_size. One embedding per 28x28 px.
-DEFAULT_MERGE_STRIDE = 28
-# Qwen2.5-VL-7B: hidden 3584 x 2 bytes (bfloat16) per embedding.
-DEFAULT_HIDDEN_DIM = 3584
-DEFAULT_ELEMENT_SIZE = 2
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from embed_profiles import (  # noqa: E402
+    DEFAULT_PROFILE,
+    Profile,
+    embeds_for_image,
+    profile_for,
+)
 
 # JPEG bytes per megapixel of a real-photo pool (LSDIR, q85), which is what a
 # synthetic pool is calibrated to match.
@@ -91,10 +94,6 @@ def parse_buckets(spec: str) -> list[Bucket]:
         buckets.append(Bucket(int(w), int(h), float(weight or 1.0)))
     total = sum(b.weight for b in buckets)
     return [Bucket(b.width, b.height, b.weight / total) for b in buckets]
-
-
-def embeds_for(width: int, height: int, stride: int) -> int:
-    return (width // stride) * (height // stride)
 
 
 # ---------------------------------------------------------------------------
@@ -135,11 +134,13 @@ def _iter_hf_tar(repo: str, filename: str | None) -> Iterator[tuple[str, object]
     import tarfile
 
     import requests
-    from huggingface_hub import HfApi, hf_hub_url
+    from huggingface_hub import hf_hub_url
     from huggingface_hub.utils import build_hf_headers
     from PIL import Image
 
-    api = HfApi()
+    from vllm.transformers_utils.repo_utils import hf_api
+
+    api = hf_api()
     if filename is None:
         info = api.repo_info(repo, repo_type="model")
         archives = sorted(
@@ -306,8 +307,7 @@ def build_pool(
     pool_size: int,
     out_dir: Path,
     quality: int,
-    stride: int,
-    bytes_per_embed: int,
+    profile: Profile,
     rng: random.Random,
     allow_upscale: bool = False,
     min_source_px: int = 0,
@@ -378,14 +378,14 @@ def build_pool(
         path = pool_dir / f"{bucket.width}x{bucket.height}_{idx:04d}.jpg"
         out.save(path, format="JPEG", quality=quality)
         img.close()
-        embeds = embeds_for(bucket.width, bucket.height, stride)
+        embeds = embeds_for_image(bucket.width, bucket.height, profile)
         pool.append(
             PoolImage(
                 path,
                 bucket.width,
                 bucket.height,
                 embeds,
-                embeds * bytes_per_embed,
+                embeds * profile.bytes_per_embed,
                 round(max(scale, 1.0), 3),
             )
         )
@@ -635,18 +635,23 @@ def _pool_entries(pool: list[PoolImage]) -> list[dict]:
     ]
 
 
-def _load_entries(entries: list[dict]) -> list[PoolImage]:
-    return [
-        PoolImage(
-            Path(e["path"]),
-            e["w"],
-            e["h"],
-            e["embeds"],
-            e["region_bytes"],
-            e.get("upscale", 1.0),
+def _load_entries(entries: list[dict], profile: Profile) -> list[PoolImage]:
+    """A saved pool, its sizes recomputed for `profile`: the files are
+    model-agnostic, their embedding counts and region bytes are not."""
+    pool = []
+    for e in entries:
+        embeds = embeds_for_image(e["w"], e["h"], profile)
+        pool.append(
+            PoolImage(
+                Path(e["path"]),
+                e["w"],
+                e["h"],
+                embeds,
+                embeds * profile.bytes_per_embed,
+                e.get("upscale", 1.0),
+            )
         )
-        for e in entries
-    ]
+    return pool
 
 
 def _count_histogram(per_request: list[list[int]]) -> dict[str, int]:
@@ -808,9 +813,12 @@ def main() -> int:
         help="consecutive requests use different size buckets, so the region "
         "actually fragments as it churns",
     )
-    p.add_argument("--hidden-dim", type=int, default=DEFAULT_HIDDEN_DIM)
-    p.add_argument("--element-size", type=int, default=DEFAULT_ELEMENT_SIZE)
-    p.add_argument("--merge-stride", type=int, default=DEFAULT_MERGE_STRIDE)
+    p.add_argument(
+        "--model",
+        default=DEFAULT_PROFILE,
+        help="the served model, which picks the embedding profile "
+        "(embed_profiles.py) the manifest is sized with",
+    )
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument(
         "--jobs",
@@ -829,7 +837,7 @@ def main() -> int:
 
     rng = random.Random(args.seed)
     buckets = parse_buckets(args.buckets)
-    bytes_per_embed = args.hidden_dim * args.element_size
+    profile = profile_for(args.model)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.warmup_images < 1 or args.warmup_requests < 1:
@@ -884,8 +892,8 @@ def main() -> int:
         previous = json.loads(manifest_path.read_text())
         if "warmup_pool" not in previous:
             raise SystemExit("[gen] the existing manifest predates warmup images")
-        pool = _load_entries(previous["pool"])
-        warm_pool = _load_entries(previous["warmup_pool"])
+        pool = _load_entries(previous["pool"], profile)
+        warm_pool = _load_entries(previous["warmup_pool"], profile)
         print(f"[gen] reusing existing pool of {len(pool)} photos")
         if picks is not None:
             if len(pool) < args.pool_size:
@@ -901,8 +909,7 @@ def main() -> int:
             args.pool_size + args.warmup_images,
             args.out_dir,
             args.jpeg_quality,
-            args.merge_stride,
-            bytes_per_embed,
+            profile,
             rng,
             args.allow_upscale,
             int(args.min_source_mp * 1e6),
@@ -939,7 +946,7 @@ def main() -> int:
             f.write(json.dumps(record, separators=(",", ":")) + "\n")
 
     manifest = build_manifest(
-        pool, per_request, bytes_per_embed=bytes_per_embed, args=args
+        pool, per_request, bytes_per_embed=profile.bytes_per_embed, args=args
     )
     manifest["warmup_pool"] = _pool_entries(warm_pool)
     manifest["warmup"] = {"requests": len(warmup), "images": len(warm_pool)}

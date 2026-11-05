@@ -23,9 +23,10 @@ manifest's `max_hit_rate` reports exactly how much reuse the dataset actually
 carries. A dataset whose rows never share an image lands at 0% and is a poor
 choice for the offload arms, whatever else it is good for.
 
-Embedding counts follow Qwen2-VL's `smart_resize`: sides are rounded to
-multiples of 28 and the pixel budget clamped, then one embedding is charged
-per 28x28 block. That is the quantity the connector stores, so the region
+Embedding counts and bytes come from `--model`'s profile in
+`embed_profiles.py`: the processor's own resize rule (Qwen2-VL's
+`smart_resize`, or InternVL's tiling) and the bytes the connector stores per
+embedding. Those are the quantities the connector allocates, so the region
 sizes in the manifest are the ones the server will actually want.
 
 Examples:
@@ -43,7 +44,6 @@ import argparse
 import hashlib
 import io
 import json
-import math
 import random
 import sys
 from collections.abc import Iterable, Sequence
@@ -52,20 +52,19 @@ from typing import Any, NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from embed_profiles import (  # noqa: E402
+    DEFAULT_PROFILE,
+    Profile,
+    embeds_for_image,
+    profile_for,
+)
+from embed_workload import point_file_name  # noqa: E402
 from gen_workload import (  # noqa: E402
-    DEFAULT_ELEMENT_SIZE,
-    DEFAULT_HIDDEN_DIM,
-    DEFAULT_MERGE_STRIDE,
     PoolImage,
     _nonce_text,
     build_manifest,
     self_check,
 )
-
-# transformers' Qwen2VLImageProcessor defaults.
-DEFAULT_MIN_PIXELS = 3136
-DEFAULT_MAX_PIXELS = 12845056
-MAX_ASPECT_RATIO = 200
 
 DEFAULT_WARMUP_REQUESTS = 8
 # Only used when the dataset cannot spare rows for a warmup that shares no
@@ -111,55 +110,6 @@ class Sample(NamedTuple):
 
     images: list[Any]
     texts: list[str]
-
-
-def smart_resize(
-    height: int,
-    width: int,
-    factor: int = DEFAULT_MERGE_STRIDE,
-    min_pixels: int = DEFAULT_MIN_PIXELS,
-    max_pixels: int = DEFAULT_MAX_PIXELS,
-) -> tuple[int, int]:
-    """Qwen2-VL's resize rule, mirroring transformers' image processor.
-
-    Args:
-        height: Source height in pixels.
-        width: Source width in pixels.
-        factor: Patch size times spatial merge size; sides become multiples
-            of this.
-        min_pixels: Smallest resized area, enlarged to reach it.
-        max_pixels: Largest resized area, shrunk to fit it.
-
-    Returns:
-        The `(height, width)` the vision tower will actually see.
-
-    Raises:
-        ValueError: If the aspect ratio exceeds what the processor accepts.
-    """
-    if max(height, width) / max(1, min(height, width)) > MAX_ASPECT_RATIO:
-        raise ValueError(
-            f"aspect ratio {max(height, width) / max(1, min(height, width)):.1f} "
-            f"exceeds {MAX_ASPECT_RATIO}"
-        )
-    h_bar = max(factor, round(height / factor) * factor)
-    w_bar = max(factor, round(width / factor) * factor)
-    if h_bar * w_bar > max_pixels:
-        beta = math.sqrt((height * width) / max_pixels)
-        h_bar = math.floor(height / beta / factor) * factor
-        w_bar = math.floor(width / beta / factor) * factor
-    elif h_bar * w_bar < min_pixels:
-        beta = math.sqrt(min_pixels / (height * width))
-        h_bar = math.ceil(height * beta / factor) * factor
-        w_bar = math.ceil(width * beta / factor) * factor
-    return max(factor, h_bar), max(factor, w_bar)
-
-
-def embeds_for_image(
-    width: int, height: int, stride: int, min_pixels: int, max_pixels: int
-) -> int:
-    """Encoder outputs one image occupies after the spatial merge."""
-    h_bar, w_bar = smart_resize(height, width, stride, min_pixels, max_pixels)
-    return (h_bar // stride) * (w_bar // stride)
 
 
 # ---------------------------------------------------------------------------
@@ -249,20 +199,33 @@ def parse_sample(record: dict, cfg: dict[str, Any], expand_turns: bool) -> Sampl
 
 
 def load_records(args: argparse.Namespace) -> list[dict]:
-    """Pull up to `--max-samples` rows, streaming so nothing extra downloads."""
+    """Pull up to `--max-samples` rows, streaming so nothing extra downloads.
+
+    `--split a+b` reads the splits in that order. With `--distinct-key`, a row
+    whose key columns repeat an earlier row's is skipped as it streams past,
+    and `--max-samples` counts the rows kept.
+    """
     from datasets import load_dataset
 
-    data = load_dataset(
-        args.dataset,
-        name=args.subset,
-        split=args.split,
-        streaming=not args.no_stream,
-    )
+    key_columns = [c for c in args.distinct_key.split(",") if c]
+    seen: set[tuple] = set()
     records: list[dict] = []
-    for record in data:
-        records.append(dict(record))
-        if args.max_samples and len(records) >= args.max_samples:
-            break
+    for split in args.split.split("+"):
+        data = load_dataset(
+            args.dataset,
+            name=args.subset,
+            split=split,
+            streaming=not args.no_stream,
+        )
+        for record in data:
+            if key_columns:
+                key = tuple(record.get(c) for c in key_columns)
+                if key in seen:
+                    continue
+                seen.add(key)
+            records.append(dict(record))
+            if args.max_samples and len(records) >= args.max_samples:
+                return records
     if not records:
         raise SystemExit(f"[hf] {args.dataset} split {args.split!r} yielded no rows")
     return records
@@ -276,11 +239,11 @@ def load_records(args: argparse.Namespace) -> list[dict]:
 class Pool:
     """Content-addressed image pool: one file per distinct image."""
 
-    def __init__(self, out_dir: Path, args: argparse.Namespace, bytes_per_embed: int):
+    def __init__(self, out_dir: Path, profile: Profile, jpeg_quality: int):
         self.dir = out_dir
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.args = args
-        self.bytes_per_embed = bytes_per_embed
+        self.profile = profile
+        self.jpeg_quality = jpeg_quality
         self.images: list[PoolImage] = []
         self.by_hash: dict[str, int] = {}
         self.names: set[str] = set()
@@ -296,13 +259,7 @@ class Pool:
             return self.by_hash[digest]
         width, height = rgb.size
         try:
-            embeds = embeds_for_image(
-                width,
-                height,
-                self.args.merge_stride,
-                self.args.min_pixels,
-                self.args.max_pixels,
-            )
+            embeds = embeds_for_image(width, height, self.profile)
         except ValueError as exc:
             print(f"[hf] skipping {width}x{height} image: {exc}", file=sys.stderr)
             self.rejected += 1
@@ -313,11 +270,13 @@ class Pool:
             length += 4
             name = f"{width}x{height}_{digest[:length]}.jpg"
         path = self.dir / name
-        rgb.save(path, format="JPEG", quality=self.args.jpeg_quality)
+        rgb.save(path, format="JPEG", quality=self.jpeg_quality)
         self.names.add(name)
         self.by_hash[digest] = len(self.images)
         self.images.append(
-            PoolImage(path, width, height, embeds, embeds * self.bytes_per_embed)
+            PoolImage(
+                path, width, height, embeds, embeds * self.profile.bytes_per_embed
+            )
         )
         return self.by_hash[digest]
 
@@ -358,6 +317,7 @@ def build_requests(
     max_images: int = 0,
     max_embeds: int = 0,
     oversized: list[int] | None = None,
+    no_reuse: bool = False,
 ) -> tuple[list[dict], list[list[int]]]:
     """Return `(jsonl_records, per_request_image_indices)`.
 
@@ -365,10 +325,13 @@ def build_requests(
     text-only request would count as a request that could never reuse. A
     row over `max_images` or `max_embeds` is dropped too, and counted in
     `oversized`: such a request outgrows the context window on every arm
-    alike, and one failure stops the benchmark's completion gate.
+    alike, and one failure stops the benchmark's completion gate. With
+    `no_reuse`, a row sharing any image with an earlier request is dropped
+    and only its first text is used, so no image is referenced twice.
     """
     records: list[dict] = []
     per_request: list[list[int]] = []
+    used: set[int] = set()
     for sample in samples:
         if limit and len(records) >= limit:
             break
@@ -388,7 +351,11 @@ def build_requests(
             if oversized is not None:
                 oversized.append(embeds)
             continue
-        for text in sample.texts:
+        if no_reuse:
+            if used.intersection(chosen) or len(set(chosen)) < len(chosen):
+                continue
+            used.update(chosen)
+        for text in sample.texts[:1] if no_reuse else sample.texts:
             if limit and len(records) >= limit:
                 break
             records.append(
@@ -454,7 +421,7 @@ def resolve_columns(record: dict, args: argparse.Namespace) -> dict[str, Any]:
 def convert(records: list[dict], args: argparse.Namespace) -> int:
     """Build the workload directory from already-loaded dataset rows."""
     rng = random.Random(args.seed)
-    bytes_per_embed = args.hidden_dim * args.element_size
+    profile = profile_for(args.model)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     cfg = resolve_columns(records[0], args)
     print(
@@ -474,7 +441,7 @@ def convert(records: list[dict], args: argparse.Namespace) -> int:
     if not samples:
         raise SystemExit("[hf] no row carried both an image and a question")
 
-    pool = Pool(args.out_dir / "pool", args, bytes_per_embed)
+    pool = Pool(args.out_dir / "pool", profile, args.jpeg_quality)
     oversized: list[int] = []
     workload, per_request = build_requests(
         samples,
@@ -485,6 +452,7 @@ def convert(records: list[dict], args: argparse.Namespace) -> int:
         max_images=args.max_images_per_request,
         max_embeds=args.max_embeds_per_request,
         oversized=oversized,
+        no_reuse=args.no_reuse,
     )
     if oversized:
         print(
@@ -494,8 +462,21 @@ def convert(records: list[dict], args: argparse.Namespace) -> int:
     if not workload:
         raise SystemExit("[hf] every row was dropped; nothing to replay")
     write_jsonl(args.out_dir / "workload.jsonl", workload)
+    if args.points:
+        # One equal, contiguous block per load point. With --no-reuse no two
+        # blocks share an image, so a point never meets an encoding an earlier
+        # point left in a cache.
+        size = len(workload) // args.points
+        if not size:
+            raise SystemExit(
+                f"[hf] {len(workload)} requests cannot fill {args.points} points"
+            )
+        for point in range(args.points):
+            block = workload[point * size : (point + 1) * size]
+            write_jsonl(args.out_dir / point_file_name(point), block)
+        print(f"[hf] {args.points} point files of {size} requests each")
 
-    warm_pool = Pool(args.out_dir / "warmup_pool", args, bytes_per_embed)
+    warm_pool = Pool(args.out_dir / "warmup_pool", profile, args.jpeg_quality)
     warm_samples = [parse_sample(r, cfg, args.expand_turns) for r in holdout]
     warm_samples = [s for s in warm_samples if s.images and s.texts]
     warmup, _ = build_requests(
@@ -526,7 +507,7 @@ def convert(records: list[dict], args: argparse.Namespace) -> int:
 
     args.images_per_request = max(len(chosen) for chosen in per_request)
     manifest = build_manifest(
-        pool.images, per_request, bytes_per_embed=bytes_per_embed, args=args
+        pool.images, per_request, bytes_per_embed=profile.bytes_per_embed, args=args
     )
     manifest["source"] = {
         "dataset": args.dataset,
@@ -554,7 +535,7 @@ def convert(records: list[dict], args: argparse.Namespace) -> int:
         f"request {exp['max_embeds_per_request']}, suggested ec_cpu_bytes "
         f"{exp['suggested_ec_cpu_bytes']}"
     )
-    if not exp["reuses"]:
+    if not exp["reuses"] and not args.no_reuse:
         print(
             "[hf] warning: no image is referenced twice, so the connector has "
             "nothing to reload and the offload arms cannot differ from baseline",
@@ -574,7 +555,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--subset", default=None, help="HF config name, if the dataset has one"
     )
-    p.add_argument("--split", default=None, help="default: the dataset's known split")
+    p.add_argument(
+        "--split",
+        default=None,
+        help="default: the dataset's known split; a+b reads several in order",
+    )
+    p.add_argument(
+        "--distinct-key",
+        default="",
+        help="comma-separated columns; a row repeating an earlier row's values "
+        "is skipped while streaming (DocVQA: ucsf_document_id,"
+        "ucsf_document_page_no keeps one row per page)",
+    )
+    p.add_argument(
+        "--points",
+        type=int,
+        default=0,
+        help="also split the workload into this many equal blocks, "
+        "workload-p0.jsonl..., one per load point (run_bench.py "
+        "--disjoint-points); 0 = no split",
+    )
+    p.add_argument(
+        "--no-reuse",
+        action="store_true",
+        help="no image is referenced twice: a row sharing an image with an "
+        "earlier request is dropped. For measuring encode fan-out, where "
+        "every request must be encoded and transferred",
+    )
     p.add_argument("--out-dir", required=True, type=Path)
     p.add_argument(
         "--num-requests", type=int, default=0, help="0 replays every usable row"
@@ -594,11 +601,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--prefix-tokens", type=int, default=32)
     p.add_argument("--warmup-requests", type=int, default=DEFAULT_WARMUP_REQUESTS)
     p.add_argument("--no-stream", action="store_true")
-    p.add_argument("--hidden-dim", type=int, default=DEFAULT_HIDDEN_DIM)
-    p.add_argument("--element-size", type=int, default=DEFAULT_ELEMENT_SIZE)
-    p.add_argument("--merge-stride", type=int, default=DEFAULT_MERGE_STRIDE)
-    p.add_argument("--min-pixels", type=int, default=DEFAULT_MIN_PIXELS)
-    p.add_argument("--max-pixels", type=int, default=DEFAULT_MAX_PIXELS)
+    p.add_argument(
+        "--model",
+        default=DEFAULT_PROFILE,
+        help="the served model, which picks the embedding profile "
+        "(embed_profiles.py) the manifest is sized with",
+    )
     p.add_argument(
         "--max-images-per-request",
         type=int,

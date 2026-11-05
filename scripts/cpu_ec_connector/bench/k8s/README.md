@@ -32,6 +32,10 @@ image.
   storage, mounted at `/bench` in every pod.
 - As many GPU nodes as GPU pods: with anti-affinity on, `N` encoders and
   one decode need `N+1` nodes. `--same-node` turns it off (a control run).
+  `--gpu-node HOST` pins the `decode`/`single` pod to `HOST`, and
+  `--encoder-nodes H1,H2` restricts encoder pods to those hosts (default:
+  any node). Both are required nodeAffinity terms combined with
+  `--exclude-nodes`; anti-affinity still applies.
 - The image must carry `nixl` for the CPU arms. The release
   `vllm/vllm-openai` images are built with `INSTALL_KV_CONNECTORS=true`; the
   preflight checks `import nixl` in the client pod. Prefer pinning a digest
@@ -178,6 +182,47 @@ Caveats:
 `--restart-per-load-point`, `--ec-cpu-bytes` and the rest of `run_bench.py`'s
 arm and load options apply unchanged. `--encoder-gpus`/`--decode-gpus` set
 both `nvidia.com/gpu` and `--tensor-parallel-size`.
+
+### Proving the RDMA path before a run
+
+An RDMA-capable node is not proof that NIXL's UCX backend will use RDMA from
+inside a pod: the device has to be injected, memory registration has to be
+allowed, and UCX has to pick an RDMA transport over TCP. `rdma_probe.py`
+checks all three with the transfer the connector makes, a NIXL READ of host
+memory between two pods on different nodes. `rdma-probe.yaml` runs it in two
+GPU-less pods, each requesting one RDMA device and `IPC_LOCK`:
+
+```bash
+kubectl -n my-ns create configmap ec-rdma-probe --from-file=rdma_probe.py
+sed "s|VLLM_IMAGE|vllm/vllm-openai@sha256:<digest>|" rdma-probe.yaml \
+    | kubectl -n my-ns apply -f -
+P=$(kubectl -n my-ns get pod ec-rdma-probe-producer -o jsonpath='{.status.podIP}')
+
+# The same UCX_TLS on both sides: what --rdma sets, so tcp is excluded.
+kubectl -n my-ns exec ec-rdma-probe-producer -- env UCX_TLS=rc,cuda_copy,cuda_ipc \
+    python3 /probe/rdma_probe.py serve --size-mib 2048 &
+kubectl -n my-ns exec ec-rdma-probe-consumer -- env UCX_TLS=rc,cuda_copy,cuda_ipc \
+    python3 /probe/rdma_probe.py read --peer $P --size-mib 2048
+
+# Then the tcp control, again on both sides:
+#   ... env UCX_TLS=tcp,cuda_copy ...
+```
+
+NIXL's UCX backend refuses a `UCX_TLS` without a CUDA transport whenever
+the image is a CUDA build (`NVIDIA GPU(s) are present, but this setting does
+not enable CUDA memory support`), even in a GPU-less pod, so every value
+keeps `cuda_copy`. In a pod with no GPU, UCX then warns that `cuda_copy` and
+`cuda_ipc` are unavailable and carries on; that warning is expected.
+
+`UCX_PROTO_INFO=y` (set in the manifest) makes UCX print the transport each
+operation selected. The RDMA path is proven when the RDMA-only run succeeds
+with intact data, its protocol table names an mlx5 device (`rc_mlx5/mlx5_0:1`)
+for "remote memory read by ucp_get", and its bandwidth is several times the
+tcp control's. On CoreWeave H200 nodes (InfiniBand, `rdma/ib`) the RDMA run
+reads 2 GiB at about 75-80 GB/s, striped over two ports
+(`50% on rc_mlx5/ibp0:1 and 50% on rc_mlx5/ibp1:1`), and the tcp control
+reports `software emulation | tcp/eth0` at about 2.5 GB/s. A failure in the RDMA-only run, before any vLLM pod exists, is
+the cheap place to find a missing device, capability or registration limit.
 
 ## Checking placement
 

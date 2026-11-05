@@ -38,6 +38,7 @@ _EC_EXAMPLE_RE = {
     "load": re.compile(r"Success load encoder cache for hash"),
 }
 _ENCODER_INPUTS_RE = re.compile(r"encoder inputs: (\d+)")
+_NIXL_READ_DONE_RE = re.compile(r"EC consumer: NIXL READ completed mm_hash=")
 _ENCODER_EMBEDS_RE = re.compile(r"encoder output embeddings: (\d+)")
 
 _TS_FORMAT = "%m-%d %H:%M:%S"
@@ -102,6 +103,10 @@ def summarize(text: str) -> dict:
     out["encoder_embeds_computed"] = sum(
         int(m) for m in _ENCODER_EMBEDS_RE.findall(text)
     )
+    # Encodings that crossed the network from a producer (logged at DEBUG,
+    # once per item): what an EPD consumer read remotely rather than found in
+    # its own region.
+    out["nixl_reads"] = len(_NIXL_READ_DONE_RE.findall(text))
     return out
 
 
@@ -171,6 +176,21 @@ _DEFERRED_FAIL_RE = re.compile(r"deferred-fail tally=\d+")
 def deferred_fail_count(text: str) -> int:
     """How many requests the ECExampleConnector patch gave up waiting on."""
     return len(_DEFERRED_FAIL_RE.findall(text))
+
+
+# The CPU connector's consumer fails a request whose encoding it can neither
+# read from the producer nor compute (it was sent only the grid). The engine
+# finishes it with an error, the proxy still streams the empty response to the
+# end, and `vllm bench serve` counts it as completed: this line is the only
+# record of it.
+_REMOTE_READ_FAILED_RE = re.compile(
+    r"needs remote encoding mm_hash=\w+ but the remote read failed"
+)
+
+
+def remote_read_failures(text: str) -> int:
+    """Requests the consumer failed because a remote encoding was unreadable."""
+    return len(_REMOTE_READ_FAILED_RE.findall(text))
 
 
 def stage_summary(text: str) -> dict:
