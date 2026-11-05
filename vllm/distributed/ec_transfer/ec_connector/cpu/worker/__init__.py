@@ -437,6 +437,7 @@ class ECCPUWorker:
         )
 
     def shutdown(self) -> None:
+        self._region.unlink()
         for transfer in (*self._inflight_saves, *self._inflight_loads):
             transfer.end_event.synchronize()
         self._shutdown_transfer_backend()

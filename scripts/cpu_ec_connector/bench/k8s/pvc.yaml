@@ -1,0 +1,13 @@
+# Shared between every pod of every run: the HF cache, the workload, per-run
+# scratch and the example connector's storage. Must be ReadWriteMany, since
+# encoder and decode are on different nodes.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: RENDERED
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: RENDERED

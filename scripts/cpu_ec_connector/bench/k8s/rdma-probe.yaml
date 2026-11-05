@@ -1,0 +1,71 @@
+# Two GPU-less pods on different nodes that run rdma_probe.py against each
+# other: a NIXL READ of host memory over UCX, the transfer ECCPUConnector
+# makes. Apply after creating the ConfigMap holding the script:
+#
+#   kubectl -n <ns> create configmap ec-rdma-probe --from-file=rdma_probe.py
+#   kubectl -n <ns> apply -f rdma-probe.yaml
+#
+# Each pod requests one rdma/ib device and IPC_LOCK (UCX pins what it
+# registers), mirroring what k8s_bench.py --rdma gives the vLLM pods.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ec-rdma-probe-producer
+  labels: {app: ec-rdma-probe, role: producer}
+spec:
+  restartPolicy: Never
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector: {matchLabels: {app: ec-rdma-probe}}
+        topologyKey: kubernetes.io/hostname
+  containers:
+  - name: probe
+    image: VLLM_IMAGE
+    # Both pods sleep; each test runs `serve` here and `read` on the consumer
+    # through kubectl exec, with the same UCX_TLS on both sides.
+    command: ["sleep", "3600"]
+    ports: [{containerPort: 5600}]
+    env:
+    - {name: UCX_PROTO_INFO, value: "y"}
+    resources:
+      requests: {cpu: "4", memory: 16Gi, rdma/ib: "1"}
+      limits: {cpu: "4", memory: 16Gi, rdma/ib: "1"}
+    securityContext:
+      capabilities: {add: [IPC_LOCK]}
+    volumeMounts:
+    - {name: probe, mountPath: /probe}
+  volumes:
+  - name: probe
+    configMap: {name: ec-rdma-probe}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ec-rdma-probe-consumer
+  labels: {app: ec-rdma-probe, role: consumer}
+spec:
+  restartPolicy: Never
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector: {matchLabels: {app: ec-rdma-probe}}
+        topologyKey: kubernetes.io/hostname
+  containers:
+  - name: probe
+    image: VLLM_IMAGE
+    # Sleeps so the probe can be run several times (RDMA, then the TCP
+    # control) with kubectl exec, all against the same producer.
+    command: ["sleep", "3600"]
+    env:
+    - {name: UCX_PROTO_INFO, value: "y"}
+    resources:
+      requests: {cpu: "4", memory: 16Gi, rdma/ib: "1"}
+      limits: {cpu: "4", memory: 16Gi, rdma/ib: "1"}
+    securityContext:
+      capabilities: {add: [IPC_LOCK]}
+    volumeMounts:
+    - {name: probe, mountPath: /probe}
+  volumes:
+  - name: probe
+    configMap: {name: ec-rdma-probe}

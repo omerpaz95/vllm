@@ -1653,4 +1653,7 @@ if __name__ == "__main__":
         log_level="info",
         loop="uvloop",
         access_log=True,
+        # Clients pool connections to the proxy too (vllm bench serve: 60s), so
+        # the proxy holds idle ones as long as the servers behind it do.
+        timeout_keep_alive=int(os.getenv("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")),
     )
